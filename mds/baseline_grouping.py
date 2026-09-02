@@ -1,506 +1,232 @@
-"""A deliberately simple snapshot-based stock grouping baseline.
-
-This module turns each distinct ``time`` value into one snapshot, sorts that
-snapshot by ``clock``, and cuts a new local group whenever the adjacent clock
-gap is greater than or equal to a detected threshold. It then combines local
-groups into one fixed ``stock_id -> group_id`` mapping.
-
-The baseline intentionally gives absolute priority to the user's first rule:
-if two stocks are separated in any snapshot where both appear, they can never
-belong to the same final group. A missing stock contributes no evidence in that
-snapshot.
-"""
+"""按 snapshot 分组，再合并为全天固定分组的第一版 baseline。"""
 
 from __future__ import annotations
 
 import argparse
-from collections import Counter
-from dataclasses import dataclass
 from itertools import combinations
-from numbers import Integral
 from pathlib import Path
-from typing import Sequence
 
 import pandas as pd
-from pandas.api.types import is_integer_dtype, is_unsigned_integer_dtype
 
-from .clock_delta import (
-    DEFAULT_MIN_SEGMENT_SIZE,
-    DEFAULT_MIN_SLOPE_MULTIPLIER,
-    DEFAULT_ROBUST_Z_THRESHOLD,
-    MAX_INT64,
-    find_abrupt_increase,
-)
+from .clock_delta import find_abrupt_increase
 
 
-REQUIRED_COLUMNS = ("clock", "stock_id", "time")
-OUTPUT_COLUMNS = ("stock_id", "group_id")
-Pair = tuple[str, str]
-MembershipHistory = dict[str, dict[str, int]]
+REQUIRED_COLUMNS = ["clock", "stock_id", "time"]
+OUTPUT_COLUMNS = ["stock_id", "group_id"]
 
 
-@dataclass(frozen=True)
-class BaselineGroupingResult:
-    """Grouping output plus diagnostics that explain the baseline run."""
+def group_one_snapshot(snapshot: pd.DataFrame, threshold: int) -> list[list[str]]:
+    """按照相邻 ``clock`` 差值，对一个 snapshot 中的股票分组。
 
-    mapping: pd.DataFrame
-    threshold: int
-    threshold_source: str
-    snapshot_count: int
-    local_group_count: int
-    positive_pair_count: int
-    blocked_merge_count: int
+    处理过程很直接：先按 ``clock`` 从小到大排序；如果当前行与上一行的
+    ``clock`` 差值大于或等于 ``threshold``，当前行就作为一个新组的
+    第一只股票。返回值形如 ``[["1", "3"], ["2", "6"]]``。
 
-    @property
-    def final_group_count(self) -> int:
-        """Return the number of final fixed groups."""
-
-        if self.mapping.empty:
-            return 0
-        return int(self.mapping["group_id"].nunique())
-
-
-class _UnionFind:
-    """Maintain final components while exposing their member sets."""
-
-    def __init__(self, stock_ids: Sequence[str]) -> None:
-        self._parent = {stock_id: stock_id for stock_id in stock_ids}
-        self._members = {stock_id: {stock_id} for stock_id in stock_ids}
-
-    def find(self, stock_id: str) -> str:
-        """Return the component root and compress the lookup path."""
-
-        parent = self._parent[stock_id]
-        if parent != stock_id:
-            self._parent[stock_id] = self.find(parent)
-        return self._parent[stock_id]
-
-    def members(self, root: str) -> set[str]:
-        """Return members of a root component."""
-
-        return self._members[root]
-
-    def union(self, first_root: str, second_root: str) -> str:
-        """Merge two roots deterministically and return the surviving root."""
-
-        # Roots are always the lexicographically smallest stock in a component.
-        # Keeping that invariant makes group construction reproducible.
-        surviving_root, absorbed_root = sorted((first_root, second_root))
-        self._parent[absorbed_root] = surviving_root
-        self._members[surviving_root].update(self._members.pop(absorbed_root))
-        return surviving_root
-
-    def components(self) -> list[set[str]]:
-        """Return all current member sets."""
-
-        return list(self._members.values())
-
-
-def _ordered_pair(stock_a: str, stock_b: str) -> Pair:
-    """Return a stable key for an unordered stock pair."""
-
-    if stock_a <= stock_b:
-        return stock_a, stock_b
-    return stock_b, stock_a
-
-
-def _normalize_market_data(data: pd.DataFrame) -> pd.DataFrame:
-    """Validate the baseline assumptions and normalize the three used columns."""
-
-    missing_columns = [column for column in REQUIRED_COLUMNS if column not in data]
-    if missing_columns:
-        missing = ", ".join(missing_columns)
-        raise ValueError(f"missing required CSV column(s): {missing}")
-
-    if data.empty:
-        raise ValueError("cannot group an empty market data table")
-    if data["stock_id"].isna().any():
-        raise ValueError("stock_id contains missing values")
-    if data["time"].isna().any():
-        raise ValueError("time contains missing values")
-    if data["clock"].isna().any():
-        raise ValueError("clock contains missing values")
-
-    try:
-        clock = pd.to_numeric(data["clock"], errors="raise")
-    except (TypeError, ValueError) as error:
-        raise ValueError("clock must contain integer microsecond timestamps") from error
-
-    if not is_integer_dtype(clock.dtype):
-        raise ValueError("clock must contain integer microsecond timestamps")
-    if is_unsigned_integer_dtype(clock.dtype) and clock.max() > MAX_INT64:
-        raise ValueError("clock contains a value outside the signed 64-bit range")
-
-    normalized = pd.DataFrame(
-        {
-            "clock": clock.astype("int64"),
-            "stock_id": data["stock_id"].astype("string"),
-            "time": data["time"].astype("string"),
-            "_row_order": range(len(data)),
-        }
-    )
-
-    # Whether one stock may have multiple records in one three-second snapshot
-    # remains a business question. This first baseline assumes at most one and
-    # rejects ambiguous input instead of silently inventing semantics.
-    duplicated = normalized.duplicated(subset=["time", "stock_id"], keep=False)
-    if duplicated.any():
-        example = normalized.loc[duplicated, ["time", "stock_id"]].iloc[0]
-        raise ValueError(
-            "baseline requires at most one row per stock_id within each time; "
-            f"found duplicate stock_id={example['stock_id']!r}, "
-            f"time={example['time']!r}"
-        )
-
-    return normalized
-
-
-def _sort_snapshot(snapshot: pd.DataFrame) -> pd.DataFrame:
-    """Sort one snapshot by clock and preserve input order for clock ties."""
-
-    return snapshot.sort_values(
-        ["clock", "_row_order"], kind="stable", ignore_index=True
-    )
-
-
-def _collect_snapshot_gaps(data: pd.DataFrame) -> pd.Series:
-    """Collect adjacent clock gaps after sorting inside each snapshot."""
-
-    gap_parts: list[pd.Series] = []
-    for _, snapshot in data.groupby("time", sort=False):
-        ordered_snapshot = _sort_snapshot(snapshot)
-        # The first row has no predecessor in its snapshot and therefore does
-        # not contribute a gap to threshold detection.
-        gap_parts.append(ordered_snapshot["clock"].diff().dropna().astype("int64"))
-
-    if not gap_parts:
-        return pd.Series(dtype="int64")
-    return pd.concat(gap_parts, ignore_index=True)
-
-
-def _resolve_threshold(
-    data: pd.DataFrame,
-    threshold: int | None,
-    *,
-    robust_z_threshold: float,
-    min_slope_multiplier: float,
-    min_segment_size: int,
-) -> tuple[int, str]:
-    """Use a manual threshold or detect one from all within-snapshot gaps."""
-
-    if threshold is not None:
-        if isinstance(threshold, bool) or not isinstance(threshold, Integral):
-            raise ValueError("threshold must be a positive integer number of microseconds")
-        resolved_threshold = int(threshold)
-        if resolved_threshold <= 0:
-            raise ValueError("threshold must be a positive integer number of microseconds")
-        return resolved_threshold, "manual"
-
-    gaps = _collect_snapshot_gaps(data)
-    abrupt_increase = find_abrupt_increase(
-        pd.DataFrame({"delta_clock": gaps}),
-        robust_z_threshold=robust_z_threshold,
-        min_slope_multiplier=min_slope_multiplier,
-        min_segment_size=min_segment_size,
-    )
-    if abrupt_increase is None:
-        raise ValueError(
-            "could not detect an abrupt snapshot clock-gap threshold; "
-            "provide --threshold explicitly"
-        )
-    return abrupt_increase.delta_clock, "automatic"
-
-
-def _collect_local_evidence(
-    data: pd.DataFrame, threshold: int
-) -> tuple[MembershipHistory, Counter[Pair], int, int]:
-    """Cut every snapshot and collect same-local-group evidence.
-
-    A gap equal to the threshold starts a new local group. This is intentional:
-    ``find_abrupt_increase`` returns the first value on the large-gap side, so
-    that value should be treated as a separator rather than a within-group gap.
+    这是单个 snapshot 的分组方法。以后想替换局部分组算法时，只需实现
+    相同输入输出形式的新函数，再传给 ``infer_fixed_groups``。
     """
 
-    histories: MembershipHistory = {
-        stock_id: {} for stock_id in data["stock_id"].unique().tolist()
-    }
-    positive_evidence: Counter[Pair] = Counter()
-    snapshot_count = 0
-    local_group_count = 0
+    ordered = snapshot.sort_values("clock", kind="stable").copy()
+
+    # 第一行没有上一行，diff 的结果为 NaN，ge(threshold) 会得到 False，
+    # 所以它自然属于第 0 个局部组。后面每遇到一个大 gap，组号就加 1。
+    ordered["local_group_id"] = ordered["clock"].diff().ge(threshold).cumsum()
+
+    return [
+        group["stock_id"].astype(str).tolist()
+        for _, group in ordered.groupby("local_group_id", sort=False)
+    ]
+
+
+def group_all_snapshots(
+    data: pd.DataFrame,
+    threshold: int,
+    snapshot_grouping_method=group_one_snapshot,
+) -> dict[str, list[list[str]]]:
+    """逐个处理所有 ``time``，保留每个 snapshot 的局部分组结果。
+
+    ``snapshot_grouping_method`` 就是第一层可插拔接口。默认使用相邻
+    ``clock`` gap，也可以直接传入另一个 ``方法(snapshot, threshold)``。
+    """
+
+    snapshot_groups: dict[str, list[list[str]]] = {}
 
     for time_value, snapshot in data.groupby("time", sort=False):
-        snapshot_count += 1
-        ordered_snapshot = _sort_snapshot(snapshot)
-        gaps = ordered_snapshot["clock"].diff()
-
-        starts_new_group = gaps.ge(threshold)
-        starts_new_group.iloc[0] = True
-        local_group_ids = starts_new_group.cumsum().sub(1).astype("int64")
-        ordered_snapshot = ordered_snapshot.assign(local_group_id=local_group_ids)
-
-        snapshot_group_count = int(local_group_ids.nunique())
-        local_group_count += snapshot_group_count
-
-        for stock_id, local_group_id in zip(
-            ordered_snapshot["stock_id"],
-            ordered_snapshot["local_group_id"],
-            strict=True,
-        ):
-            histories[str(stock_id)][str(time_value)] = int(local_group_id)
-
-        # Every pair in one local candidate group receives one unit of positive
-        # evidence. This is deliberately simple and can be expensive for very
-        # large local groups; it is part of the baseline, not the final design.
-        for _, local_group in ordered_snapshot.groupby("local_group_id", sort=False):
-            stock_ids = local_group["stock_id"].astype(str).tolist()
-            for stock_a, stock_b in combinations(stock_ids, 2):
-                positive_evidence[_ordered_pair(stock_a, stock_b)] += 1
-
-    return histories, positive_evidence, snapshot_count, local_group_count
-
-
-def _were_ever_separated(
-    stock_a: str,
-    stock_b: str,
-    histories: MembershipHistory,
-    cache: dict[Pair, bool],
-) -> bool:
-    """Return whether a pair was split in any snapshot where both appeared."""
-
-    pair = _ordered_pair(stock_a, stock_b)
-    cached = cache.get(pair)
-    if cached is not None:
-        return cached
-
-    history_a = histories[stock_a]
-    history_b = histories[stock_b]
-
-    # Iterate over the shorter history to reduce dictionary lookups. If one
-    # stock is absent from a snapshot, that time is simply not found in the
-    # other history and contributes no negative evidence.
-    if len(history_a) > len(history_b):
-        history_a, history_b = history_b, history_a
-
-    separated = any(
-        time_value in history_b and history_b[time_value] != local_group_id
-        for time_value, local_group_id in history_a.items()
-    )
-    cache[pair] = separated
-    return separated
-
-
-def _components_can_merge(
-    first_members: set[str],
-    second_members: set[str],
-    histories: MembershipHistory,
-    separation_cache: dict[Pair, bool],
-) -> bool:
-    """Require every cross-component pair to respect permanent separation."""
-
-    return not any(
-        _were_ever_separated(
-            stock_a,
-            stock_b,
-            histories,
-            separation_cache,
+        snapshot_groups[str(time_value)] = snapshot_grouping_method(
+            snapshot,
+            threshold,
         )
-        for stock_a in first_members
-        for stock_b in second_members
-    )
+
+    return snapshot_groups
 
 
-def _merge_with_permanent_separation(
-    stock_ids: Sequence[str],
-    histories: MembershipHistory,
-    positive_evidence: Counter[Pair],
-) -> tuple[list[set[str]], int]:
-    """Greedily merge strong positive pairs without violating hard constraints."""
+def _stock_pair(stock_a: str, stock_b: str) -> tuple[str, str]:
+    """把股票对固定为同一个顺序，方便放进 set。"""
 
-    union_find = _UnionFind(stock_ids)
-    separation_cache: dict[Pair, bool] = {}
-    blocked_merge_count = 0
-
-    # Stronger repeated same-group evidence is considered first. Pair order is
-    # the deterministic tie-breaker. Hard separation always wins regardless of
-    # how large the positive count is.
-    ordered_evidence = sorted(
-        positive_evidence.items(),
-        key=lambda item: (-item[1], item[0]),
-    )
-    for (stock_a, stock_b), _same_group_count in ordered_evidence:
-        first_root = union_find.find(stock_a)
-        second_root = union_find.find(stock_b)
-        if first_root == second_root:
-            continue
-
-        if not _components_can_merge(
-            union_find.members(first_root),
-            union_find.members(second_root),
-            histories,
-            separation_cache,
-        ):
-            blocked_merge_count += 1
-            continue
-
-        union_find.union(first_root, second_root)
-
-    return union_find.components(), blocked_merge_count
+    return tuple(sorted((stock_a, stock_b)))
 
 
-def _build_mapping(components: list[set[str]]) -> pd.DataFrame:
-    """Assign deterministic zero-based group IDs and sort by stock ID."""
+def group_by_permanent_separation(
+    snapshot_groups: dict[str, list[list[str]]],
+    stock_ids: list[str],
+) -> list[list[str]]:
+    """使用“只要被分开过，就永远不同组”的规则生成最终分组。
 
-    ordered_components = sorted(
-        (sorted(component) for component in components),
-        key=lambda component: component[0],
-    )
-    rows = [
-        (stock_id, group_id)
-        for group_id, component in enumerate(ordered_components)
-        for stock_id in component
-    ]
-    return (
-        pd.DataFrame(rows, columns=list(OUTPUT_COLUMNS))
-        .sort_values("stock_id", kind="stable", ignore_index=True)
-        .astype({"stock_id": "string", "group_id": "int64"})
-    )
+    第一步遍历所有 snapshot。只要两只股票在某个 snapshot 的两个不同
+    局部组中，就把这对股票记入 ``different_pairs``。
+
+    第二步按股票 ID 顺序逐只放入最终组。股票会进入第一个与它没有
+    ``different_pairs`` 冲突的组；如果所有已有组都冲突，就新建一个组。
+    这是一版简单、确定性的贪心 baseline，不追求全局最优。
+
+    这是第二层可插拔接口。以后修改最终分组规则时，可以写一个接收
+    ``snapshot_groups, stock_ids`` 并返回 ``list[list[str]]`` 的新函数，
+    然后传给 ``infer_fixed_groups``，无需修改 snapshot 分组代码。
+    """
+
+    different_pairs: set[tuple[str, str]] = set()
+
+    # 一个 snapshot 中任意两个不同局部组之间的股票对，都是永久冲突对。
+    for groups in snapshot_groups.values():
+        for first_group, second_group in combinations(groups, 2):
+            for stock_a in first_group:
+                for stock_b in second_group:
+                    different_pairs.add(_stock_pair(stock_a, stock_b))
+
+    final_groups: list[list[str]] = []
+
+    # 按固定顺序执行 first-fit，保证相同输入每次得到相同结果。
+    for stock_id in sorted(stock_ids):
+        for final_group in final_groups:
+            can_join = all(
+                _stock_pair(stock_id, member) not in different_pairs
+                for member in final_group
+            )
+            if can_join:
+                final_group.append(stock_id)
+                break
+        else:
+            final_groups.append([stock_id])
+
+    return final_groups
 
 
 def infer_fixed_groups(
     data: pd.DataFrame,
-    *,
-    threshold: int | None = None,
-    robust_z_threshold: float = DEFAULT_ROBUST_Z_THRESHOLD,
-    min_slope_multiplier: float = DEFAULT_MIN_SLOPE_MULTIPLIER,
-    min_segment_size: int = DEFAULT_MIN_SEGMENT_SIZE,
-) -> BaselineGroupingResult:
-    """Infer a fixed stock grouping with the coarse snapshot baseline.
+    threshold: int,
+    snapshot_grouping_method=group_one_snapshot,
+    final_grouping_method=group_by_permanent_separation,
+) -> tuple[dict[str, list[list[str]]], list[list[str]]]:
+    """依次执行“每个 snapshot 分组”和“全天最终分组”两个阶段。
 
-    Complexity is intentionally not optimized: positive pair collection costs
-    ``O(sum(local_group_size ** 2))`` and constrained component checks can also
-    become expensive. This implementation is suitable as a correctness and
-    failure-mode baseline, not yet as the final full-market algorithm.
+    两个方法都通过参数传入，因此可以彼此独立替换。返回值同时保留全部
+    snapshot 的中间结果和最终结果，便于直接检查每一层发生了什么。
     """
 
-    normalized = _normalize_market_data(data)
-    resolved_threshold, threshold_source = _resolve_threshold(
-        normalized,
+    snapshot_groups = group_all_snapshots(
+        data,
         threshold,
-        robust_z_threshold=robust_z_threshold,
-        min_slope_multiplier=min_slope_multiplier,
-        min_segment_size=min_segment_size,
+        snapshot_grouping_method,
     )
-    histories, positive_evidence, snapshot_count, local_group_count = (
-        _collect_local_evidence(normalized, resolved_threshold)
-    )
-    stock_ids = sorted(histories)
-    components, blocked_merge_count = _merge_with_permanent_separation(
-        stock_ids,
-        histories,
-        positive_evidence,
-    )
-    mapping = _build_mapping(components)
+    stock_ids = data["stock_id"].astype(str).unique().tolist()
+    final_groups = final_grouping_method(snapshot_groups, stock_ids)
+    return snapshot_groups, final_groups
 
-    return BaselineGroupingResult(
-        mapping=mapping,
-        threshold=resolved_threshold,
-        threshold_source=threshold_source,
-        snapshot_count=snapshot_count,
-        local_group_count=local_group_count,
-        positive_pair_count=len(positive_evidence),
-        blocked_merge_count=blocked_merge_count,
-    )
+
+def detect_threshold(data: pd.DataFrame) -> int:
+    """沿用已有的异常 gap 方法，为没有手工阈值的运行提供默认值。"""
+
+    all_gaps: list[pd.Series] = []
+
+    for _, snapshot in data.groupby("time", sort=False):
+        ordered = snapshot.sort_values("clock", kind="stable")
+        all_gaps.append(ordered["clock"].diff().dropna().astype("int64"))
+
+    gaps = pd.concat(all_gaps, ignore_index=True)
+    candidate = find_abrupt_increase(pd.DataFrame({"delta_clock": gaps}))
+
+    if candidate is None:
+        raise ValueError("没有自动找到 clock gap 阈值，请通过 --threshold 指定")
+
+    return candidate.delta_clock
+
+
+def groups_to_mapping(final_groups: list[list[str]]) -> pd.DataFrame:
+    """把按组排列的结果转换成 ``stock_id,group_id`` CSV 结构。"""
+
+    rows = [
+        (stock_id, group_id)
+        for group_id, group in enumerate(final_groups, start=1)
+        for stock_id in group
+    ]
+    return pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
+
+
+def print_final_groups(final_groups: list[list[str]]) -> None:
+    """在终端直观打印组数以及每一组包含的股票。"""
+
+    print(f"最终分组数：{len(final_groups)}")
+    for group_id, group in enumerate(final_groups, start=1):
+        print(f"第 {group_id} 组（{len(group)} 只）：{', '.join(group)}")
 
 
 def process_csv(
     input_csv: Path | str,
     output_csv: Path | str,
-    *,
     threshold: int | None = None,
-    robust_z_threshold: float = DEFAULT_ROBUST_Z_THRESHOLD,
-    min_slope_multiplier: float = DEFAULT_MIN_SLOPE_MULTIPLIER,
-    min_segment_size: int = DEFAULT_MIN_SEGMENT_SIZE,
-) -> BaselineGroupingResult:
-    """Read market data, run the baseline, and write ``stock_id,group_id``."""
+    snapshot_grouping_method=group_one_snapshot,
+    final_grouping_method=group_by_permanent_separation,
+) -> tuple[dict[str, list[list[str]]], list[list[str]], int]:
+    """读取固定格式 CSV，执行两层分组并写出最终映射。"""
 
+    # 输入格式由业务保证固定，因此只按已知表头读取真正需要的三列。
     data = pd.read_csv(
         input_csv,
-        usecols=list(REQUIRED_COLUMNS),
-        dtype={"clock": "string", "stock_id": "string", "time": "string"},
+        usecols=REQUIRED_COLUMNS,
+        dtype={"clock": "int64", "stock_id": "string", "time": "string"},
     )
-    result = infer_fixed_groups(
+
+    if threshold is None:
+        threshold = detect_threshold(data)
+
+    snapshot_groups, final_groups = infer_fixed_groups(
         data,
-        threshold=threshold,
-        robust_z_threshold=robust_z_threshold,
-        min_slope_multiplier=min_slope_multiplier,
-        min_segment_size=min_segment_size,
+        threshold,
+        snapshot_grouping_method,
+        final_grouping_method,
     )
-    result.mapping.to_csv(output_csv, columns=list(OUTPUT_COLUMNS), index=False)
-    return result
+    groups_to_mapping(final_groups).to_csv(output_csv, index=False)
+    return snapshot_groups, final_groups, threshold
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    """Build the command-line parser."""
+    """创建命令行参数。"""
 
     parser = argparse.ArgumentParser(
-        description=(
-            "Infer a coarse fixed stock grouping from time snapshots and clock "
-            "gaps. Any pair separated once is permanently separated."
-        )
+        description="先对每个 time snapshot 分组，再生成全天固定股票分组。"
     )
-    parser.add_argument("input_csv", type=Path, help="source market data CSV")
-    parser.add_argument("output_csv", type=Path, help="destination group mapping CSV")
+    parser.add_argument("input_csv", type=Path, help="输入 market data CSV")
+    parser.add_argument("output_csv", type=Path, help="输出 stock 分组 CSV")
     parser.add_argument(
         "--threshold",
         type=int,
-        help="manual clock-gap threshold in microseconds; default: auto-detect",
-    )
-    parser.add_argument(
-        "--robust-z-threshold",
-        type=float,
-        default=DEFAULT_ROBUST_Z_THRESHOLD,
-        help="automatic detector MAD threshold (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--min-slope-multiplier",
-        type=float,
-        default=DEFAULT_MIN_SLOPE_MULTIPLIER,
-        help="automatic detector minimum slope multiplier (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--min-segment-size",
-        type=int,
-        default=DEFAULT_MIN_SEGMENT_SIZE,
-        help="automatic detector minimum samples per side (default: %(default)s)",
+        help="snapshot 内切分组的 clock gap 阈值；不传则沿用自动检测",
     )
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Run the baseline CLI."""
+def main(argv: list[str] | None = None) -> int:
+    """执行命令行程序并打印最终分组。"""
 
-    parser = build_argument_parser()
-    arguments = parser.parse_args(argv)
-
-    try:
-        result = process_csv(
-            arguments.input_csv,
-            arguments.output_csv,
-            threshold=arguments.threshold,
-            robust_z_threshold=arguments.robust_z_threshold,
-            min_slope_multiplier=arguments.min_slope_multiplier,
-            min_segment_size=arguments.min_segment_size,
-        )
-    except (OSError, ValueError) as error:
-        parser.exit(status=1, message=f"error: {error}\n")
-
-    print(
-        f"threshold={result.threshold} ({result.threshold_source}), "
-        f"snapshots={result.snapshot_count}, "
-        f"local_groups={result.local_group_count}, "
-        f"final_groups={result.final_group_count}, "
-        f"blocked_merges={result.blocked_merge_count}"
+    arguments = build_argument_parser().parse_args(argv)
+    _, final_groups, threshold = process_csv(
+        arguments.input_csv,
+        arguments.output_csv,
+        arguments.threshold,
     )
+
+    print(f"clock gap 阈值：{threshold} 微秒")
+    print_final_groups(final_groups)
     return 0
 
 
