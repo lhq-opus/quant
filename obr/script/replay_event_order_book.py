@@ -87,16 +87,29 @@ def read_events(path):
 
 
 class EventOrderBook:
-    """只维护买卖双方的全深度聚合数量，不执行任何撮合。"""
+    """维护全深度聚合盘口，并在价格档层面处理可成交数量。"""
 
     def __init__(self):
         # bids 和 asks 都是“价格 -> 当前聚合数量”。
-        # 订单簿只需要价格档总量，因此不再为同价订单维护 FIFO 队列。
+        # 订单簿只需要价格档总量，因此不为同价订单维护 FIFO 队列。
         self.bids = {}
         self.asks = {}
 
+        # 价格档撮合能够确定成交总量和成交额，但不能确定实际成交消息笔数。
+        # 这两个累计值供后续完整 book.csv 的 cvl、cto 字段使用。
+        self.cumulative_trade_quantity = 0
+        self.cumulative_turnover = Decimal("0")
+
+        # 保存当前 order 在各价格档推导出的成交量和成交额，便于观察单条事件的结果。
+        # 撤单不会产生成交，因此应用每个新事件前都重置为 0。
+        self.event_trade_quantity = 0
+        self.event_turnover = Decimal("0")
+
     def apply(self, event):
         """应用一条事件，并立即生成与该事件 caa 对应的订单簿快照。"""
+        self.event_trade_quantity = 0
+        self.event_turnover = Decimal("0")
+
         if event.ExecType == "4":
             self._apply_cancel(event)
             event_type = "cancel"
@@ -108,14 +121,66 @@ class EventOrderBook:
         return self._snapshot(event.caa, event_type)
 
     def _apply_order(self, event):
-        """把 order 的数量累加到买方或卖方对应价格档。"""
-        price = Decimal(event.Price)
-        quantity = int(event.OrderQty)
-        levels = self.bids if event.Side == "1" else self.asks
+        """按价格优先逐档消耗对手盘，再把未成交数量加入本方盘口。"""
+        limit_price = Decimal(event.Price)
+        remaining_quantity = int(event.OrderQty)
 
-        # order 是交易所已经发布的委托事实。重放器只更新本方盘口，不能主动寻找
-        # 对手盘或自行生成成交；真实成交应由单独的成交事件驱动。
-        levels[price] = levels.get(price, 0) + quantity
+        if event.Side == "1":
+            # 买单从最低卖价开始成交。只要卖一不高于买入限价，就继续看下一卖价。
+            while remaining_quantity > 0 and self.asks:
+                best_ask_price = min(self.asks)
+                if best_ask_price > limit_price:
+                    break
+
+                traded_quantity = min(
+                    remaining_quantity,
+                    self.asks[best_ask_price],
+                )
+                self._record_trade(best_ask_price, traded_quantity)
+
+                remaining_quantity -= traded_quantity
+                self.asks[best_ask_price] -= traded_quantity
+                if self.asks[best_ask_price] == 0:
+                    del self.asks[best_ask_price]
+
+            # 买单仍有剩余，说明剩余数量无法继续成交，应进入买盘的委托价格档。
+            if remaining_quantity > 0:
+                self.bids[limit_price] = (
+                    self.bids.get(limit_price, 0) + remaining_quantity
+                )
+            return
+
+        # 卖单与买单完全对称：从最高买价开始成交，再依次查看买二、买三。
+        while remaining_quantity > 0 and self.bids:
+            best_bid_price = max(self.bids)
+            if best_bid_price < limit_price:
+                break
+
+            traded_quantity = min(
+                remaining_quantity,
+                self.bids[best_bid_price],
+            )
+            self._record_trade(best_bid_price, traded_quantity)
+
+            remaining_quantity -= traded_quantity
+            self.bids[best_bid_price] -= traded_quantity
+            if self.bids[best_bid_price] == 0:
+                del self.bids[best_bid_price]
+
+        # 卖单仍有剩余时，把剩余数量加入卖盘的委托价格档。
+        if remaining_quantity > 0:
+            self.asks[limit_price] = (
+                self.asks.get(limit_price, 0) + remaining_quantity
+            )
+
+    def _record_trade(self, trade_price, trade_quantity):
+        """累计一次价格档消耗产生的成交量和成交额。"""
+        trade_turnover = trade_price * trade_quantity
+
+        self.event_trade_quantity += trade_quantity
+        self.event_turnover += trade_turnover
+        self.cumulative_trade_quantity += trade_quantity
+        self.cumulative_turnover += trade_turnover
 
     def _apply_cancel(self, event):
         """从撤单价格所在的一侧扣减聚合数量。"""
@@ -181,7 +246,15 @@ def main():
         lineterminator="\n",
     )
 
-    print("已重放 %d 条事件，输出 %s" % (len(rows), args.output))
+    print(
+        "已重放 %d 条事件，推导成交量 %d，推导成交额 %s，输出 %s"
+        % (
+            len(rows),
+            order_book.cumulative_trade_quantity,
+            format(order_book.cumulative_turnover, ".4f"),
+            args.output,
+        )
+    )
     return 0
 
 
