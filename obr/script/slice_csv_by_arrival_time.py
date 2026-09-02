@@ -27,11 +27,18 @@ def parse_args():
     parser.add_argument("--order", required=True, type=Path, help="Path to input order CSV")
     parser.add_argument("--trade", required=True, type=Path, help="Path to input trade CSV")
     parser.add_argument("--book", required=True, type=Path, help="Path to input book CSV")
-    parser.add_argument(
-        "--output-dir",
-        required=True,
+    output_group = parser.add_mutually_exclusive_group(required=True)
+    output_group.add_argument(
+        "--output-path",
+        dest="output_path",
         type=Path,
-        help="Directory that will receive order.csv, trade.csv, and book.csv",
+        help="Output directory for order.csv, trade.csv, and book.csv",
+    )
+    output_group.add_argument(
+        "--output-dir",
+        dest="output_path",
+        type=Path,
+        help="Deprecated alias for --output-path",
     )
     parser.add_argument("--start-time", required=True, help="Inclusive start arrival time")
     parser.add_argument("--end-time", required=True, help="Inclusive end arrival time")
@@ -236,8 +243,8 @@ def main():
             )
             results.append((label, input_path, result))
 
-        args.output_dir.mkdir(parents=True, exist_ok=True)
-        output_paths = [args.output_dir / (label + ".csv") for label, _, _ in results]
+        args.output_path.mkdir(parents=True, exist_ok=True)
+        output_paths = [args.output_path / (label + ".csv") for label, _, _ in results]
         ensure_output_paths(
             [args.order, args.trade, args.book], output_paths, args.overwrite
         )

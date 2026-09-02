@@ -12,10 +12,12 @@ python3 ./quant/obr/script/slice_csv_by_arrival_time.py \
   --book ./data/examples/book.csv \
   --start-time '2026-08-31T09:30:00.000110+08:00' \
   --end-time '2026-08-31T09:30:00.000118+08:00' \
-  --output-dir /tmp/obr-subset
+  --output-path /tmp/obr-subset
 ```
 
-输出固定为目标目录中的 `order.csv`、`trade.csv`、`book.csv`。区间是闭区间，
+输出固定为 `--output-path` 目录中的 `order.csv`、`trade.csv`、`book.csv`。
+已发布的 `--output-dir` 作为兼容别名仍可使用，但新命令建议使用 `--output-path`。
+区间是闭区间，
 因此时间恰好等于起点或终点的行也会被保留。脚本保留每个输入文件的原表头和
 数据字段，不在这一步合并 schema。
 
