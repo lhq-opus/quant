@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Estimate a ``delta_clock`` threshold from an extremely skewed distribution.
+"""Locate the onset of a small, rapidly growing ``delta_clock`` upper tail.
 
-This is an experimental, frequency-aware alternative to the slope/MAD detector
-in :mod:`mds.clock_delta`.  It deliberately lives in a separate executable
-module so the original detector remains available as a baseline.
+This executable is an experimental alternative to the slope/MAD detector in
+``mds.clock_delta``.  The old detector remains unchanged as a baseline.
+
+The estimator compares local regression slopes immediately before and after
+candidate points on the upper empirical-quantile curve.  It seeks the final
+small tail where ``log1p(delta_clock)`` starts growing much faster with rank,
+not the edge of the dominant low-value histogram peak.
 """
 
 from __future__ import annotations
@@ -19,56 +23,93 @@ import pandas as pd
 from pandas.api.types import is_integer_dtype, is_unsigned_integer_dtype
 
 DELTA_COLUMN = "delta_clock"
-METHOD_NAME = "log_histogram_triangle_ensemble"
+METHOD_NAME = "upper_quantile_local_slope_ensemble"
 MAX_INT64 = 2**63 - 1
-DEFAULT_TAIL_QUANTILE = 0.995
-DEFAULT_HISTOGRAM_BINS = (32, 48, 64, 96)
-DEFAULT_MIN_TRIANGLE_SCORE = 0.05
-DEFAULT_MAX_THRESHOLD_SPREAD = 4.0
-MIN_HISTOGRAM_BINS = 8
-MIN_BIN_CONFIGURATIONS = 3
-MIN_POSITIVE_DELTAS = 100
+
+# 只分析排序分布的上部 10%，从而跳过 <20 微秒超高密度主峰的边缘。
+DEFAULT_ANALYSIS_START_QUANTILE = 0.90
+
+# 最顶部 0.05% 不参与局部回归，避免单个 980000 一类的值支配拟合；
+# 它们仍会进入最终 tail_count 等统计。
+DEFAULT_UPPER_QUANTILE = 0.9995
+DEFAULT_QUANTILE_POINTS = 4096
+
+# 用不同宽度的 rank 窗口重复检测。真正的上尾起点不应随着平滑尺度变化
+# 而大幅移动；三个窗口在 498 万条数据上分别约含 4980/9960/19920 条。
+DEFAULT_WINDOW_FRACTIONS = (0.001, 0.002, 0.004)
+
+# 用户确认组间 gap 只占很小一部分。默认在“尾部占 0.5%–5%”的范围内
+# 搜索。这是显式业务先验，可通过 CLI 调整，不是普适统计常数。
+DEFAULT_MIN_TAIL_FRACTION = 0.005
+DEFAULT_MAX_TAIL_FRACTION = 0.05
+
+# 候选点右侧局部斜率至少为左侧的 3 倍；左右分别拟合两条线，相对整个
+# 局部窗口只拟合一条线，残差平方和至少降低 25%。
+DEFAULT_MIN_SLOPE_RATIO = 3.0
+DEFAULT_MIN_FIT_IMPROVEMENT = 0.25
+
+# 不同窗口宽度得到的折点 rank 相差不得超过 0.5 个百分点，候选微秒值
+# 最大值不得超过最小值的 2 倍。
+DEFAULT_MAX_BREAKPOINT_QUANTILE_SPREAD = 0.005
+DEFAULT_MAX_THRESHOLD_SPREAD = 2.0
+
+MIN_WINDOW_CONFIGURATIONS = 3
+MIN_POSITIVE_DELTAS = 1_000
+MIN_TAIL_OBSERVATIONS = 50
+MIN_QUANTILE_POINTS = 512
+MIN_LOCAL_GRID_POINTS = 12
+NUMERICAL_EPSILON = 1e-12
 
 
 @dataclass(frozen=True)
-class TriangleCandidate:
-    """One threshold candidate obtained at one histogram resolution."""
+class LocalSlopeCandidate:
+    """One upper-tail breakpoint found with one local window width."""
 
-    histogram_bins: int
+    window_fraction: float
+    breakpoint_quantile: float
     threshold: int
-    raw_threshold: float
-    triangle_score: float
-    peak_bin: int
-    knee_bin: int
-    tail_bin: int
-    peak_value: float
-    peak_count: int
-    knee_count: int
-    tail_count: int
+    rank_index: int
+    left_slope: float
+    right_slope: float
+    slope_ratio: float
+    fit_improvement: float
+    left_sse: float
+    right_sse: float
+    single_line_sse: float
 
 
 @dataclass(frozen=True)
 class SkewedThresholdResult:
-    """Final threshold and diagnostics needed to judge whether it is stable."""
+    """Final upper-tail threshold and diagnostics for judging its stability."""
 
     threshold: int
     total_count: int
     positive_count: int
     ignored_nonpositive_count: int
-    tail_quantile: float
-    tail_clip_value: float
-    tail_clipped_count: int
-    histogram_count: int
-    below_threshold_count: int
-    below_threshold_fraction: float
+    body_count: int
+    tail_count: int
+    tail_fraction: float
+    analysis_start_quantile: float
+    upper_quantile: float
+    upper_excluded_count: int
+    quantile_points: int
+    min_tail_fraction: float
+    max_tail_fraction: float
     threshold_spread_ratio: float
-    candidates: tuple[TriangleCandidate, ...]
+    breakpoint_quantile_spread: float
+    candidates: tuple[LocalSlopeCandidate, ...]
 
     @property
     def candidate_thresholds(self) -> tuple[int, ...]:
-        """Return the per-resolution thresholds in configured order."""
+        """Return per-window thresholds in configured order."""
 
         return tuple(candidate.threshold for candidate in self.candidates)
+
+    @property
+    def candidate_breakpoint_quantiles(self) -> tuple[float, ...]:
+        """Return per-window breakpoint quantiles."""
+
+        return tuple(candidate.breakpoint_quantile for candidate in self.candidates)
 
 
 def _normalize_delta_clock(data: pd.DataFrame) -> np.ndarray:
@@ -84,8 +125,6 @@ def _normalize_delta_clock(data: pd.DataFrame) -> np.ndarray:
     except (TypeError, ValueError) as error:
         raise ValueError("delta_clock must contain integer values") from error
 
-    # clock 的单位是整数微秒。接受 12.5 之类的小数会让最后的整数阈值
-    # 语义不清楚，因此即使它能被 pandas 转成 float，也在这里明确拒绝。
     if not is_integer_dtype(delta_clock.dtype):
         raise ValueError("delta_clock must contain integer values")
     if is_unsigned_integer_dtype(delta_clock.dtype) and delta_clock.max() > MAX_INT64:
@@ -96,236 +135,394 @@ def _normalize_delta_clock(data: pd.DataFrame) -> np.ndarray:
 
 def _validate_parameters(
     *,
-    tail_quantile: float,
-    histogram_bins: Sequence[int],
-    min_triangle_score: float,
+    analysis_start_quantile: float,
+    upper_quantile: float,
+    quantile_points: int,
+    window_fractions: Sequence[float],
+    min_tail_fraction: float,
+    max_tail_fraction: float,
+    min_slope_ratio: float,
+    min_fit_improvement: float,
+    max_breakpoint_quantile_spread: float,
     max_threshold_spread: float,
-) -> tuple[int, ...]:
-    """Validate estimator settings and normalize histogram resolutions."""
+) -> tuple[float, ...]:
+    """Validate settings and normalize local-window fractions."""
 
-    if not isfinite(tail_quantile) or not 0.5 < tail_quantile < 1:
-        raise ValueError("tail_quantile must be finite and between 0.5 and 1")
-    if not isfinite(min_triangle_score) or min_triangle_score <= 0:
-        raise ValueError("min_triangle_score must be finite and positive")
+    if (
+        not isfinite(analysis_start_quantile)
+        or not isfinite(upper_quantile)
+        or not 0 < analysis_start_quantile < upper_quantile < 1
+    ):
+        raise ValueError(
+            "quantile bounds must satisfy 0 < analysis_start_quantile "
+            "< upper_quantile < 1"
+        )
+    if isinstance(quantile_points, bool) or not isinstance(
+        quantile_points, (int, np.integer)
+    ):
+        raise TypeError("quantile_points must be an integer")
+    if quantile_points < MIN_QUANTILE_POINTS:
+        raise ValueError(f"quantile_points must be at least {MIN_QUANTILE_POINTS}")
+    if (
+        not isfinite(min_tail_fraction)
+        or not isfinite(max_tail_fraction)
+        or not 0 < min_tail_fraction < max_tail_fraction < 0.5
+    ):
+        raise ValueError(
+            "tail fractions must satisfy 0 < min_tail_fraction "
+            "< max_tail_fraction < 0.5"
+        )
+    if analysis_start_quantile >= 1 - max_tail_fraction:
+        raise ValueError(
+            "analysis_start_quantile must be below the earliest tail breakpoint"
+        )
+    if not isfinite(min_slope_ratio) or min_slope_ratio <= 1:
+        raise ValueError("min_slope_ratio must be finite and greater than 1")
+    if not isfinite(min_fit_improvement) or not 0 < min_fit_improvement < 1:
+        raise ValueError("min_fit_improvement must be finite and between 0 and 1")
+    if (
+        not isfinite(max_breakpoint_quantile_spread)
+        or max_breakpoint_quantile_spread <= 0
+    ):
+        raise ValueError("max_breakpoint_quantile_spread must be finite and positive")
     if not isfinite(max_threshold_spread) or max_threshold_spread < 1:
         raise ValueError("max_threshold_spread must be finite and at least 1")
 
-    normalized_bins: list[int] = []
-    for bin_count in histogram_bins:
-        if isinstance(bin_count, bool) or not isinstance(bin_count, (int, np.integer)):
-            raise TypeError("histogram_bins must contain integers")
-        normalized_bin_count = int(bin_count)
-        if normalized_bin_count < MIN_HISTOGRAM_BINS:
-            raise ValueError(
-                f"each histogram bin count must be at least {MIN_HISTOGRAM_BINS}"
-            )
-        if normalized_bin_count not in normalized_bins:
-            normalized_bins.append(normalized_bin_count)
+    normalized_windows: list[float] = []
+    for window_fraction in window_fractions:
+        if not isinstance(window_fraction, (int, float, np.integer, np.floating)):
+            raise TypeError("window_fractions must contain numbers")
+        normalized_window = float(window_fraction)
+        if not isfinite(normalized_window) or normalized_window <= 0:
+            raise ValueError("each window fraction must be finite and positive")
+        if normalized_window not in normalized_windows:
+            normalized_windows.append(normalized_window)
 
-    if len(normalized_bins) < MIN_BIN_CONFIGURATIONS:
+    if len(normalized_windows) < MIN_WINDOW_CONFIGURATIONS:
         raise ValueError(
-            "histogram_bins must contain at least "
-            f"{MIN_BIN_CONFIGURATIONS} distinct resolutions"
+            "window_fractions must contain at least "
+            f"{MIN_WINDOW_CONFIGURATIONS} distinct values"
         )
-    return tuple(normalized_bins)
+
+    largest_window = max(normalized_windows)
+    earliest_breakpoint = 1.0 - max_tail_fraction
+    latest_breakpoint = 1.0 - min_tail_fraction
+    if earliest_breakpoint - largest_window <= analysis_start_quantile:
+        raise ValueError(
+            "analysis_start_quantile does not leave a full left local window"
+        )
+    if latest_breakpoint + largest_window >= upper_quantile:
+        raise ValueError("upper_quantile does not leave a full right local window")
+
+    quantile_step = (upper_quantile - analysis_start_quantile) / (quantile_points - 1)
+    if min(normalized_windows) / quantile_step < MIN_LOCAL_GRID_POINTS:
+        raise ValueError("quantile_points is too small for the narrowest local window")
+    return tuple(normalized_windows)
 
 
-def _triangle_candidate(
-    log_values: np.ndarray,
+def _linear_fit(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    """Return ordinary-least-squares slope and residual sum of squares."""
+
+    centered_x = x - float(x.mean())
+    centered_y = y - float(y.mean())
+    denominator = float(centered_x @ centered_x)
+    if denominator <= NUMERICAL_EPSILON:
+        return 0.0, float(centered_y @ centered_y)
+
+    slope = float((centered_x @ centered_y) / denominator)
+    if slope < 0:
+        return 0.0, float(centered_y @ centered_y)
+    intercept = float(y.mean()) - slope * float(x.mean())
+    residuals = y - (intercept + slope * x)
+    return slope, float(residuals @ residuals)
+
+
+def _fit_local_slope_candidate(
+    sorted_positive_values: np.ndarray,
     *,
-    lower_log_value: float,
-    upper_log_value: float,
-    histogram_bins: int,
-    min_triangle_score: float,
-) -> TriangleCandidate | None:
-    """Apply a right-tail triangle rule at one histogram resolution.
+    quantiles: np.ndarray,
+    rank_indices: np.ndarray,
+    log_quantile_values: np.ndarray,
+    window_fraction: float,
+    min_tail_fraction: float,
+    max_tail_fraction: float,
+    min_slope_ratio: float,
+    min_fit_improvement: float,
+) -> tuple[LocalSlopeCandidate | None, str | None]:
+    """Find the strongest local slope increase for one window width.
 
-    The histogram peak represents the dense small-gap region.  The last
-    occupied bin represents the sparse right tail.  We connect those two
-    points with a straight line and find the intermediate histogram bin that
-    lies furthest *below* that line.  That bin is the triangle-method knee.
+    For every permitted candidate rank ``q``:
 
-    Both axes are normalized to 0..1 before measuring distance.  Without this
-    normalization, changing the number of bins would change the x-axis scale
-    and make scores from different resolutions incomparable.
+    1. fit a line on ``[q-window, q)``;
+    2. fit another line on ``[q, q+window]``;
+    3. compare their slopes;
+    4. compare the two-line residual with a single line over the whole window.
+
+    The candidate with the largest right/left slope ratio is selected first;
+    only then are the minimum ratio and fit-improvement rules applied.  This
+    prevents searching until some weaker, convenient point happens to pass.
     """
 
-    counts, bin_edges = np.histogram(
-        log_values,
-        bins=histogram_bins,
-        range=(lower_log_value, upper_log_value),
+    earliest_breakpoint = 1.0 - max_tail_fraction
+    latest_breakpoint = 1.0 - min_tail_fraction
+    eligible = np.flatnonzero(
+        (quantiles >= earliest_breakpoint)
+        & (quantiles <= latest_breakpoint)
+        & (quantiles - window_fraction >= quantiles[0])
+        & (quantiles + window_fraction <= quantiles[-1])
     )
-    occupied_bins = np.flatnonzero(counts)
-    if occupied_bins.size == 0:
-        return None
+    if eligible.size < 3:
+        return None, "tail and window bounds leave too few candidate ranks"
 
-    # np.argmax chooses the first peak in a tie.  For this right-tail problem,
-    # the earlier peak is the conservative choice: it does not silently throw
-    # away a dense small-delta mode that happens to tie with a later bin.
-    peak_bin = int(np.argmax(counts))
-    tail_bin = int(occupied_bins[-1])
+    best_score: tuple[float, float, float, float] | None = None
+    best_candidate: LocalSlopeCandidate | None = None
 
-    # The two endpoints themselves cannot be a knee.  Requiring at least two
-    # bins between them also prevents a very coarse/degenerate histogram from
-    # manufacturing a threshold.
-    if tail_bin - peak_bin < 3:
-        return None
+    for breakpoint_index in eligible:
+        breakpoint_quantile = float(quantiles[breakpoint_index])
+        left_start = int(
+            np.searchsorted(
+                quantiles,
+                breakpoint_quantile - window_fraction,
+                side="left",
+            )
+        )
+        right_stop = int(
+            np.searchsorted(
+                quantiles,
+                breakpoint_quantile + window_fraction,
+                side="right",
+            )
+        )
+        if (
+            breakpoint_index - left_start < MIN_LOCAL_GRID_POINTS
+            or right_stop - breakpoint_index < MIN_LOCAL_GRID_POINTS
+        ):
+            continue
 
-    interior_bins = np.arange(peak_bin + 1, tail_bin, dtype="int64")
-    normalized_x = (interior_bins - peak_bin) / (tail_bin - peak_bin)
+        # 左右不重复使用折点：左侧是 [left_start, breakpoint)，右侧是
+        # [breakpoint, right_stop)。这样 two-line SSE 与整个窗口 single-line
+        # SSE 使用完全相同的观测点，可以直接比较。
+        left_x = quantiles[left_start:breakpoint_index]
+        left_y = log_quantile_values[left_start:breakpoint_index]
+        right_x = quantiles[breakpoint_index:right_stop]
+        right_y = log_quantile_values[breakpoint_index:right_stop]
+        full_x = quantiles[left_start:right_stop]
+        full_y = log_quantile_values[left_start:right_stop]
 
-    peak_count = int(counts[peak_bin])
-    tail_count = int(counts[tail_bin])
-    normalized_y = counts[interior_bins] / peak_count
-    normalized_tail_y = tail_count / peak_count
+        left_slope, left_sse = _linear_fit(left_x, left_y)
+        right_slope, right_sse = _linear_fit(right_x, right_y)
+        _, single_line_sse = _linear_fit(full_x, full_y)
 
-    # In normalized coordinates the endpoint line is
-    # y = 1 + (tail_y - 1) * x.  A rapidly thinning right-skewed histogram lies
-    # below this line.  The numerator below is the vertical gap; dividing by
-    # sqrt(1 + slope^2) turns it into perpendicular distance to the line.
-    line_slope = normalized_tail_y - 1.0
-    line_y = 1.0 + line_slope * normalized_x
-    perpendicular_distance = (line_y - normalized_y) / np.sqrt(1.0 + line_slope**2)
+        if left_slope <= NUMERICAL_EPSILON:
+            slope_ratio = float("inf") if right_slope > 0 else 1.0
+        else:
+            slope_ratio = right_slope / left_slope
+        if single_line_sse <= NUMERICAL_EPSILON:
+            fit_improvement = 0.0
+        else:
+            fit_improvement = 1.0 - (left_sse + right_sse) / single_line_sse
 
-    best_offset = int(np.argmax(perpendicular_distance))
-    triangle_score = float(perpendicular_distance[best_offset])
-    if not isfinite(triangle_score) or triangle_score < min_triangle_score:
-        return None
+        # ratio 是主要目标。若平坦区令多个 ratio 都为 inf，则依次偏好更大
+        # 的右斜率、更好的拟合改善和更早的 rank，保证确定且保守的结果。
+        score = (
+            slope_ratio,
+            right_slope,
+            fit_improvement,
+            -breakpoint_quantile,
+        )
+        if best_score is None or score > best_score:
+            rank_index = int(rank_indices[breakpoint_index])
+            best_score = score
+            best_candidate = LocalSlopeCandidate(
+                window_fraction=window_fraction,
+                breakpoint_quantile=breakpoint_quantile,
+                threshold=int(sorted_positive_values[rank_index]),
+                rank_index=rank_index,
+                left_slope=left_slope,
+                right_slope=right_slope,
+                slope_ratio=slope_ratio,
+                fit_improvement=fit_improvement,
+                left_sse=left_sse,
+                right_sse=right_sse,
+                single_line_sse=single_line_sse,
+            )
 
-    knee_bin = int(interior_bins[best_offset])
-
-    # Use the *upper edge* of the knee bin.  Values below that edge stay on the
-    # dense/small-gap side; a value equal to the returned integer threshold is
-    # on the large-gap side, matching the baseline grouping rule (gap >= k
-    # starts a new local group).  ceil avoids truncating the boundary downward.
-    raw_threshold = float(np.expm1(bin_edges[knee_bin + 1]))
-    threshold = min(MAX_INT64, max(1, ceil(raw_threshold)))
-    peak_value = float(np.expm1((bin_edges[peak_bin] + bin_edges[peak_bin + 1]) / 2.0))
-
-    return TriangleCandidate(
-        histogram_bins=histogram_bins,
-        threshold=threshold,
-        raw_threshold=raw_threshold,
-        triangle_score=triangle_score,
-        peak_bin=peak_bin,
-        knee_bin=knee_bin,
-        tail_bin=tail_bin,
-        peak_value=peak_value,
-        peak_count=peak_count,
-        knee_count=int(counts[knee_bin]),
-        tail_count=tail_count,
-    )
+    if best_candidate is None:
+        return None, "no candidate has enough local curve points"
+    if best_candidate.breakpoint_quantile in (
+        float(quantiles[eligible[0]]),
+        float(quantiles[eligible[-1]]),
+    ):
+        return None, "strongest slope change lies on a tail-fraction boundary"
+    if best_candidate.slope_ratio < min_slope_ratio:
+        return None, (
+            f"best slope ratio {best_candidate.slope_ratio:.3f} is below "
+            f"{min_slope_ratio:.3f}"
+        )
+    if best_candidate.fit_improvement < min_fit_improvement:
+        return None, (
+            f"best two-line fit improvement {best_candidate.fit_improvement:.3f} "
+            f"is below {min_fit_improvement:.3f}"
+        )
+    return best_candidate, None
 
 
 def estimate_skewed_threshold(
     data: pd.DataFrame,
     *,
-    tail_quantile: float = DEFAULT_TAIL_QUANTILE,
-    histogram_bins: Sequence[int] = DEFAULT_HISTOGRAM_BINS,
-    min_triangle_score: float = DEFAULT_MIN_TRIANGLE_SCORE,
+    analysis_start_quantile: float = DEFAULT_ANALYSIS_START_QUANTILE,
+    upper_quantile: float = DEFAULT_UPPER_QUANTILE,
+    quantile_points: int = DEFAULT_QUANTILE_POINTS,
+    window_fractions: Sequence[float] = DEFAULT_WINDOW_FRACTIONS,
+    min_tail_fraction: float = DEFAULT_MIN_TAIL_FRACTION,
+    max_tail_fraction: float = DEFAULT_MAX_TAIL_FRACTION,
+    min_slope_ratio: float = DEFAULT_MIN_SLOPE_RATIO,
+    min_fit_improvement: float = DEFAULT_MIN_FIT_IMPROVEMENT,
+    max_breakpoint_quantile_spread: float = (DEFAULT_MAX_BREAKPOINT_QUANTILE_SPREAD),
     max_threshold_spread: float = DEFAULT_MAX_THRESHOLD_SPREAD,
 ) -> SkewedThresholdResult:
-    """Estimate a stable frequency-aware threshold for skewed ``delta_clock``.
+    """Find a stable local-slope changepoint at a small upper-tail onset.
 
-    Why this differs from the old slope/MAD baseline:
-
-    1. Every positive observation is retained in the histogram.  Four million
-       repeated small values therefore carry four million observations' worth
-       of weight; they are not collapsed into a few non-zero sorted slopes.
-    2. ``log1p(delta_clock)`` compresses a right tail such as 3,000..980,000,
-       so the maximum cannot consume nearly the entire histogram x-axis.
-    3. Values above a high quantile are left out of the histogram geometry.
-       They are still reported and still count when describing which side of
-       the final threshold each observation falls on.
-    4. The triangle knee is repeated at several bin counts.  The median is
-       returned only when those candidates agree within a configured ratio.
-
-    This detects a distributional scale change, not a proven business group
-    boundary.  The diagnostics should be inspected before using the threshold.
+    The method encodes three user-confirmed assumptions: most gaps are
+    within-group, between-group gaps form a small upper tail, and the sorted
+    curve grows much faster on entering that tail.  These assumptions cannot
+    be proven from one unlabeled distribution, so unstable candidates raise
+    ``ValueError`` instead of producing an arbitrary threshold.
     """
 
-    normalized_bins = _validate_parameters(
-        tail_quantile=tail_quantile,
-        histogram_bins=histogram_bins,
-        min_triangle_score=min_triangle_score,
+    normalized_windows = _validate_parameters(
+        analysis_start_quantile=analysis_start_quantile,
+        upper_quantile=upper_quantile,
+        quantile_points=quantile_points,
+        window_fractions=window_fractions,
+        min_tail_fraction=min_tail_fraction,
+        max_tail_fraction=max_tail_fraction,
+        min_slope_ratio=min_slope_ratio,
+        min_fit_improvement=min_fit_improvement,
+        max_breakpoint_quantile_spread=max_breakpoint_quantile_spread,
         max_threshold_spread=max_threshold_spread,
     )
     delta_clock = _normalize_delta_clock(data)
-    positive_values = delta_clock[delta_clock > 0]
-
-    if positive_values.size < MIN_POSITIVE_DELTAS:
+    sorted_positive_values = np.sort(delta_clock[delta_clock > 0])
+    positive_count = int(sorted_positive_values.size)
+    if positive_count < MIN_POSITIVE_DELTAS:
         raise ValueError(
-            "at least "
-            f"{MIN_POSITIVE_DELTAS} positive delta_clock observations are required"
+            f"at least {MIN_POSITIVE_DELTAS} positive delta_clock observations "
+            "are required"
         )
-
-    # quantile uses the empirical ranks *with duplicates*.  This is important
-    # for the user's distribution: millions of values below 20 must influence
-    # the 99.5% cutoff and the histogram, rather than disappearing after a
-    # unique-value or non-zero-slope filter.
-    tail_clip_value = float(np.quantile(positive_values, tail_quantile))
-    histogram_values = positive_values[positive_values <= tail_clip_value]
-    tail_clipped_count = int(positive_values.size - histogram_values.size)
-
-    log_values = np.log1p(histogram_values.astype("float64", copy=False))
-    lower_log_value = float(log_values.min())
-    upper_log_value = float(log_values.max())
-    if lower_log_value == upper_log_value:
+    if ceil(positive_count * min_tail_fraction) < MIN_TAIL_OBSERVATIONS:
         raise ValueError(
-            "positive delta_clock values have no variation after tail clipping"
+            "min_tail_fraction leaves fewer than "
+            f"{MIN_TAIL_OBSERVATIONS} observations in the smallest allowed tail"
         )
+    if sorted_positive_values[0] == sorted_positive_values[-1]:
+        raise ValueError("positive delta_clock values have no variation")
 
-    candidates = tuple(
-        candidate
-        for bin_count in normalized_bins
-        if (
-            candidate := _triangle_candidate(
-                log_values,
-                lower_log_value=lower_log_value,
-                upper_log_value=upper_log_value,
-                histogram_bins=bin_count,
-                min_triangle_score=min_triangle_score,
-            )
-        )
-        is not None
+    # 等距 empirical-rank 采样保留频数：大量重复小值会占据大量 rank，
+    # 而不是在 unique 或“只保留正 slope”后被压成一个值。
+    quantiles = np.linspace(
+        analysis_start_quantile,
+        upper_quantile,
+        quantile_points,
+        dtype="float64",
     )
-    if len(candidates) < MIN_BIN_CONFIGURATIONS:
+    rank_indices = np.floor(quantiles * (positive_count - 1)).astype("int64")
+    if np.unique(rank_indices).size < 2 * MIN_LOCAL_GRID_POINTS + 1:
+        raise ValueError("too few distinct empirical ranks in the quantile curve")
+    log_quantile_values = np.log1p(
+        sorted_positive_values[rank_indices].astype("float64", copy=False)
+    )
+
+    candidates: list[LocalSlopeCandidate] = []
+    failures: list[str] = []
+    for window_fraction in normalized_windows:
+        candidate, failure = _fit_local_slope_candidate(
+            sorted_positive_values,
+            quantiles=quantiles,
+            rank_indices=rank_indices,
+            log_quantile_values=log_quantile_values,
+            window_fraction=window_fraction,
+            min_tail_fraction=min_tail_fraction,
+            max_tail_fraction=max_tail_fraction,
+            min_slope_ratio=min_slope_ratio,
+            min_fit_improvement=min_fit_improvement,
+        )
+        if candidate is None:
+            failures.append(f"window={window_fraction:.4f}: {failure}")
+        else:
+            candidates.append(candidate)
+
+    # 三种平滑尺度必须全部找到有效折点；只保留碰巧成功的窗口会产生选择
+    # 偏差，也无法说明检测到的是同一个上尾起点。
+    if failures:
         raise ValueError(
-            "no reliable triangle knee: fewer than "
-            f"{MIN_BIN_CONFIGURATIONS} histogram resolutions produced candidates"
+            "no stable upper-tail changepoint across all local windows: "
+            + "; ".join(failures)
         )
 
-    raw_thresholds = np.asarray(
-        [candidate.raw_threshold for candidate in candidates], dtype="float64"
+    candidate_thresholds = np.asarray(
+        [candidate.threshold for candidate in candidates], dtype="float64"
     )
-    threshold_spread_ratio = float(raw_thresholds.max() / raw_thresholds.min())
+    threshold_spread_ratio = float(
+        candidate_thresholds.max() / candidate_thresholds.min()
+    )
     if threshold_spread_ratio > max_threshold_spread:
-        formatted_candidates = ", ".join(
-            str(candidate.threshold) for candidate in candidates
-        )
+        formatted = ", ".join(str(int(value)) for value in candidate_thresholds)
         raise ValueError(
-            "unstable triangle threshold across histogram resolutions: "
-            f"candidates=[{formatted_candidates}], "
+            "unstable upper-tail thresholds across local windows: "
+            f"candidates=[{formatted}], "
             f"spread_ratio={threshold_spread_ratio:.3f} exceeds "
             f"{max_threshold_spread:.3f}"
         )
 
-    threshold = min(MAX_INT64, max(1, ceil(float(np.median(raw_thresholds)))))
-    below_threshold_count = int(np.count_nonzero(positive_values < threshold))
+    breakpoint_quantiles = np.asarray(
+        [candidate.breakpoint_quantile for candidate in candidates],
+        dtype="float64",
+    )
+    breakpoint_quantile_spread = float(
+        breakpoint_quantiles.max() - breakpoint_quantiles.min()
+    )
+    if breakpoint_quantile_spread > max_breakpoint_quantile_spread:
+        formatted = ", ".join(f"{value:.6f}" for value in breakpoint_quantiles)
+        raise ValueError(
+            "unstable upper-tail breakpoint ranks across local windows: "
+            f"quantiles=[{formatted}], "
+            f"spread={breakpoint_quantile_spread:.6f} exceeds "
+            f"{max_breakpoint_quantile_spread:.6f}"
+        )
+
+    threshold = min(
+        MAX_INT64,
+        max(1, ceil(float(np.median(candidate_thresholds)))),
+    )
+    body_count = int(np.searchsorted(sorted_positive_values, threshold, side="left"))
+    tail_count = positive_count - body_count
+    tail_fraction = tail_count / positive_count
+    if not min_tail_fraction <= tail_fraction <= max_tail_fraction:
+        raise ValueError(
+            "selected integer threshold produces a tail fraction outside the "
+            "configured bounds, possibly because many observations tie at the "
+            f"threshold: tail_fraction={tail_fraction:.6f}"
+        )
+    upper_last_rank = int(np.floor(upper_quantile * (positive_count - 1)))
 
     return SkewedThresholdResult(
         threshold=threshold,
         total_count=int(delta_clock.size),
-        positive_count=int(positive_values.size),
-        ignored_nonpositive_count=int(delta_clock.size - positive_values.size),
-        tail_quantile=tail_quantile,
-        tail_clip_value=tail_clip_value,
-        tail_clipped_count=tail_clipped_count,
-        histogram_count=int(histogram_values.size),
-        below_threshold_count=below_threshold_count,
-        below_threshold_fraction=below_threshold_count / positive_values.size,
+        positive_count=positive_count,
+        ignored_nonpositive_count=int(delta_clock.size - positive_count),
+        body_count=body_count,
+        tail_count=tail_count,
+        tail_fraction=tail_fraction,
+        analysis_start_quantile=analysis_start_quantile,
+        upper_quantile=upper_quantile,
+        upper_excluded_count=positive_count - upper_last_rank - 1,
+        quantile_points=quantile_points,
+        min_tail_fraction=min_tail_fraction,
+        max_tail_fraction=max_tail_fraction,
         threshold_spread_ratio=threshold_spread_ratio,
-        candidates=candidates,
+        breakpoint_quantile_spread=breakpoint_quantile_spread,
+        candidates=tuple(candidates),
     )
 
 
@@ -340,38 +537,45 @@ def _summary_frame(result: SkewedThresholdResult) -> pd.DataFrame:
                 "total_count": result.total_count,
                 "positive_count": result.positive_count,
                 "ignored_nonpositive_count": result.ignored_nonpositive_count,
-                "tail_quantile": result.tail_quantile,
-                "tail_clip_value": result.tail_clip_value,
-                "tail_clipped_count": result.tail_clipped_count,
-                "histogram_count": result.histogram_count,
-                "below_threshold_count": result.below_threshold_count,
-                "below_threshold_fraction": result.below_threshold_fraction,
+                "body_count": result.body_count,
+                "tail_count": result.tail_count,
+                "tail_fraction": result.tail_fraction,
+                "analysis_start_quantile": result.analysis_start_quantile,
+                "upper_quantile": result.upper_quantile,
+                "upper_excluded_count": result.upper_excluded_count,
+                "quantile_points": result.quantile_points,
+                "min_tail_fraction": result.min_tail_fraction,
+                "max_tail_fraction": result.max_tail_fraction,
                 "candidate_thresholds": ";".join(
                     str(value) for value in result.candidate_thresholds
                 ),
+                "candidate_breakpoint_quantiles": ";".join(
+                    f"{value:.9f}" for value in result.candidate_breakpoint_quantiles
+                ),
                 "threshold_spread_ratio": result.threshold_spread_ratio,
+                "breakpoint_quantile_spread": result.breakpoint_quantile_spread,
             }
         ]
     )
 
 
 def _diagnostics_frame(result: SkewedThresholdResult) -> pd.DataFrame:
-    """Convert per-resolution candidates into a diagnostic CSV."""
+    """Convert per-window local fits into a diagnostic CSV."""
 
     return pd.DataFrame.from_records(
         [
             {
-                "histogram_bins": candidate.histogram_bins,
+                "window_fraction": candidate.window_fraction,
+                "breakpoint_quantile": candidate.breakpoint_quantile,
                 "candidate_threshold": candidate.threshold,
-                "raw_threshold": candidate.raw_threshold,
-                "triangle_score": candidate.triangle_score,
-                "peak_bin": candidate.peak_bin,
-                "knee_bin": candidate.knee_bin,
-                "tail_bin": candidate.tail_bin,
-                "peak_value": candidate.peak_value,
-                "peak_count": candidate.peak_count,
-                "knee_count": candidate.knee_count,
-                "tail_count": candidate.tail_count,
+                "rank_index": candidate.rank_index,
+                "left_slope": candidate.left_slope,
+                "right_slope": candidate.right_slope,
+                "slope_ratio": candidate.slope_ratio,
+                "fit_improvement": candidate.fit_improvement,
+                "left_sse": candidate.left_sse,
+                "right_sse": candidate.right_sse,
+                "single_line_sse": candidate.single_line_sse,
             }
             for candidate in result.candidates
         ]
@@ -383,12 +587,18 @@ def process_csv(
     output_csv: Path | str,
     *,
     diagnostics_csv: Path | str | None = None,
-    tail_quantile: float = DEFAULT_TAIL_QUANTILE,
-    histogram_bins: Sequence[int] = DEFAULT_HISTOGRAM_BINS,
-    min_triangle_score: float = DEFAULT_MIN_TRIANGLE_SCORE,
+    analysis_start_quantile: float = DEFAULT_ANALYSIS_START_QUANTILE,
+    upper_quantile: float = DEFAULT_UPPER_QUANTILE,
+    quantile_points: int = DEFAULT_QUANTILE_POINTS,
+    window_fractions: Sequence[float] = DEFAULT_WINDOW_FRACTIONS,
+    min_tail_fraction: float = DEFAULT_MIN_TAIL_FRACTION,
+    max_tail_fraction: float = DEFAULT_MAX_TAIL_FRACTION,
+    min_slope_ratio: float = DEFAULT_MIN_SLOPE_RATIO,
+    min_fit_improvement: float = DEFAULT_MIN_FIT_IMPROVEMENT,
+    max_breakpoint_quantile_spread: float = (DEFAULT_MAX_BREAKPOINT_QUANTILE_SPREAD),
     max_threshold_spread: float = DEFAULT_MAX_THRESHOLD_SPREAD,
 ) -> SkewedThresholdResult:
-    """Read deltas, estimate a threshold, and write summary diagnostics."""
+    """Read deltas, estimate the upper-tail onset, and write diagnostics."""
 
     input_path = Path(input_csv)
     output_path = Path(output_csv)
@@ -401,18 +611,24 @@ def process_csv(
         if diagnostics_path.resolve() == output_path.resolve():
             raise ValueError("diagnostics_csv and output_csv must be different files")
 
-    # usecols 避免把原始 clock_delta.csv 中可能存在的其他列载入内存。
-    # string dtype 先保留 CSV 的字面值，再由统一校验逻辑判断是否为整数。
     data = pd.read_csv(
         input_path,
         usecols=[DELTA_COLUMN],
-        dtype={DELTA_COLUMN: "string"},
+        # 直接使用 pandas nullable integer，避免 498 万条数字先以 Python
+        # 字符串常驻内存；缺失和非整数仍由统一校验或 CSV parser 明确拒绝。
+        dtype={DELTA_COLUMN: "Int64"},
     )
     result = estimate_skewed_threshold(
         data,
-        tail_quantile=tail_quantile,
-        histogram_bins=histogram_bins,
-        min_triangle_score=min_triangle_score,
+        analysis_start_quantile=analysis_start_quantile,
+        upper_quantile=upper_quantile,
+        quantile_points=quantile_points,
+        window_fractions=window_fractions,
+        min_tail_fraction=min_tail_fraction,
+        max_tail_fraction=max_tail_fraction,
+        min_slope_ratio=min_slope_ratio,
+        min_fit_improvement=min_fit_improvement,
+        max_breakpoint_quantile_spread=max_breakpoint_quantile_spread,
         max_threshold_spread=max_threshold_spread,
     )
     _summary_frame(result).to_csv(output_path, index=False)
@@ -421,17 +637,17 @@ def process_csv(
     return result
 
 
-def _parse_histogram_bins(value: str) -> tuple[int, ...]:
-    """Parse ``--bins 32,48,64,96`` into integer resolutions."""
+def _parse_fractions(value: str) -> tuple[float, ...]:
+    """Parse a comma-separated CLI fraction list."""
 
     try:
-        values = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+        values = tuple(float(part.strip()) for part in value.split(",") if part.strip())
     except ValueError as error:
         raise argparse.ArgumentTypeError(
-            "bins must be comma-separated integers, for example 32,48,64,96"
+            "fractions must be comma-separated numbers, for example 0.001,0.002,0.004"
         ) from error
     if not values:
-        raise argparse.ArgumentTypeError("bins must not be empty")
+        raise argparse.ArgumentTypeError("fractions must not be empty")
     return values
 
 
@@ -440,9 +656,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Estimate a frequency-aware delta_clock threshold with an ensemble "
-            "of triangle knees on log-scaled histograms. Input must contain a "
-            "delta_clock column, such as the output of mds.clock_delta."
+            "Find the onset of a small, rapidly growing delta_clock upper tail "
+            "by comparing local regression slopes on empirical quantiles. "
+            "Input must contain a delta_clock column."
         )
     )
     parser.add_argument("input_csv", type=Path, help="CSV containing delta_clock")
@@ -450,31 +666,67 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--diagnostics-csv",
         type=Path,
-        help="optional per-histogram-resolution diagnostics CSV",
+        help="optional per-window diagnostics CSV",
     )
     parser.add_argument(
-        "--tail-quantile",
+        "--analysis-start-quantile",
         type=float,
-        default=DEFAULT_TAIL_QUANTILE,
-        help="upper quantile retained in histogram geometry (default: %(default)s)",
+        default=DEFAULT_ANALYSIS_START_QUANTILE,
+        help="lowest quantile sampled for local fits (default: %(default)s)",
     )
     parser.add_argument(
-        "--bins",
-        type=_parse_histogram_bins,
-        default=DEFAULT_HISTOGRAM_BINS,
-        help="comma-separated histogram resolutions (default: 32,48,64,96)",
-    )
-    parser.add_argument(
-        "--min-triangle-score",
+        "--upper-quantile",
         type=float,
-        default=DEFAULT_MIN_TRIANGLE_SCORE,
-        help="minimum normalized triangle distance (default: %(default)s)",
+        default=DEFAULT_UPPER_QUANTILE,
+        help="highest quantile sampled for local fits (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--quantile-points",
+        type=int,
+        default=DEFAULT_QUANTILE_POINTS,
+        help="points sampled on the quantile curve (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--window-fractions",
+        type=_parse_fractions,
+        default=DEFAULT_WINDOW_FRACTIONS,
+        help="comma-separated local half-window sizes (default: 0.001,0.002,0.004)",
+    )
+    parser.add_argument(
+        "--min-tail-fraction",
+        type=float,
+        default=DEFAULT_MIN_TAIL_FRACTION,
+        help="smallest permitted tail fraction (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--max-tail-fraction",
+        type=float,
+        default=DEFAULT_MAX_TAIL_FRACTION,
+        help="largest permitted tail fraction (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--min-slope-ratio",
+        type=float,
+        default=DEFAULT_MIN_SLOPE_RATIO,
+        help="minimum right/left local slope ratio (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--min-fit-improvement",
+        type=float,
+        default=DEFAULT_MIN_FIT_IMPROVEMENT,
+        help="minimum two-line SSE reduction (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--max-breakpoint-quantile-spread",
+        type=float,
+        default=DEFAULT_MAX_BREAKPOINT_QUANTILE_SPREAD,
+        help="maximum breakpoint-rank spread (default: %(default)s)",
     )
     parser.add_argument(
         "--max-threshold-spread",
         type=float,
         default=DEFAULT_MAX_THRESHOLD_SPREAD,
-        help="maximum max/min candidate ratio (default: %(default)s)",
+        help="maximum max/min candidate threshold ratio (default: %(default)s)",
     )
     return parser
 
@@ -489,23 +741,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.input_csv,
             arguments.output_csv,
             diagnostics_csv=arguments.diagnostics_csv,
-            tail_quantile=arguments.tail_quantile,
-            histogram_bins=arguments.bins,
-            min_triangle_score=arguments.min_triangle_score,
+            analysis_start_quantile=arguments.analysis_start_quantile,
+            upper_quantile=arguments.upper_quantile,
+            quantile_points=arguments.quantile_points,
+            window_fractions=arguments.window_fractions,
+            min_tail_fraction=arguments.min_tail_fraction,
+            max_tail_fraction=arguments.max_tail_fraction,
+            min_slope_ratio=arguments.min_slope_ratio,
+            min_fit_improvement=arguments.min_fit_improvement,
+            max_breakpoint_quantile_spread=(arguments.max_breakpoint_quantile_spread),
             max_threshold_spread=arguments.max_threshold_spread,
         )
-    except (OSError, ValueError) as error:
+    except (OSError, TypeError, ValueError) as error:
         parser.exit(status=1, message=f"error: {error}\n")
 
-    candidates = ",".join(str(value) for value in result.candidate_thresholds)
+    thresholds = ",".join(str(value) for value in result.candidate_thresholds)
+    breakpoint_quantiles = ",".join(
+        f"{value:.6f}" for value in result.candidate_breakpoint_quantiles
+    )
+    slope_ratios = ",".join(
+        "inf" if not isfinite(candidate.slope_ratio) else f"{candidate.slope_ratio:.2f}"
+        for candidate in result.candidates
+    )
     print(
-        "Detected frequency-aware delta_clock threshold: "
+        "Detected upper-tail delta_clock threshold: "
         f"threshold={result.threshold} us, "
-        f"candidates=[{candidates}], "
-        f"spread_ratio={result.threshold_spread_ratio:.3f}, "
-        f"below={result.below_threshold_count}/{result.positive_count} "
-        f"({result.below_threshold_fraction:.2%}), "
-        f"tail_clipped={result.tail_clipped_count}"
+        f"tail={result.tail_count}/{result.positive_count} "
+        f"({result.tail_fraction:.2%}), "
+        f"candidates=[{thresholds}], "
+        f"breakpoint_quantiles=[{breakpoint_quantiles}], "
+        f"slope_ratios=[{slope_ratios}]"
     )
     return 0
 
