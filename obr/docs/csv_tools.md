@@ -1,7 +1,21 @@
 # CSV 验证工具
 
-这两个脚本位于 `obr/script`，只使用 Python 标准库，都可以作为独立命令运行。
-它们用于构建可复现的小型验证数据，不负责确定最终的交易所事件排序规则。
+这两个脚本位于 `obr/script`，都可以作为独立命令运行。它们统一使用 pandas 的
+`read_csv` 和 `DataFrame.to_csv` 读写 CSV，用于构建可复现的小型验证数据，
+不负责确定最终的交易所事件排序规则。
+
+## 安装依赖
+
+建议使用独立虚拟环境：
+
+```bash
+python3 -m venv /tmp/obr-python-env
+source /tmp/obr-python-env/bin/activate
+python -m pip install -r ./quant/obr/requirements.txt
+```
+
+脚本读取时把所有原始字段保留为字符串，并关闭 pandas 默认的空值识别，避免
+`000001`、空字符串和四位小数价格被自动改写。
 
 ## 1. 按到达时间截取三个 CSV
 

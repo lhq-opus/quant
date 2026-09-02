@@ -3,6 +3,16 @@
 `reconstruct_book_demo.py` 用一个 Python 文件展示从 `order.csv` 和 `trade.csv`
 重建 `book.csv` 的完整状态转换。它的目标是学习和手工验证，不是取代 C++ 生产核心。
 
+脚本使用 pandas 读写 CSV。首次运行前安装项目依赖：
+
+```bash
+python3 -m venv /tmp/obr-python-env
+source /tmp/obr-python-env/bin/activate
+python -m pip install -r ./quant/obr/requirements.txt
+```
+
+输入列全部按字符串读取，订单簿计算时才显式把价格转为 `Decimal`、数量转为整数。
+
 ## 运行
 
 ```bash

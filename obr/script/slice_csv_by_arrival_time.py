@@ -2,12 +2,20 @@
 """Create order, trade, and book CSV subsets for an inclusive arrival-time range."""
 
 import argparse
-import csv
 import os
 import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
+
+try:
+    import pandas as pd
+except ImportError:
+    print(
+        "error: pandas is required; install quant/obr/requirements.txt",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 
 
 TIME_COLUMN_CANDIDATES = ("clockAtArrivalTime", "clockAtArrival", "caa")
@@ -24,9 +32,15 @@ def parse_args():
             "range [START, END]."
         )
     )
-    parser.add_argument("--order", required=True, type=Path, help="Path to input order CSV")
-    parser.add_argument("--trade", required=True, type=Path, help="Path to input trade CSV")
-    parser.add_argument("--book", required=True, type=Path, help="Path to input book CSV")
+    parser.add_argument(
+        "--order", required=True, type=Path, help="Path to input order CSV"
+    )
+    parser.add_argument(
+        "--trade", required=True, type=Path, help="Path to input trade CSV"
+    )
+    parser.add_argument(
+        "--book", required=True, type=Path, help="Path to input book CSV"
+    )
     output_group = parser.add_mutually_exclusive_group(required=True)
     output_group.add_argument(
         "--output-path",
@@ -40,7 +54,9 @@ def parse_args():
         type=Path,
         help="Deprecated alias for --output-path",
     )
-    parser.add_argument("--start-time", required=True, help="Inclusive start arrival time")
+    parser.add_argument(
+        "--start-time", required=True, help="Inclusive start arrival time"
+    )
     parser.add_argument("--end-time", required=True, help="Inclusive end arrival time")
     parser.add_argument(
         "--time-format",
@@ -136,63 +152,71 @@ def resolve_time_column(header, explicit_column, path):
 def read_filtered_csv(
     path, explicit_time_column, start_time, end_time, time_format
 ):
+    """Read text fields with pandas, then keep rows inside the time range."""
     try:
-        input_file = path.open("r", encoding="utf-8-sig", newline="")
+        # header=None lets us validate duplicate column names before assigning them.
+        raw_frame = pd.read_csv(
+            path,
+            header=None,
+            dtype=str,
+            keep_default_na=False,
+            na_filter=False,
+            encoding="utf-8-sig",
+            engine="python",
+            skip_blank_lines=False,
+        )
+    except pd.errors.EmptyDataError:
+        raise CsvToolError("%s: CSV file is empty" % path)
+    except pd.errors.ParserError as error:
+        raise CsvToolError("%s: malformed CSV data: %s" % (path, error))
     except OSError as error:
         raise CsvToolError("cannot open %s: %s" % (path, error))
 
-    with input_file:
-        reader = csv.reader(input_file, strict=True)
-        try:
-            header = next(reader)
-        except StopIteration:
-            raise CsvToolError("%s: CSV file is empty" % path)
-        except csv.Error as error:
-            raise CsvToolError("%s: cannot read CSV header: %s" % (path, error))
+    header = ["" if pd.isna(value) else str(value) for value in raw_frame.iloc[0]]
+    validate_header(header, path)
 
-        validate_header(header, path)
-        time_column = resolve_time_column(header, explicit_time_column, path)
-        time_index = header.index(time_column)
-        selected_rows = []
-        total_rows = 0
+    frame = raw_frame.iloc[1:].reset_index(drop=True)
+    missing_rows = frame.isna().any(axis=1)
+    if missing_rows.any():
+        row_index = missing_rows[missing_rows].index[0]
+        actual_columns = int(frame.loc[row_index].notna().sum())
+        raise CsvToolError(
+            "%s:%d: expected %d columns, found %d"
+            % (path, row_index + 2, len(header), actual_columns)
+        )
 
-        try:
-            for line_number, row in enumerate(reader, start=2):
-                total_rows += 1
-                if len(row) != len(header):
-                    raise CsvToolError(
-                        "%s:%d: expected %d columns, found %d"
-                        % (path, line_number, len(header), len(row))
-                    )
+    frame.columns = header
+    time_column = resolve_time_column(header, explicit_time_column, path)
+    selected = []
+    for row_index, raw_time in enumerate(frame[time_column], start=2):
+        row_time = parse_timestamp(
+            raw_time,
+            time_format,
+            "%s:%d column %s" % (path, row_index, time_column),
+        )
+        validate_time_compatibility(row_time, start_time, "%s:%d" % (path, row_index))
+        selected.append(start_time <= row_time <= end_time)
 
-                row_time = parse_timestamp(
-                    row[time_index],
-                    time_format,
-                    "%s:%d column %s" % (path, line_number, time_column),
-                )
-                validate_time_compatibility(
-                    row_time, start_time, "%s:%d" % (path, line_number)
-                )
-                if start_time <= row_time <= end_time:
-                    selected_rows.append(row)
-        except csv.Error as error:
-            raise CsvToolError("%s: malformed CSV data: %s" % (path, error))
-
-    return header, selected_rows, total_rows, time_column
+    mask = pd.Series(selected, index=frame.index, dtype=bool)
+    selected_frame = frame.loc[mask].reset_index(drop=True)
+    return selected_frame, len(frame), time_column
 
 
 def ensure_output_paths(inputs, outputs, overwrite):
     input_paths = set(path.resolve() for path in inputs)
     for output_path in outputs:
         if output_path.resolve() in input_paths:
-            raise CsvToolError("output path would overwrite an input file: %s" % output_path)
+            raise CsvToolError(
+                "output path would overwrite an input file: %s" % output_path
+            )
         if output_path.exists() and not overwrite:
             raise CsvToolError(
-                "output already exists: %s (use --overwrite to replace it)" % output_path
+                "output already exists: %s (use --overwrite to replace it)"
+                % output_path
             )
 
 
-def write_csv_atomically(path, header, rows):
+def write_csv_atomically(path, frame):
     temporary_path = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -205,9 +229,7 @@ def write_csv_atomically(path, header, rows):
             delete=False,
         ) as output_file:
             temporary_path = Path(output_file.name)
-            writer = csv.writer(output_file, lineterminator="\n")
-            writer.writerow(header)
-            writer.writerows(rows)
+            frame.to_csv(output_file, index=False, lineterminator="\n")
             output_file.flush()
             os.fsync(output_file.fileno())
         os.replace(str(temporary_path), str(path))
@@ -225,7 +247,9 @@ def main():
         end_time = parse_timestamp(args.end_time, args.time_format, "--end-time")
         validate_time_compatibility(end_time, start_time, "--start-time/--end-time")
         if start_time > end_time:
-            raise CsvToolError("--start-time must be earlier than or equal to --end-time")
+            raise CsvToolError(
+                "--start-time must be earlier than or equal to --end-time"
+            )
 
         specifications = (
             ("order", args.order, args.order_time_column),
@@ -251,11 +275,11 @@ def main():
 
         for output_path, result_item in zip(output_paths, results):
             label, _, result = result_item
-            header, rows, total_rows, time_column = result
-            write_csv_atomically(output_path, header, rows)
+            frame, total_rows, time_column = result
+            write_csv_atomically(output_path, frame)
             print(
                 "%s: kept %d of %d rows using %s -> %s"
-                % (label, len(rows), total_rows, time_column, output_path)
+                % (label, len(frame), total_rows, time_column, output_path)
             )
     except (CsvToolError, OSError, UnicodeError) as error:
         print("error: %s" % error, file=sys.stderr)

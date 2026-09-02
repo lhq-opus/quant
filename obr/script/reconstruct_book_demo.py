@@ -6,13 +6,21 @@ state transitions can be read and experimented with in one file.
 """
 
 import argparse
-import csv
 import os
 import sys
 import tempfile
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+try:
+    import pandas as pd
+except ImportError:
+    print(
+        "error: pandas is required; install quant/obr/requirements.txt",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 
 
 ORDER_HEADER = [
@@ -126,43 +134,56 @@ def context(record, field=None):
 def read_csv(path, expected_header, source):
     """Read one raw CSV and preserve the source path and line for diagnostics."""
     try:
-        input_file = path.open("r", encoding="utf-8-sig", newline="")
+        # header=None preserves duplicate names instead of letting pandas rename them.
+        raw_frame = pd.read_csv(
+            path,
+            header=None,
+            dtype=str,
+            keep_default_na=False,
+            na_filter=False,
+            encoding="utf-8-sig",
+            engine="python",
+            skip_blank_lines=False,
+        )
+    except pd.errors.EmptyDataError:
+        raise DemoError("%s: CSV file is empty" % path)
+    except pd.errors.ParserError as error:
+        raise DemoError("%s: malformed CSV data: %s" % (path, error))
     except OSError as error:
         raise DemoError("cannot open %s: %s" % (path, error))
 
-    with input_file:
-        reader = csv.reader(input_file, strict=True)
-        try:
-            actual_header = next(reader)
-        except StopIteration:
-            raise DemoError("%s: CSV file is empty" % path)
-        except csv.Error as error:
-            raise DemoError("%s: cannot read CSV header: %s" % (path, error))
+    actual_header = [
+        "" if pd.isna(value) else str(value) for value in raw_frame.iloc[0]
+    ]
+    if actual_header != expected_header:
+        raise DemoError(
+            "%s: unexpected %s header\nexpected: %s\nactual:   %s"
+            % (path, source, ",".join(expected_header), ",".join(actual_header))
+        )
 
-        if actual_header != expected_header:
-            raise DemoError(
-                "%s: unexpected %s header\nexpected: %s\nactual:   %s"
-                % (path, source, ",".join(expected_header), ",".join(actual_header))
-            )
+    frame = raw_frame.iloc[1:].reset_index(drop=True)
+    missing_rows = frame.isna().any(axis=1)
+    if missing_rows.any():
+        row_index = missing_rows[missing_rows].index[0]
+        actual_columns = int(frame.loc[row_index].notna().sum())
+        raise DemoError(
+            "%s:%d: expected %d columns, found %d"
+            % (path, row_index + 2, len(expected_header), actual_columns)
+        )
 
-        records = []
-        try:
-            for line_number, values in enumerate(reader, start=2):
-                if len(values) != len(expected_header):
-                    raise DemoError(
-                        "%s:%d: expected %d columns, found %d"
-                        % (path, line_number, len(expected_header), len(values))
-                    )
-                records.append(
-                    {
-                        "source": source,
-                        "path": path,
-                        "line_number": line_number,
-                        "row": dict(zip(expected_header, values)),
-                    }
-                )
-        except csv.Error as error:
-            raise DemoError("%s: malformed CSV data: %s" % (path, error))
+    frame.columns = actual_header
+    records = []
+    for line_number, values in enumerate(
+        frame.itertuples(index=False, name=None), start=2
+    ):
+        records.append(
+            {
+                "source": source,
+                "path": path,
+                "line_number": line_number,
+                "row": dict(zip(expected_header, values)),
+            }
+        )
 
     return records
 
@@ -535,9 +556,8 @@ def write_book(path, rows):
             delete=False,
         ) as output_file:
             temporary_path = Path(output_file.name)
-            writer = csv.writer(output_file, lineterminator="\n")
-            writer.writerow(BOOK_HEADER)
-            writer.writerows(rows)
+            frame = pd.DataFrame(rows, columns=BOOK_HEADER)
+            frame.to_csv(output_file, index=False, lineterminator="\n")
             output_file.flush()
             os.fsync(output_file.fileno())
         os.replace(str(temporary_path), str(path))
