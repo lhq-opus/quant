@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Build event.csv from order rows and cancellation trade rows.
+"""由 order 和撤单 trade 生成 event.csv。
 
-This is a small validation utility.  A cancellation row normally carries a zero
-TradePrice, so the script looks up the referenced order and copies its Price into
-the cancellation event before order and trade events are merged by arrival time.
+撤单行本身没有完整的订单方向和价格，因此脚本先找到它引用的原订单，再把原订单的
+Side 和 Price 写入撤单事件，最后按到达时间合并两类事件。
 """
 
 import argparse
@@ -153,9 +152,9 @@ def require_non_empty(raw_value, field, path, line_number):
         )
 
 
-def build_order_price_index(order_frame, order_path):
-    """Map the exchange-scoped order reference to its original price text."""
-    prices = {}
+def build_order_index(order_frame, order_path):
+    """建立“频道和 ASN -> 原订单价格、方向、行号”的索引。"""
+    orders = {}
     fields = ["ChannelNo", "ApplSeqNum"] + ORDER_COLUMNS
     for line_number, values in enumerate(
         order_frame[fields].itertuples(index=False, name=None), start=2
@@ -172,22 +171,24 @@ def build_order_price_index(order_frame, order_path):
             require_non_empty(raw_value, field, order_path, line_number)
 
         key = (channel, asn)
-        if key in prices:
-            previous_line = prices[key][1]
+        if key in orders:
+            previous_line = orders[key][2]
             raise EventCsvError(
                 "%s:%d: duplicate order key ChannelNo=%d, ApplSeqNum=%d; "
                 "first seen on line %d"
                 % (order_path, line_number, channel, asn, previous_line)
             )
-        prices[key] = (price, line_number)
-    return prices
+        # 撤单事件既需要原订单价格，也需要原订单方向。行号只用于上面的重复键诊断。
+        orders[key] = (price, side, line_number)
+    return orders
 
 
-def fill_cancel_prices(trade_frame, order_prices, trade_path):
-    """Keep ExecType=4 rows and replace TradePrice with the order's Price."""
+def fill_cancel_order_fields(trade_frame, order_index, trade_path):
+    """保留撤单，并用被撤原订单补全 TradePrice 和 Side。"""
     cancel_frame = trade_frame.loc[trade_frame["ExecType"] == "4"].copy()
     lookup_fields = ["ChannelNo", "BidApplSeqNum", "OfferApplSeqNum"]
     resolved_prices = []
+    resolved_sides = []
 
     for row_index, values in cancel_frame[lookup_fields].iterrows():
         line_number = int(row_index) + 2
@@ -215,7 +216,7 @@ def fill_cancel_prices(trade_frame, order_prices, trade_path):
             0,
         )
 
-        # Exactly one side identifies the canceled order; zero is not an order ID.
+        # 撤单只引用买方或卖方中的一张原订单，0 表示这一侧没有订单引用。
         if (bid_asn == 0) == (offer_asn == 0):
             raise EventCsvError(
                 "%s:%d: ExecType=4 requires exactly one non-zero order reference"
@@ -224,14 +225,18 @@ def fill_cancel_prices(trade_frame, order_prices, trade_path):
 
         referenced_asn = bid_asn if bid_asn != 0 else offer_asn
         key = (channel, referenced_asn)
-        if key not in order_prices:
+        if key not in order_index:
             raise EventCsvError(
                 "%s:%d: referenced order not found: ChannelNo=%d, ApplSeqNum=%d"
                 % (trade_path, line_number, channel, referenced_asn)
             )
-        resolved_prices.append(order_prices[key][0])
+        # 价格用于定位聚合档位，方向用于在集合竞价的交叉盘口中选择正确一侧。
+        order_price, order_side, _ = order_index[key]
+        resolved_prices.append(order_price)
+        resolved_sides.append(order_side)
 
     cancel_frame["TradePrice"] = resolved_prices
+    cancel_frame["Side"] = resolved_sides
     return cancel_frame
 
 
@@ -249,10 +254,12 @@ def build_events(order_frame, cancel_frame, order_time_column, trade_time_column
     order_events = order_frame[[order_time_column] + ORDER_COLUMNS].copy()
     order_events = order_events.rename(columns={order_time_column: "caa"})
 
-    trade_events = cancel_frame[[trade_time_column] + TRADE_COLUMNS].copy()
+    # Side 不再只属于 order。撤单必须携带被撤原订单的方向，重放时才能在买卖同价的
+    # 集合竞价盘口中扣减正确的一侧。
+    trade_events = cancel_frame[[trade_time_column, "Side"] + TRADE_COLUMNS].copy()
     trade_events = trade_events.rename(columns={trade_time_column: "caa"})
 
-    # Reindex fills fields that belong only to the other event type with empty text.
+    # 两类事件各自不用的字段补为空字符串，并统一成固定 event.csv 列顺序。
     order_events = order_events.reindex(columns=EVENT_COLUMNS, fill_value="")
     trade_events = trade_events.reindex(columns=EVENT_COLUMNS, fill_value="")
     events = pd.concat([order_events, trade_events], ignore_index=True, sort=False)
@@ -328,8 +335,8 @@ def main():
             args.trade,
         )
 
-        order_prices = build_order_price_index(order_frame, args.order)
-        cancel_frame = fill_cancel_prices(trade_frame, order_prices, args.trade)
+        order_index = build_order_index(order_frame, args.order)
+        cancel_frame = fill_cancel_order_fields(trade_frame, order_index, args.trade)
         events = build_events(
             order_frame, cancel_frame, order_time_column, trade_time_column
         )

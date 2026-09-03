@@ -39,10 +39,11 @@ enum class TradingSession {
 //
 // cancel：
 //   type       <- ExecType=4
+//   side       <- Side
 //   price      <- TradePrice
 //   quantity   <- TradeQty
 //
-// cancel 不需要 side 和 order_type，所以这两个字符会填成 '\0'。
+// cancel 的 Side 由上游从原订单补全；order_type 对撤单无意义，填成 '\0'。
 struct Event {
   std::string caa;
   std::string transaction_time;

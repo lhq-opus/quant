@@ -31,7 +31,8 @@ caa,TransactionTime,Side,OrderType,Price,OrderQty,ExecType,TradeQty,TradePrice
 ```
 
 - order 行使用 `caa,TransactionTime,Side,OrderType,Price,OrderQty`；
-- 撤单行使用 `caa,TransactionTime,ExecType,TradeQty,TradePrice`；
+- 撤单行使用 `caa,TransactionTime,Side,ExecType,TradeQty,TradePrice`；`Side` 和
+  `TradePrice` 由上游从被撤原订单补全；
 - 必要枚举仍是 `Side=1/2`、`OrderType=2`、`ExecType=4`；
 - `TransactionTime` 不足 9 位时左补零，按 `HHMMSSmmm` 理解；阶段判断只读取
   `HHMMSS`。例如 `91500790` 属于 09:15:00，`100407190` 属于 10:04:07；
@@ -45,8 +46,9 @@ caa,TransactionTime,Side,OrderType,Price,OrderQty,ExecType,TradeQty,TradePrice
 
 ## 集合竞价阶段
 
-集合竞价不是逐笔撮合。每条 order 到达时只累加到自己的买盘或卖盘价格档，撤单则从
-已补全 `TradePrice` 的价格档扣量。阶段结束后才集中撮合一次。
+集合竞价不是逐笔撮合。每条 order 到达时只累加到自己的买盘或卖盘价格档，撤单则按
+已补全的 `Side` 选择买盘或卖盘，再从 `TradePrice` 对应档位扣量。阶段结束后才集中
+撮合一次。同一价格可能同时存在买卖申报，因此不能根据价格出现在哪一侧推断撤单方向。
 
 成交价按以下顺序选择：
 

@@ -69,11 +69,14 @@ quantity   = OrderQty
 
 ```text
 EventType::Cancel
+side     = Side
 price    = TradePrice
 quantity = TradeQty
 ```
 
-这一步把两种 CSV 行归一成同一个简单 `Event`，所以 `OrderBook` 不需要知道原始列位置。
+其中 `Side` 和 `TradePrice` 已由上游从原订单补全。这一步把两种 CSV 行归一成同一个
+简单 `Event`，所以 `OrderBook` 不需要知道原始列位置；集合竞价出现买卖同价时，也能
+按 `Side` 撤销正确一侧。
 
 ## 为什么价格仍使用整数
 

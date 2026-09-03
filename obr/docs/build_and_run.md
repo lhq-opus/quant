@@ -73,7 +73,7 @@ caa,TransactionTime,Side,OrderType,Price,OrderQty,ExecType,TradeQty,TradePrice
 ```
 
 - order 行填写 `caa,TransactionTime,Side,OrderType,Price,OrderQty`；
-- 撤单行填写 `caa,TransactionTime,ExecType,TradeQty,TradePrice`；
+- 撤单行填写 `caa,TransactionTime,Side,ExecType,TradeQty,TradePrice`；
 - `ExecType=4` 表示撤单；
 - `TransactionTime` 用于区分开盘集合、连续和收盘集合竞价；
 - 程序会按 `caa` 稳定排序，不要求 CSV 当前已经排好顺序。

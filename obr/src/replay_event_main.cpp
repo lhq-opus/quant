@@ -90,9 +90,9 @@ obr::Event parse_event(const std::vector<std::string>& columns) {
   event.transaction_time = columns[1];
 
   if (columns[6] == "4") {
-    // 撤单行：TradePrice 已由上游根据原订单引用补全。
+    // 撤单行：Side 和 TradePrice 已由上游根据原订单引用补全。
     event.type = obr::EventType::Cancel;
-    event.side = '\0';
+    event.side = columns[2][0];
     event.order_type = '\0';
     event.price = parse_price(columns[8]);
     event.quantity = static_cast<obr::Quantity>(std::stoll(columns[7]));

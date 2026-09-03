@@ -312,14 +312,14 @@ class EventOrderBook:
                 break
 
     def _apply_cancel(self, event):
-        """从撤单价格所在的一侧扣减聚合数量。"""
+        """根据撤单方向，从对应买盘或卖盘价格档扣减数量。"""
         price = Decimal(event.TradePrice)
         quantity = int(event.TradeQty)
 
-        # build_cancel_event_csv.py 已经用原始订单引用补全了撤单价格。
-        # 第一版输入保证该价格能够唯一定位到买盘或卖盘，因此无需订单级 FIFO，
-        # 只需修改对应价格档的聚合数量。
-        levels = self.bids if price in self.bids else self.asks
+        # 集合竞价期间订单只累计、不立即撮合，因此同一个价格可以同时存在买卖申报。
+        # 上游已经从被撤原订单补全 Side：1 表示买单，2 表示卖单。这里必须按 Side
+        # 选择盘口，不能再根据价格首先出现在哪个字典来猜测方向。
+        levels = self.bids if event.Side == "1" else self.asks
         levels[price] -= quantity
 
         # 一个价格档被完全撤空后，不应继续出现在订单簿中。

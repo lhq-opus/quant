@@ -99,10 +99,10 @@ void OrderBook::apply_continuous_order(const Event& event) {
 }
 
 void OrderBook::apply_cancel(const Event& event) {
-  // event.csv 已经把撤单引用的原订单价格补到了 TradePrice。
-  // 当前 demo 假设这个价格只会出现在买卖一侧，因此先查买盘，找不到就查卖盘。
-  BidLevels::iterator bid = bids_.find(event.price);
-  if (bid != bids_.end()) {
+  // 集合竞价期间同一个价格可以同时存在买卖申报，因此不能用价格推断撤单方向。
+  // event.csv 已经从原订单补全 Side：'1' 撤买单，'2' 撤卖单。
+  if (event.side == '1') {
+    BidLevels::iterator bid = bids_.find(event.price);
     bid->second -= event.quantity;
     if (bid->second == 0) {
       bids_.erase(bid);
@@ -110,8 +110,7 @@ void OrderBook::apply_cancel(const Event& event) {
     return;
   }
 
-  // 输入保证撤单价格存在、数量充足，所以这里不再添加 unknown order、超量撤单等
-  // 防御性分支，直接修改找到的卖盘价格档。
+  // 第一版输入保证 Side、价格和数量合法，所以卖方分支直接修改对应卖盘价格档。
   AskLevels::iterator ask = asks_.find(event.price);
   ask->second -= event.quantity;
   if (ask->second == 0) {

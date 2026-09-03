@@ -20,9 +20,9 @@ obr::Event make_order(const char* caa, const char* transaction_time, char side, 
   return event;
 }
 
-obr::Event make_cancel(const char* caa, const char* transaction_time, obr::Price price,
+obr::Event make_cancel(const char* caa, const char* transaction_time, char side, obr::Price price,
                        obr::Quantity quantity) {
-  const obr::Event event = {caa,   transaction_time, obr::EventType::Cancel, '\0', '\0',
+  const obr::Event event = {caa,   transaction_time, obr::EventType::Cancel, side, '\0',
                             price, quantity};
   return event;
 }
@@ -78,7 +78,7 @@ void validate_full_day() {
 void validate_cancel() {
   obr::OrderBook book;
   const obr::Event bid = make_order("09:15", "91500000", '1', 101000, 100);
-  const obr::Event cancel = make_cancel("09:19", "91900000", 101000, 20);
+  const obr::Event cancel = make_cancel("09:19", "91900000", '1', 101000, 20);
   const obr::Event ask = make_order("09:24", "92400000", '2', 99000, 100);
 
   book.apply(bid, obr::TradingSession::OpeningAuction);
@@ -93,6 +93,29 @@ void validate_cancel() {
   expect(snapshot.asks[0].quantity == 20, "cancel example should leave ask quantity 20");
   expect(book.cumulative_trade_quantity() == 80, "cancel example trade quantity should be 80");
   expect(book.cumulative_turnover() == 7920000, "cancel example turnover should be 792.0000");
+}
+
+void validate_cancel_side_with_crossed_price() {
+  obr::OrderBook book;
+
+  // 集合竞价尚未统一撮合时，买卖双方可以在同一个价格上同时有数量。
+  const obr::Event bid = make_order("09:15", "91500000", '1', 100000, 100);
+  const obr::Event ask = make_order("09:16", "91600000", '2', 100000, 80);
+  const obr::Event cancel_ask = make_cancel("09:17", "91700000", '2', 100000, 30);
+  const obr::Event cancel_bid = make_cancel("09:18", "91800000", '1', 100000, 20);
+
+  book.apply(bid, obr::TradingSession::OpeningAuction);
+  book.apply(ask, obr::TradingSession::OpeningAuction);
+  book.apply(cancel_ask, obr::TradingSession::OpeningAuction);
+
+  obr::Snapshot snapshot = book.make_snapshot(cancel_ask);
+  expect(snapshot.bids[0].quantity == 100, "sell cancel must not reduce same-price bid");
+  expect(snapshot.asks[0].quantity == 50, "sell cancel should reduce same-price ask");
+
+  book.apply(cancel_bid, obr::TradingSession::OpeningAuction);
+  snapshot = book.make_snapshot(cancel_bid);
+  expect(snapshot.bids[0].quantity == 80, "buy cancel should reduce same-price bid");
+  expect(snapshot.asks[0].quantity == 50, "buy cancel must not reduce same-price ask");
 }
 
 void validate_multi_level_continuous_trade() {
@@ -121,6 +144,7 @@ void validate_multi_level_continuous_trade() {
 int main() {
   validate_full_day();
   validate_cancel();
+  validate_cancel_side_with_crossed_price();
   validate_multi_level_continuous_trade();
   std::cout << "simple reconstruction validation passed\n";
   return EXIT_SUCCESS;
