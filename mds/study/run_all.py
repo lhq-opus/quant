@@ -8,12 +8,14 @@ from .pandas_01_io_selection import main as lesson_01_main
 from .pandas_02_snapshot_groupby import main as lesson_02_main
 from .pandas_03_aggregate_merge import main as lesson_03_main
 from .pandas_04_time_large_data import main as lesson_04_main
+from .pandas_05_csv_files import main as lesson_05_main
 
 LESSONS: tuple[tuple[str, Callable[[], int]], ...] = (
     ("第一课：CSV、类型与筛选", lesson_01_main),
     ("第二课：snapshot 与 groupby", lesson_02_main),
     ("第三课：聚合、配对与 merge", lesson_03_main),
     ("第四课：时间切片与大文件", lesson_04_main),
+    ("第五课：创建、合并与追加 CSV", lesson_05_main),
 )
 
 

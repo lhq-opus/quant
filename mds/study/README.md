@@ -18,6 +18,7 @@ python -m mds.study.pandas_01_io_selection
 python -m mds.study.pandas_02_snapshot_groupby
 python -m mds.study.pandas_03_aggregate_merge
 python -m mds.study.pandas_04_time_large_data
+python -m mds.study.pandas_05_csv_files
 ```
 
 ## 学习路线
@@ -28,14 +29,17 @@ python -m mds.study.pandas_04_time_large_data
 | 02 snapshot 操作 | 在每个 `time` 内排序和计算 `delta_clock` | `sort_values`、`groupby`、`diff`、`transform`、`cumcount`、`cumsum`、`agg` |
 | 03 聚合与连接 | 汇总活跃度、构造候选股票对、连接最终映射 | 命名聚合、self-merge、`validate`、`indicator`、`crosstab` |
 | 04 时间与大数据 | 上午/下午稳定性检查，处理数百万行 CSV | `to_timedelta`、`between`、`pivot`、`chunksize`、索引对齐、`memory_usage`、`category` |
+| 05 CSV 文件操作 | 创建带表头/仅表头文件，合并 CSV，分批追加 | `DataFrame.from_records`、`to_csv`、`concat`、`merge`、`mode`、`header` |
 
-## 三个贯穿原则
+## 四个贯穿原则
 
 1. `time` 用于标识 3 秒 snapshot；真正比较到达先后的是微秒 `clock`，不要混用。
 2. snapshot 内按 clock 得到的 `local_group_id` 只是记录级候选时间簇，不等于
    隐藏 `push_id`，更不等于全天固定 `group_id`。
 3. pandas 的宽表、自连接和全局排序都可能制造很大的中间数据。先写清统计
    含义，再测量内存和复杂度；不能只因为一行 pandas 代码能运行就用于全市场。
+4. “合并 CSV”要先问清方向：相同列按行堆叠用 `concat`；不同信息按键补列
+   用 `merge`。两者的数据含义和行数风险完全不同。
 
 ## 延伸阅读
 

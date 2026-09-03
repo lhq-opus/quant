@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import contextlib
 import io
+import tempfile
 import unittest
+from pathlib import Path
 
 import pandas as pd
 
@@ -32,6 +34,17 @@ from mds.study.pandas_04_time_large_data import (
     compare_memory_usage,
     count_updates_with_chunks,
     snapshot_sizes_with_boundary_carry,
+)
+from mds.study.pandas_05_csv_files import (
+    AFTERNOON_RECORDS,
+    MORNING_RECORDS,
+    build_market_frame,
+    concatenate_csv_rows,
+    create_header_only_csv,
+    merge_market_and_group_csv,
+    read_derived_market_csv,
+    write_csv_batches,
+    write_market_csv,
 )
 from mds.study.run_all import main as run_all_lessons
 
@@ -182,6 +195,69 @@ class TimeAndLargeDataLessonTest(unittest.TestCase):
         self.assertGreater(usage["string_bytes"], usage["category_bytes"])
 
 
+class CsvFilesLessonTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.directory = Path(self.temporary_directory.name)
+
+    def test_create_header_only_and_regular_csv(self) -> None:
+        header_only_csv = self.directory / "header_only.csv"
+        market_csv = self.directory / "market.csv"
+
+        create_header_only_csv(header_only_csv)
+        self.assertEqual(
+            header_only_csv.read_text(encoding="utf-8"),
+            "clock,stock_id,time\n",
+        )
+
+        market = build_market_frame(MORNING_RECORDS)
+        write_market_csv(market, market_csv)
+        loaded = read_derived_market_csv(market_csv)
+        pd.testing.assert_frame_equal(loaded, market)
+        self.assertEqual(loaded.loc[0, "stock_id"], "000001")
+
+    def test_concat_rows_and_append_batches_write_one_header(self) -> None:
+        morning_csv = self.directory / "morning.csv"
+        afternoon_csv = self.directory / "afternoon.csv"
+        batches_csv = self.directory / "batches.csv"
+        morning = build_market_frame(MORNING_RECORDS)
+        afternoon = build_market_frame(AFTERNOON_RECORDS)
+        write_market_csv(morning, morning_csv)
+        write_market_csv(afternoon, afternoon_csv)
+
+        combined = concatenate_csv_rows([morning_csv, afternoon_csv])
+        self.assertEqual(
+            combined["stock_id"].tolist(),
+            ["000001", "600000", "000001", "000002"],
+        )
+
+        write_csv_batches([combined.iloc[:1], combined.iloc[1:]], batches_csv)
+        batch_text = batches_csv.read_text(encoding="utf-8")
+        self.assertEqual(batch_text.count("clock,stock_id,time"), 1)
+        pd.testing.assert_frame_equal(
+            read_derived_market_csv(batches_csv),
+            combined,
+        )
+
+    def test_merge_csvs_by_stock_id_reports_missing_mapping(self) -> None:
+        market_csv = self.directory / "market.csv"
+        group_csv = self.directory / "groups.csv"
+        market = build_market_frame(MORNING_RECORDS + AFTERNOON_RECORDS)
+        write_market_csv(market, market_csv)
+        pd.DataFrame(
+            {
+                "stock_id": pd.Series(["000001", "600000"], dtype="string"),
+                "group_id": pd.Series([1, 1], dtype="int64"),
+            }
+        ).to_csv(group_csv, index=False)
+
+        merged = merge_market_and_group_csv(market_csv, group_csv)
+        missing = merged.loc[merged["stock_id"].eq("000002")].iloc[0]
+        self.assertTrue(pd.isna(missing["group_id"]))
+        self.assertEqual(missing["group_match"], "left_only")
+
+
 class RunAllLessonsTest(unittest.TestCase):
     def test_all_examples_are_executable(self) -> None:
         output = io.StringIO()
@@ -192,6 +268,7 @@ class RunAllLessonsTest(unittest.TestCase):
         self.assertIn("第一课：CSV、类型与筛选", output.getvalue())
         self.assertIn("local_group_id 只是记录级候选时间簇", output.getvalue())
         self.assertIn("跨 chunk 保留完整 snapshot", output.getvalue())
+        self.assertIn("第五课：创建、合并与追加 CSV", output.getvalue())
 
 
 if __name__ == "__main__":
