@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""按到达时间重放 order 和撤单事件，并输出每个事件后的五档订单簿。"""
+"""按到达时间重放开盘集合、连续和收盘集合竞价事件。"""
 
 import argparse
 from decimal import Decimal
@@ -7,11 +7,11 @@ from pathlib import Path
 
 import pandas as pd
 
-
-# event.csv 的列由 build_cancel_event_csv.py 固定生成。
+# event.csv 使用约定好的固定结构，TransactionTime 由上游额外带入。
 # 第一版直接使用这份确定的结构，不猜测列名，也不兼容其他表头。
 EVENT_HEADER = [
     "caa",
+    "TransactionTime",
     "Side",
     "OrderType",
     "Price",
@@ -20,6 +20,12 @@ EVENT_HEADER = [
     "TradeQty",
     "TradePrice",
 ]
+
+# 深市股票三个竞价阶段。TransactionTime 左补零后是 HHMMSSmmm，
+# 判断阶段只需要前六位 HHMMSS。
+OPENING_AUCTION = "opening_auction"
+CONTINUOUS_AUCTION = "continuous_auction"
+CLOSING_AUCTION = "closing_auction"
 
 # 输出按“买一价、买一量……卖五价、卖五量”的顺序展开。
 BOOK_HEADER = [
@@ -55,6 +61,12 @@ def parse_args():
     )
     parser.add_argument("--event", required=True, type=Path, help="输入 event.csv")
     parser.add_argument(
+        "--previous-close",
+        required=True,
+        type=Decimal,
+        help="前收盘价；开盘集合竞价最终并列时用于选择成交价",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("book.csv"),
@@ -78,7 +90,7 @@ def read_events(path):
         encoding="utf-8-sig",
     )
 
-    # 直接选取约定的八列。输入契约保证列名和数据合法，因此这里不再猜测表头、
+    # 直接选取约定的九列。输入契约保证列名和数据合法，因此这里不再猜测表头、
     # 检查多种格式或捕获并改写 pandas 的异常。
     events = events.loc[:, EVENT_HEADER]
 
@@ -86,10 +98,26 @@ def read_events(path):
     return events.sort_values("caa", kind="stable").reset_index(drop=True)
 
 
+def trading_session(transaction_time):
+    """根据 HHMMSSmmm 形式的 TransactionTime 判断竞价阶段。"""
+    # 例如 91500790 左补零后是 091500790，前六位表示 09:15:00。
+    hhmmss = int(str(transaction_time).zfill(9)[:6])
+
+    if 91500 <= hhmmss <= 92500:
+        return OPENING_AUCTION
+    if 93000 <= hhmmss <= 113000 or 130000 <= hhmmss < 145700:
+        return CONTINUOUS_AUCTION
+    if 145700 <= hhmmss <= 150000:
+        return CLOSING_AUCTION
+
+    # 本脚本约定输入都是合法交易时段；这一行只避免意外时静默分错阶段。
+    raise ValueError("TransactionTime 不在股票竞价交易时段内")
+
+
 class EventOrderBook:
     """维护全深度聚合盘口，并在价格档层面处理可成交数量。"""
 
-    def __init__(self):
+    def __init__(self, previous_close):
         # bids 和 asks 都是“价格 -> 当前聚合数量”。
         # 订单簿只需要价格档总量，因此不为同价订单维护 FIFO 队列。
         self.bids = {}
@@ -100,27 +128,40 @@ class EventOrderBook:
         self.cumulative_trade_quantity = 0
         self.cumulative_turnover = Decimal("0")
 
+        # 开盘最终并列要参考前收盘价；收盘参考当天最近成交价。
+        self.previous_close = previous_close
+        self.last_trade_price = None
+
         # 保存当前 order 在各价格档推导出的成交量和成交额，便于观察单条事件的结果。
         # 撤单不会产生成交，因此应用每个新事件前都重置为 0。
         self.event_trade_quantity = 0
         self.event_turnover = Decimal("0")
 
-    def apply(self, event):
-        """应用一条事件，并立即生成与该事件 caa 对应的订单簿快照。"""
+    def apply(self, event, session):
+        """应用一条事件；连续竞价立即撮合，集合竞价只把订单放入盘口。"""
         self.event_trade_quantity = 0
         self.event_turnover = Decimal("0")
 
         if event.ExecType == "4":
             self._apply_cancel(event)
             event_type = "cancel"
+        elif session == CONTINUOUS_AUCTION:
+            self._apply_continuous_order(event)
+            event_type = "order"
         else:
-            self._apply_order(event)
+            self._add_order_to_book(event)
             event_type = "order"
 
-        # 每个输入事件只生成一行输出，且 caa 原样取自当前事件。
-        return self._snapshot(event.caa, event_type)
+        return event_type
 
-    def _apply_order(self, event):
+    def _add_order_to_book(self, event):
+        """集合竞价期间不逐笔撮合，只累计到订单自己的买卖价格档。"""
+        price = Decimal(event.Price)
+        quantity = int(event.OrderQty)
+        levels = self.bids if event.Side == "1" else self.asks
+        levels[price] = levels.get(price, 0) + quantity
+
+    def _apply_continuous_order(self, event):
         """按价格优先逐档消耗对手盘，再把未成交数量加入本方盘口。"""
         limit_price = Decimal(event.Price)
         remaining_quantity = int(event.OrderQty)
@@ -169,9 +210,7 @@ class EventOrderBook:
 
         # 卖单仍有剩余时，把剩余数量加入卖盘的委托价格档。
         if remaining_quantity > 0:
-            self.asks[limit_price] = (
-                self.asks.get(limit_price, 0) + remaining_quantity
-            )
+            self.asks[limit_price] = self.asks.get(limit_price, 0) + remaining_quantity
 
     def _record_trade(self, trade_price, trade_quantity):
         """累计一次价格档消耗产生的成交量和成交额。"""
@@ -181,6 +220,115 @@ class EventOrderBook:
         self.event_turnover += trade_turnover
         self.cumulative_trade_quantity += trade_quantity
         self.cumulative_turnover += trade_turnover
+        self.last_trade_price = trade_price
+
+    def finish_call_auction(self, session):
+        """在开盘或收盘集合竞价结束时，以一个成交价统一撮合。"""
+        if session == OPENING_AUCTION:
+            reference_price = self.previous_close
+        else:
+            # 当天此前没有成交时，用前收盘价作为最近成交价的后备。
+            reference_price = self.last_trade_price or self.previous_close
+
+        auction_price, trade_quantity = self._find_call_auction_result(reference_price)
+        if auction_price is None:
+            return
+
+        # 买方从最高价开始、卖方从最低价开始扣减，体现价格优先。
+        bid_prices = sorted(
+            (price for price in self.bids if price >= auction_price), reverse=True
+        )
+        ask_prices = sorted(price for price in self.asks if price <= auction_price)
+        self._reduce_levels(self.bids, bid_prices, trade_quantity)
+        self._reduce_levels(self.asks, ask_prices, trade_quantity)
+        self._record_trade(auction_price, trade_quantity)
+
+    def _find_call_auction_result(self, reference_price):
+        """按照深交所集合竞价规则选择唯一成交价和最大成交量。"""
+        # 候选价格来自当前买卖申报价格的并集。
+        # 为了让规则一眼可见，demo 对每个价格直接重新求和，不做前缀和优化。
+        prices = sorted(set(self.bids) | set(self.asks))
+        candidates = []
+
+        for price in prices:
+            buy_quantity = sum(
+                quantity
+                for bid_price, quantity in self.bids.items()
+                if bid_price >= price
+            )
+            sell_quantity = sum(
+                quantity
+                for ask_price, quantity in self.asks.items()
+                if ask_price <= price
+            )
+            trade_quantity = min(buy_quantity, sell_quantity)
+            if trade_quantity == 0:
+                continue
+
+            # 严格优于候选价的买卖申报必须全部成交。
+            better_buy_quantity = sum(
+                quantity
+                for bid_price, quantity in self.bids.items()
+                if bid_price > price
+            )
+            better_sell_quantity = sum(
+                quantity
+                for ask_price, quantity in self.asks.items()
+                if ask_price < price
+            )
+            if (
+                better_buy_quantity > trade_quantity
+                or better_sell_quantity > trade_quantity
+            ):
+                continue
+
+            # 候选价上的买方或卖方，至少有一方必须能够全部成交。
+            # 某一侧在候选价没有申报时，该侧数量为 0，也自然属于“全部成交”。
+            buy_at_price = self.bids.get(price, 0)
+            sell_at_price = self.asks.get(price, 0)
+            all_buys_at_price_trade = (
+                better_buy_quantity + buy_at_price <= trade_quantity
+            )
+            all_sells_at_price_trade = (
+                better_sell_quantity + sell_at_price <= trade_quantity
+            )
+            if not all_buys_at_price_trade and not all_sells_at_price_trade:
+                continue
+
+            # 第二层并列规则比较“严格高价买量”和“严格低价卖量”的差。
+            quantity_difference = abs(better_buy_quantity - better_sell_quantity)
+            candidates.append((price, trade_quantity, quantity_difference))
+
+        if not candidates:
+            return None, 0
+
+        maximum_trade_quantity = max(item[1] for item in candidates)
+        candidates = [item for item in candidates if item[1] == maximum_trade_quantity]
+
+        minimum_difference = min(item[2] for item in candidates)
+        candidates = [item for item in candidates if item[2] == minimum_difference]
+
+        # 最后一层：开盘参考前收盘价，收盘参考最近成交价。
+        # 合法输入约定保证这一步能够唯一选出价格。
+        auction_price = min(
+            (item[0] for item in candidates),
+            key=lambda price: abs(price - reference_price),
+        )
+        return auction_price, maximum_trade_quantity
+
+    @staticmethod
+    def _reduce_levels(levels, prices, trade_quantity):
+        """按已经排好的价格优先顺序，从一侧盘口扣除集合竞价成交量。"""
+        quantity_left = trade_quantity
+        for price in prices:
+            reduced_quantity = min(quantity_left, levels[price])
+            levels[price] -= reduced_quantity
+            quantity_left -= reduced_quantity
+
+            if levels[price] == 0:
+                del levels[price]
+            if quantity_left == 0:
+                break
 
     def _apply_cancel(self, event):
         """从撤单价格所在的一侧扣减聚合数量。"""
@@ -206,7 +354,7 @@ class EventOrderBook:
         price = prices[index]
         return format(price, ".4f"), str(levels[price])
 
-    def _snapshot(self, caa, event_type):
+    def snapshot(self, caa, event_type):
         """从全深度买卖盘截取前五档。"""
         # 买盘价格越高越优，卖盘价格越低越优。
         bid_prices = sorted(self.bids, reverse=True)[:5]
@@ -234,10 +382,24 @@ def main():
     validate_output_path(args.event, args.output, args.overwrite)
 
     events = read_events(args.event)
-    order_book = EventOrderBook()
+    order_book = EventOrderBook(args.previous_close)
 
-    # itertuples 比逐行 Series 更直接；一条输入事件严格对应一条输出快照。
-    rows = [order_book.apply(event) for event in events.itertuples(index=False)]
+    # 先算出每条事件的阶段，便于识别一段集合竞价中的最后一条事件。
+    event_rows = list(events.itertuples(index=False))
+    sessions = [trading_session(event.TransactionTime) for event in event_rows]
+    rows = []
+
+    for index, event in enumerate(event_rows):
+        session = sessions[index]
+        event_type = order_book.apply(event, session)
+
+        # 集合竞价最后一条输入处理完后统一撮合，再生成这条事件对应的快照。
+        # 这样不额外制造 event，输出行数仍与输入行数相同。
+        next_session = sessions[index + 1] if index + 1 < len(sessions) else None
+        if session in (OPENING_AUCTION, CLOSING_AUCTION) and next_session != session:
+            order_book.finish_call_auction(session)
+
+        rows.append(order_book.snapshot(event.caa, event_type))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows, columns=BOOK_HEADER).to_csv(
