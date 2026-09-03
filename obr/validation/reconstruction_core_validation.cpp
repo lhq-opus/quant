@@ -2,234 +2,126 @@
 
 #include <cstdlib>
 #include <iostream>
-#include <limits>
-#include <vector>
+#include <string>
 
 namespace {
 
-const std::uint32_t kTradingDay = 20260901U;
-const std::uint32_t kChannel = 1U;
-
-void fail(const char* message) {
-  std::cerr << "validation failed: " << message << '\n';
-  std::exit(EXIT_FAILURE);
-}
-
 void expect(bool condition, const char* message) {
   if (!condition) {
-    fail(message);
-  }
-}
-
-obr::OrderId make_order_id(std::uint64_t sequence) {
-  return obr::OrderId(kTradingDay, kChannel, sequence);
-}
-
-obr::EventId make_event_id(std::uint64_t sequence) {
-  return obr::EventId(kTradingDay, kChannel, sequence);
-}
-
-obr::AddOrderEvent make_add(std::uint64_t sequence, obr::Side side, std::int64_t price,
-                            std::uint64_t quantity, obr::OrderType order_type) {
-  obr::AddOrderEvent event = {make_event_id(sequence), make_order_id(sequence), side, order_type,
-                              obr::Price(price),       obr::Quantity(quantity)};
-  return event;
-}
-
-obr::AddOrderEvent make_limit_add(std::uint64_t sequence, obr::Side side, std::int64_t price,
-                                  std::uint64_t quantity) {
-  return make_add(sequence, side, price, quantity, obr::OrderType::Limit);
-}
-
-obr::CancelOrderEvent make_cancel(std::uint64_t event_sequence, std::uint64_t order_sequence,
-                                  obr::Side side, std::uint64_t quantity) {
-  obr::CancelOrderEvent event = {make_event_id(event_sequence), make_order_id(order_sequence), side,
-                                 obr::Quantity(quantity)};
-  return event;
-}
-
-obr::TradeEvent make_trade(std::uint64_t event_sequence, std::uint64_t bid_sequence,
-                           std::uint64_t ask_sequence, std::int64_t price, std::uint64_t quantity) {
-  obr::TradeEvent event = {make_event_id(event_sequence), make_order_id(bid_sequence),
-                           make_order_id(ask_sequence), obr::Price(price), obr::Quantity(quantity)};
-  return event;
-}
-
-struct ObservableState {
-  std::size_t order_count;
-  std::size_t event_count;
-  std::vector<obr::PriceLevel> bids;
-  std::vector<obr::PriceLevel> asks;
-};
-
-ObservableState observe(const obr::OrderBook& book) {
-  ObservableState state = {book.order_count(), book.processed_event_count(), book.bid_levels(),
-                           book.ask_levels()};
-  return state;
-}
-
-bool same_state(const ObservableState& left, const ObservableState& right) {
-  return left.order_count == right.order_count && left.event_count == right.event_count &&
-         left.bids == right.bids && left.asks == right.asks;
-}
-
-void expect_invariants(const obr::OrderBook& book) {
-  obr::ValidationResult result = book.validate_invariants();
-  if (!result.valid) {
-    std::cerr << "invariant audit failed: " << result.message << '\n';
+    std::cerr << "validation failed: " << message << '\n';
     std::exit(EXIT_FAILURE);
   }
 }
 
-void expect_success(obr::OrderBook& book, const obr::ApplyResult& result) {
-  if (!result.applied) {
-    std::cerr << "expected success, got: " << result.message << '\n';
-    std::exit(EXIT_FAILURE);
-  }
-  expect_invariants(book);
+obr::Event make_order(const char* caa, const char* transaction_time, char side, obr::Price price,
+                      obr::Quantity quantity) {
+  const obr::Event event = {caa,   transaction_time, obr::EventType::Order, side, '2',
+                            price, quantity};
+  return event;
 }
 
-void expect_failure_unchanged(obr::OrderBook& book, const ObservableState& before,
-                              const obr::ApplyResult& result, obr::ApplyErrorCode expected_code) {
-  expect(!result.applied, "expected event rejection");
-  if (result.code != expected_code) {
-    std::cerr << "unexpected rejection code: " << result.message << '\n';
-    std::exit(EXIT_FAILURE);
-  }
-  expect(same_state(observe(book), before), "rejected event changed the book");
-  expect_invariants(book);
+obr::Event make_cancel(const char* caa, const char* transaction_time, obr::Price price,
+                       obr::Quantity quantity) {
+  const obr::Event event = {caa,   transaction_time, obr::EventType::Cancel, '\0', '\0',
+                            price, quantity};
+  return event;
 }
 
-void check_remaining(const obr::OrderBook& book, std::uint64_t order_sequence,
-                     std::uint64_t expected_quantity) {
-  obr::Quantity actual(0U);
-  expect(book.get_remaining_quantity(make_order_id(order_sequence), &actual),
-         "expected live order was not found");
-  expect(actual.value == expected_quantity, "unexpected remaining order quantity");
-}
-
-void check_level(const obr::OrderBook& book, obr::Side side, std::int64_t price,
-                 std::uint64_t expected_quantity) {
-  obr::Quantity actual(0U);
-  expect(book.get_level_quantity(side, obr::Price(price), &actual),
-         "expected price level was not found");
-  expect(actual.value == expected_quantity, "unexpected aggregate level quantity");
-}
-
-void validate_normal_flow() {
+void validate_full_day() {
   obr::OrderBook book;
 
-  expect_success(book, book.apply_add(make_limit_add(1U, obr::Side::Buy, 10000, 1000U)));
-  expect_success(book, book.apply_add(make_limit_add(2U, obr::Side::Buy, 10000, 500U)));
-  expect_success(book, book.apply_add(make_limit_add(3U, obr::Side::Buy, 9900, 700U)));
-  expect_success(book, book.apply_add(make_limit_add(4U, obr::Side::Buy, 9800, 600U)));
-  expect_success(book, book.apply_add(make_limit_add(5U, obr::Side::Buy, 9700, 500U)));
-  expect_success(book, book.apply_add(make_limit_add(6U, obr::Side::Buy, 9600, 400U)));
-  expect_success(book, book.apply_add(make_limit_add(7U, obr::Side::Buy, 9500, 300U)));
-  expect_success(book, book.apply_add(make_limit_add(8U, obr::Side::Buy, 9400, 200U)));
-  expect_success(book, book.apply_add(make_limit_add(9U, obr::Side::Sell, 10100, 800U)));
-  expect_success(book, book.apply_add(make_limit_add(10U, obr::Side::Sell, 10200, 900U)));
+  // 开盘集合竞价：最大成交量 250，统一成交价 10.0000。
+  const obr::Event opening_bid_1 = make_order("09:15", "91500790", '1', 101000, 100);
+  const obr::Event opening_bid_2 = make_order("09:16", "91600000", '1', 100000, 200);
+  const obr::Event opening_ask_1 = make_order("09:17", "91700000", '2', 99000, 150);
+  const obr::Event opening_ask_2 = make_order("09:18", "91800000", '2', 100000, 100);
 
-  expect(book.bid_levels().size() == 7U, "book did not retain levels beyond top five");
-  check_level(book, obr::Side::Buy, 10000, 1500U);
+  book.apply(opening_bid_1, obr::TradingSession::OpeningAuction);
+  book.apply(opening_bid_2, obr::TradingSession::OpeningAuction);
+  book.apply(opening_ask_1, obr::TradingSession::OpeningAuction);
+  book.apply(opening_ask_2, obr::TradingSession::OpeningAuction);
+  book.finish_call_auction();
 
-  expect_success(book, book.apply_trade(make_trade(11U, 1U, 9U, 10100, 300U)));
-  check_remaining(book, 1U, 700U);
-  check_remaining(book, 9U, 500U);
+  obr::Snapshot snapshot = book.make_snapshot(opening_ask_2);
+  expect(snapshot.bids.size() == 1U, "opening should leave one bid level");
+  expect(snapshot.bids[0].price == 100000, "opening remaining bid price should be 10.0000");
+  expect(snapshot.bids[0].quantity == 50, "opening remaining bid quantity should be 50");
+  expect(snapshot.asks.empty(), "opening should consume all eligible asks");
 
-  expect_success(book, book.apply_cancel(make_cancel(12U, 2U, obr::Side::Buy, 500U)));
-  expect(!book.get_remaining_quantity(make_order_id(2U), NULL),
-         "full cancel did not remove the order");
-  check_level(book, obr::Side::Buy, 10000, 700U);
+  // 连续竞价：卖单先消耗 10.0000 买盘，随后另一个卖单消耗 10.2000 买盘。
+  const obr::Event continuous_ask = make_order("09:30", "93000000", '2', 99500, 20);
+  const obr::Event continuous_bid = make_order("10:04", "100407190", '1', 102000, 70);
+  const obr::Event continuous_ask_2 = make_order("10:05", "100500000", '2', 101000, 30);
+  book.apply(continuous_ask, obr::TradingSession::ContinuousAuction);
+  book.apply(continuous_bid, obr::TradingSession::ContinuousAuction);
+  book.apply(continuous_ask_2, obr::TradingSession::ContinuousAuction);
 
-  expect_success(book, book.apply_trade(make_trade(13U, 1U, 9U, 10100, 500U)));
-  expect(!book.get_remaining_quantity(make_order_id(9U), NULL),
-         "full fill did not remove the sell order");
-  check_remaining(book, 1U, 200U);
+  // 收盘集合竞价：新增买卖盘统一在 10.1000 成交 100。
+  const obr::Event closing_bid = make_order("14:57", "145700000", '1', 101000, 60);
+  const obr::Event closing_ask_1 = make_order("14:58", "145800000", '2', 100000, 50);
+  const obr::Event closing_ask_2 = make_order("14:59", "145959000", '2', 101000, 50);
+  book.apply(closing_bid, obr::TradingSession::ClosingAuction);
+  book.apply(closing_ask_1, obr::TradingSession::ClosingAuction);
+  book.apply(closing_ask_2, obr::TradingSession::ClosingAuction);
+  book.finish_call_auction();
 
-  expect_success(book, book.apply_cancel(make_cancel(14U, 1U, obr::Side::Buy, 200U)));
-  expect(book.bid_levels()[0].price == obr::Price(9900),
-         "removing best bid did not promote the next full-depth level");
-
-  ObservableState before = observe(book);
-  expect_failure_unchanged(book, before,
-                           book.apply_cancel(make_cancel(14U, 1U, obr::Side::Buy, 200U)),
-                           obr::ApplyErrorCode::DuplicateEvent);
-
-  before = observe(book);
-  obr::AddOrderEvent duplicate_order = {make_event_id(15U), make_order_id(3U),
-                                        obr::Side::Buy,     obr::OrderType::Limit,
-                                        obr::Price(9900),   obr::Quantity(1U)};
-  expect_failure_unchanged(book, before, book.apply_add(duplicate_order),
-                           obr::ApplyErrorCode::DuplicateOrder);
-
-  before = observe(book);
-  expect_failure_unchanged(book, before,
-                           book.apply_cancel(make_cancel(16U, 999U, obr::Side::Buy, 1U)),
-                           obr::ApplyErrorCode::UnknownOrder);
-
-  before = observe(book);
-  expect_failure_unchanged(book, before,
-                           book.apply_cancel(make_cancel(17U, 3U, obr::Side::Sell, 1U)),
-                           obr::ApplyErrorCode::SideMismatch);
-
-  before = observe(book);
-  expect_failure_unchanged(book, before,
-                           book.apply_cancel(make_cancel(18U, 3U, obr::Side::Buy, 701U)),
-                           obr::ApplyErrorCode::OverReduce);
-
-  before = observe(book);
-  expect_failure_unchanged(book, before, book.apply_trade(make_trade(19U, 3U, 10U, 10000, 701U)),
-                           obr::ApplyErrorCode::OverReduce);
-  check_remaining(book, 10U, 900U);
-
-  before = observe(book);
-  expect_failure_unchanged(book, before, book.apply_trade(make_trade(20U, 3U, 999U, 10000, 1U)),
-                           obr::ApplyErrorCode::UnknownOrder);
-
-  before = observe(book);
-  expect_failure_unchanged(book, before,
-                           book.apply_cancel(make_cancel(21U, 3U, obr::Side::Buy, 0U)),
-                           obr::ApplyErrorCode::InvalidQuantity);
-
-  before = observe(book);
-  expect_failure_unchanged(book, before, book.apply_add(make_limit_add(22U, obr::Side::Buy, 0, 1U)),
-                           obr::ApplyErrorCode::InvalidPrice);
-
-  before = observe(book);
-  expect_failure_unchanged(
-      book, before, book.apply_add(make_add(23U, obr::Side::Buy, 9000, 1U, obr::OrderType::Market)),
-      obr::ApplyErrorCode::UnsupportedOrderType);
-
-  before = observe(book);
-  obr::CancelOrderEvent wrong_scope = {make_event_id(24U), obr::OrderId(kTradingDay, 2U, 3U),
-                                       obr::Side::Buy, obr::Quantity(1U)};
-  expect_failure_unchanged(book, before, book.apply_cancel(wrong_scope),
-                           obr::ApplyErrorCode::ScopeMismatch);
-
-  before = observe(book);
-  obr::CancelOrderEvent invalid_event = {obr::EventId(0U, kChannel, 25U), make_order_id(3U),
-                                         obr::Side::Buy, obr::Quantity(1U)};
-  expect_failure_unchanged(book, before, book.apply_cancel(invalid_event),
-                           obr::ApplyErrorCode::InvalidEventId);
+  snapshot = book.make_snapshot(closing_ask_2);
+  expect(snapshot.bids.size() == 1U, "closing should leave one bid level");
+  expect(snapshot.bids[0].price == 100000, "final bid price should be 10.0000");
+  expect(snapshot.bids[0].quantity == 30, "final bid quantity should be 30");
+  expect(snapshot.asks.empty(), "closing should consume all asks");
+  expect(book.cumulative_trade_quantity() == 400, "full day cumulative quantity should be 400");
+  expect(book.cumulative_turnover() == 40160000,
+         "full day cumulative turnover should be 4016.0000");
 }
 
-void validate_aggregate_overflow() {
+void validate_cancel() {
   obr::OrderBook book;
-  expect_success(book, book.apply_add(make_limit_add(1U, obr::Side::Buy, 10000,
-                                                     std::numeric_limits<std::uint64_t>::max())));
+  const obr::Event bid = make_order("09:15", "91500000", '1', 101000, 100);
+  const obr::Event cancel = make_cancel("09:19", "91900000", 101000, 20);
+  const obr::Event ask = make_order("09:24", "92400000", '2', 99000, 100);
 
-  ObservableState before = observe(book);
-  expect_failure_unchanged(book, before,
-                           book.apply_add(make_limit_add(2U, obr::Side::Buy, 10000, 1U)),
-                           obr::ApplyErrorCode::LevelQuantityOverflow);
+  book.apply(bid, obr::TradingSession::OpeningAuction);
+  book.apply(cancel, obr::TradingSession::OpeningAuction);
+  book.apply(ask, obr::TradingSession::OpeningAuction);
+  book.finish_call_auction();
+
+  const obr::Snapshot snapshot = book.make_snapshot(ask);
+  expect(snapshot.bids.empty(), "cancel example should consume the remaining bid");
+  expect(snapshot.asks.size() == 1U, "cancel example should leave one ask level");
+  expect(snapshot.asks[0].price == 99000, "cancel example ask should stay at 9.9000");
+  expect(snapshot.asks[0].quantity == 20, "cancel example should leave ask quantity 20");
+  expect(book.cumulative_trade_quantity() == 80, "cancel example trade quantity should be 80");
+  expect(book.cumulative_turnover() == 7920000, "cancel example turnover should be 792.0000");
+}
+
+void validate_multi_level_continuous_trade() {
+  obr::OrderBook book;
+
+  // 两个卖价先进入空盘口，随后一张更高限价的买单依次吃掉卖一、卖二。
+  const obr::Event ask_1 = make_order("10:00", "100000000", '2', 100000, 30);
+  const obr::Event ask_2 = make_order("10:01", "100100000", '2', 101000, 40);
+  const obr::Event bid = make_order("10:02", "100200000", '1', 102000, 100);
+  book.apply(ask_1, obr::TradingSession::ContinuousAuction);
+  book.apply(ask_2, obr::TradingSession::ContinuousAuction);
+  book.apply(bid, obr::TradingSession::ContinuousAuction);
+
+  const obr::Snapshot snapshot = book.make_snapshot(bid);
+  expect(snapshot.asks.empty(), "multi-level trade should consume both ask levels");
+  expect(snapshot.bids.size() == 1U, "buy remainder should enter one bid level");
+  expect(snapshot.bids[0].price == 102000, "buy remainder should use its limit price");
+  expect(snapshot.bids[0].quantity == 30, "buy remainder should be 30");
+  expect(book.cumulative_trade_quantity() == 70, "multi-level cumulative quantity should be 70");
+  expect(book.cumulative_turnover() == 7040000,
+         "multi-level cumulative turnover should be 704.0000");
 }
 
 } // namespace
 
 int main() {
-  validate_normal_flow();
-  validate_aggregate_overflow();
-  std::cout << "reconstruction core validation passed\n";
+  validate_full_day();
+  validate_cancel();
+  validate_multi_level_continuous_trade();
+  std::cout << "simple reconstruction validation passed\n";
   return EXIT_SUCCESS;
 }

@@ -4,109 +4,47 @@
 
 #include <functional>
 #include <map>
-#include <set>
-#include <string>
-#include <vector>
 
 namespace obr {
 
-enum class ApplyErrorCode {
-  None,
-  InvalidEventId,
-  DuplicateEvent,
-  ScopeMismatch,
-  InvalidSide,
-  UnsupportedOrderType,
-  InvalidPrice,
-  InvalidQuantity,
-  DuplicateOrder,
-  UnknownOrder,
-  SideMismatch,
-  InvalidTradeReferences,
-  OverReduce,
-  LevelQuantityOverflow,
-  InternalInvariantViolation,
-};
-
-struct ApplyResult {
-  ApplyResult(bool was_applied, ApplyErrorCode error_code, const std::string& error_message)
-      : applied(was_applied), code(error_code), message(error_message) {}
-
-  static ApplyResult success();
-  static ApplyResult failure(ApplyErrorCode code, const std::string& message);
-
-  bool applied;
-  ApplyErrorCode code;
-  std::string message;
-};
-
-struct PriceLevel {
-  PriceLevel(Price level_price, Quantity level_quantity)
-      : price(level_price), aggregate_quantity(level_quantity) {}
-
-  Price price;
-  Quantity aggregate_quantity;
-};
-
-inline bool operator==(const PriceLevel& left, const PriceLevel& right) {
-  return left.price == right.price && left.aggregate_quantity == right.aggregate_quantity;
-}
-
-struct OrderState {
-  OrderState(Side order_side, OrderType type, Price order_price, Quantity remaining)
-      : side(order_side), order_type(type), price(order_price), remaining_quantity(remaining) {}
-
-  Side side;
-  OrderType order_type;
-  Price price;
-  Quantity remaining_quantity;
-};
-
-struct ValidationResult {
-  ValidationResult(bool is_valid, const std::string& error_message)
-      : valid(is_valid), message(error_message) {}
-
-  bool valid;
-  std::string message;
-};
-
-// This class owns one instrument's live orders and all of its price levels.
-// CSV reading, event ordering, snapshots, and multi-instrument dispatch stay outside it.
+// 第一版 OrderBook 只维护聚合价格档，不维护订单 ID 或同价订单队列。
+//
+// 买盘 map 使用 std::greater<Price>，所以 begin() 永远是最高买价；
+// 卖盘 map 使用默认升序，所以 begin() 永远是最低卖价。
+// 这让连续竞价可以直接从双方的 begin() 开始撮合。
 class OrderBook {
 public:
-  ApplyResult apply_add(const AddOrderEvent& event);
-  ApplyResult apply_cancel(const CancelOrderEvent& event);
-  ApplyResult apply_trade(const TradeEvent& event);
+  OrderBook();
 
-  std::size_t order_count() const;
-  std::size_t processed_event_count() const;
+  // 应用一条已经从 CSV 转换好的 Event。
+  // 连续竞价 order 会立即撮合；集合竞价 order 只进入本方价格档。
+  void apply(const Event& event, TradingSession session);
 
-  bool get_remaining_quantity(const OrderId& order_id, Quantity* quantity) const;
-  bool get_level_quantity(Side side, Price price, Quantity* quantity) const;
+  // 一段开盘或收盘集合竞价结束时调用一次，统一确定成交价并扣减数量。
+  void finish_call_auction();
 
-  std::vector<PriceLevel> bid_levels() const;
-  std::vector<PriceLevel> ask_levels() const;
+  // 从内部全深度 map 中截取买卖各五档。
+  Snapshot make_snapshot(const Event& event) const;
 
-  // This O(N) audit is intended for validation and diagnostics, not every hot-path event.
-  ValidationResult validate_invariants() const;
+  Quantity cumulative_trade_quantity() const;
+  Turnover cumulative_turnover() const;
 
 private:
-  typedef std::map<OrderId, OrderState> OrderRegistry;
   typedef std::map<Price, Quantity, std::greater<Price>> BidLevels;
   typedef std::map<Price, Quantity> AskLevels;
 
-  ApplyResult validate_new_event(const EventId& event_id) const;
-  ApplyResult validate_order_scope(const EventId& event_id, const OrderId& order_id) const;
-  ApplyResult validate_reduction(OrderRegistry::const_iterator order, Side expected_side,
-                                 Quantity quantity) const;
+  void add_order(const Event& event);
+  void apply_continuous_order(const Event& event);
+  void apply_cancel(const Event& event);
+  void record_trade(Price price, Quantity quantity);
 
-  void add_to_level(Side side, Price price, Quantity quantity);
-  void reduce_order(OrderRegistry::iterator order, Quantity quantity);
+  // 找到集合竞价唯一成交价。返回 false 表示当前买卖盘没有可成交数量。
+  bool find_call_auction_result(Price& auction_price, Quantity& trade_quantity) const;
 
-  OrderRegistry orders_;
-  BidLevels bid_levels_;
-  AskLevels ask_levels_;
-  std::set<EventId> processed_events_;
+  BidLevels bids_;
+  AskLevels asks_;
+  Quantity cumulative_trade_quantity_;
+  Turnover cumulative_turnover_;
 };
 
 } // namespace obr

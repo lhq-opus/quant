@@ -1,61 +1,128 @@
-# 第一版订单簿重建核心（C++11 基础语法）
+# C++11 第一版 event.csv 重放
 
-## 范围
+## 这一版解决什么问题
 
-这一版只实现单标的、已标准化事件的核心状态机。它不读取 CSV，也不负责跨文件排序、
-序列缺口、五档输出或累计成交统计。这样可以先独立证明最关键的状态转换，再让后续适配层
-复用同一个核心。
+这一版把 Python `replay_event_order_book.py` 的主要数据流用基础 C++11 重写一遍：
 
-按用户的学习目标，本版固定为 C++11，不使用 `std::variant`、`std::visit`、
-`std::optional`、结构化绑定或三向比较。新增、撤单和成交是三个普通 `struct`，
-分别传入 `apply_add`、`apply_cancel`和 `apply_trade`，便于直接跟踪逻辑。
-活动订单和已处理事件分别使用 `std::map` 和 `std::set`；它们不是本项目的最终
-性能选型，但第一版没有自定义哈希逻辑，更容易学习和检查。
-
-当前核心只接受限价订单。深交所 `OrderType=1`（市价）和 `U`（本方最优）的行为会受
-交易阶段和上游编码契约影响；在这些规则被确认和单独设计以前，核心返回
-`UnsupportedOrderType`，不会猜测价格或静默入簿。
-
-## 状态与事件
-
-`OrderId` 由交易日、频道和原委托 `ApplSeqNum` 组成。`EventId` 使用相同三段作用域，
-但表示当前事件自身的应用序号。这两个类型刻意分开，避免把成交/撤单事件序号误当作
-被引用的原委托序号。
-
-每个活动订单保存方向、类型、价格和剩余数量。买卖两侧分别维护全深度价格映射：
-买价从高到低，卖价从低到高。每档数量必须等于该方向、该价格所有活动订单剩余量之和。
-
-核心接收三种标准化事件：
-
-- `AddOrderEvent`：增加一个唯一活动订单，并增加对应价格档；
-- `CancelOrderEvent`：验证订单、方向和可撤数量后，减少一个订单；
-- `TradeEvent`：先同时验证买卖两个引用和双方可成交数量，再同时减少两个订单。
-
-剩余量或价位聚合变成零时立即删除。成功应用的 `EventId` 会被记录；重复事件返回
-`DuplicateEvent`，不会二次改变状态。
-
-## 原子性和错误
-
-所有预期业务错误都在修改前完成校验。特别是成交事件只有在买卖双方同时有效时才开始
-更新，因此未知订单、方向错误或任一方数量不足都不会留下“只扣了一边”的中间状态。
-错误通过 `ApplyResult` 返回，不依赖异常表达正常数据质量问题。
-
-本版没有实现恢复模式。零价格、零数量、重复订单、跨交易日/频道引用、未知订单、超量
-成交或撤单、价位数量溢出等都会严格拒绝。`validate_invariants()` 会从活动订单重新计算
-全量聚合，用于验证和诊断；它是 O(N) 审计，不应放进生产热路径的每个事件。
-
-## 构建与验证
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build --parallel
-./build/obr_validate_reconstruction_core
-
-cmake -S . -B build-sanitized -DCMAKE_BUILD_TYPE=Debug -DOBR_ENABLE_SANITIZERS=ON
-cmake --build build-sanitized --parallel
-./build-sanitized/obr_validate_reconstruction_core
+```text
+命令行
+  -> 读取固定 9 列 event.csv
+  -> 每行转换成 Event
+  -> 按 caa 稳定排序
+  -> 重放开盘集合、连续和收盘集合竞价
+  -> 每条 Event 生成一条五档 Snapshot
+  -> 写 book.csv
 ```
 
-验证程序使用运行时构造的事件，不依赖或提交 mock CSV。它覆盖同价聚合、七档深度、
-部分/全部成交与撤单、深档晋升、重复事件、重复订单、未知引用、方向错误、跨作用域、
-超量扣减、零值、不支持的订单类型和聚合溢出，并检查每个失败事件前后状态完全一致。
+目标是让初学者可以顺着代码看到 CSV 字符串怎样一步步变成订单簿，而不是第一版就搭建
+完整的生产框架。代码只使用 C++11 及更早的基础语法和标准库。
+
+## 三个文件的职责
+
+- `include/obr/domain.hpp`：定义基础整数别名、`Event`、`TradingSession`、
+  `PriceLevel` 和 `Snapshot`；
+- `include/obr/order_book.hpp` 与 `src/order_book.cpp`：用两个 `std::map` 保存买卖
+  聚合价格档，实现集合竞价、连续竞价、撤单和五档快照；
+- `src/replay_event_main.cpp`：解析命令行、拆分 CSV、转换 Event、判断交易阶段、排序，
+  最后写出 CSV。
+
+这三层只是为了不把文件读写和订单簿状态混在同一个函数里，不是抽象框架。
+
+## 构建和运行
+
+在 `quant/obr` 目录执行：
+
+```bash
+cmake -S . -B /tmp/obr-build -DCMAKE_BUILD_TYPE=Debug
+cmake --build /tmp/obr-build --parallel
+
+/tmp/obr-build/obr_replay_event \
+  --event /path/to/event.csv \
+  --output /path/to/book.csv
+```
+
+`--output` 可以省略，默认覆盖当前目录下的 `book.csv`。第一版没有 `--overwrite`、路径
+冲突检查或自动创建父目录。
+
+## CSV 怎样变成 Event
+
+输入固定为以下 9 列：
+
+```text
+caa,TransactionTime,Side,OrderType,Price,OrderQty,ExecType,TradeQty,TradePrice
+```
+
+`replay_event_main.cpp` 先跳过表头，然后用一个简单循环按逗号拆分每一行。输入约定合法，
+字段中没有逗号和引号，因此这里不引入第三方 CSV 库，也不实现 RFC CSV 转义规则。
+
+order 行转换为：
+
+```text
+EventType::Order
+side       = Side
+order_type = OrderType
+price      = Price
+quantity   = OrderQty
+```
+
+`ExecType=4` 的撤单行转换为：
+
+```text
+EventType::Cancel
+price    = TradePrice
+quantity = TradeQty
+```
+
+这一步把两种 CSV 行归一成同一个简单 `Event`，所以 `OrderBook` 不需要知道原始列位置。
+
+## 为什么价格仍使用整数
+
+代码没有复杂的强类型，但也没有使用 `double`。`Price` 是普通 `std::int64_t`，单位为
+0.0001 元：
+
+```text
+CSV 10.10  <->  内部 101000  <->  输出 10.1000
+```
+
+`parse_price()` 在输入边界拆开整数和小数部分，`format_fixed_point()` 在输出边界恢复四位小数。
+成交额内部同样保留四位小数单位。
+
+## OrderBook 的直接逻辑
+
+内部只有两个主要状态：
+
+```text
+bids_: 价格从高到低 -> 聚合买量
+asks_: 价格从低到高 -> 聚合卖量
+```
+
+- 集合竞价 order：只加入本方 map；阶段结束时统一筛选成交价并扣减双方数量；
+- 连续竞价 order：从对方 `map.begin()` 开始逐档成交，剩余量再进入本方 map；
+- cancel：用上游补好的 `TradePrice` 查找价格档并扣除 `TradeQty`；
+- snapshot：直接从两个已经排好序的 map 各取前五个元素。
+
+集合竞价与 Python demo 相同：按最大成交量、较优价格全部成交、成交价一侧全部成交、
+严格高买量与严格低卖量差最小依次筛选。本 demo 不使用 reference price，约定筛选后只剩
+一个候选价。
+
+## 有意不做的事情
+
+这一版假设输入是单交易日、单标的、完整且合法的数据，因此没有实现：
+
+- 订单 ID、同价 FIFO 或真实成交双方恢复；
+- 表头兼容、带引号 CSV、非法数字和未知枚举诊断；
+- 重复事件、序列缺口、未知撤单、超量扣减或整数溢出策略；
+- 输出覆盖保护、恢复模式、多标的调度或性能优化。
+
+这些不是被遗忘，而是按当前学习目标推迟。后续工业化迭代可以在已经理解状态变化之后，
+逐项恢复明确的输入契约和错误策略。
+
+## 验证
+
+```bash
+/tmp/obr-build/obr_validate_reconstruction_core
+```
+
+验证程序只覆盖合法正常流程：开盘集合竞价、连续逐档成交、盘前撤单、收盘集合竞价、
+未成交数量结转以及累计成交量和成交额。端到端验证还会让 C++ 和 Python 读取同一份临时
+`event.csv`，并逐字节比较两份 `book.csv`。

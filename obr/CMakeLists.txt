@@ -48,6 +48,33 @@ if(OBR_ENABLE_SANITIZERS)
     endif()
 endif()
 
+add_executable(obr_replay_event
+    src/replay_event_main.cpp
+)
+
+target_link_libraries(obr_replay_event
+    PRIVATE
+        obr_reconstruction_core
+)
+
+set_target_properties(obr_replay_event PROPERTIES
+    CXX_EXTENSIONS OFF
+    CXX_STANDARD 11
+    CXX_STANDARD_REQUIRED ON
+)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "AppleClang|Clang|GNU")
+    target_compile_options(obr_replay_event
+        PRIVATE
+            -Wall
+            -Wextra
+            -Wconversion
+            -Werror
+            -Wpedantic
+            -Wshadow
+    )
+endif()
+
 add_executable(obr_validate_reconstruction_core
     validation/reconstruction_core_validation.cpp
 )

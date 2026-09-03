@@ -1,358 +1,331 @@
 #include "obr/order_book.hpp"
 
-#include <limits>
-#include <utility>
+#include <algorithm>
+#include <cassert>
+#include <vector>
 
 namespace obr {
 namespace {
 
-bool is_valid_side(Side side) { return side == Side::Buy || side == Side::Sell; }
-
-bool is_same_scope(const EventId& event_id, const OrderId& order_id) {
-  return event_id.trading_day == order_id.trading_day && event_id.channel == order_id.channel;
-}
+// 集合竞价会先为每个申报价计算三个值，再逐层筛选。
+// 这里直接用一个局部 struct 保存结果，比引入通用算法或模板更容易阅读。
+struct AuctionCandidate {
+  Price price;
+  Quantity trade_quantity;
+  Quantity quantity_difference;
+};
 
 } // namespace
 
-ApplyResult ApplyResult::success() { return ApplyResult(true, ApplyErrorCode::None, ""); }
+OrderBook::OrderBook() : cumulative_trade_quantity_(0), cumulative_turnover_(0) {}
 
-ApplyResult ApplyResult::failure(ApplyErrorCode code, const std::string& message) {
-  return ApplyResult(false, code, message);
+void OrderBook::apply(const Event& event, TradingSession session) {
+  // 撤单在三个阶段中的处理方式相同：从已知价格档扣除 TradeQty。
+  if (event.type == EventType::Cancel) {
+    apply_cancel(event);
+    return;
+  }
+
+  // 连续竞价中的新订单会马上尝试吃掉对手盘。
+  if (session == TradingSession::ContinuousAuction) {
+    apply_continuous_order(event);
+    return;
+  }
+
+  // 开盘和收盘集合竞价期间不逐笔撮合，只把订单累加到本方价格档。
+  add_order(event);
 }
 
-ApplyResult OrderBook::apply_add(const AddOrderEvent& event) {
-  ApplyResult result = validate_new_event(event.event_id);
-  if (!result.applied) {
-    return result;
+void OrderBook::add_order(const Event& event) {
+  if (event.side == '1') {
+    // map 的 operator[] 在价格不存在时会先放入一个 0，然后再加数量。
+    bids_[event.price] += event.quantity;
+  } else {
+    asks_[event.price] += event.quantity;
   }
-
-  result = validate_order_scope(event.event_id, event.order_id);
-  if (!result.applied) {
-    return result;
-  }
-  if (orders_.find(event.order_id) != orders_.end()) {
-    return ApplyResult::failure(ApplyErrorCode::DuplicateOrder, "order id is already live");
-  }
-  if (event.event_id.application_sequence != event.order_id.application_sequence) {
-    return ApplyResult::failure(ApplyErrorCode::ScopeMismatch,
-                                "add event sequence must equal its original order sequence");
-  }
-  if (!is_valid_side(event.side)) {
-    return ApplyResult::failure(ApplyErrorCode::InvalidSide, "add order side is invalid");
-  }
-  if (event.order_type != OrderType::Limit) {
-    return ApplyResult::failure(ApplyErrorCode::UnsupportedOrderType,
-                                "first reconstruction core supports limit orders only");
-  }
-  if (event.price.value <= 0) {
-    return ApplyResult::failure(ApplyErrorCode::InvalidPrice, "limit order price must be positive");
-  }
-  if (event.quantity.value == 0U) {
-    return ApplyResult::failure(ApplyErrorCode::InvalidQuantity,
-                                "add order quantity must be positive");
-  }
-
-  Quantity current_quantity(0U);
-  get_level_quantity(event.side, event.price, &current_quantity);
-  if (event.quantity.value > std::numeric_limits<std::uint64_t>::max() - current_quantity.value) {
-    return ApplyResult::failure(ApplyErrorCode::LevelQuantityOverflow,
-                                "adding the order would overflow its price-level quantity");
-  }
-
-  OrderState state(event.side, event.order_type, event.price, event.quantity);
-  orders_.insert(std::make_pair(event.order_id, state));
-  add_to_level(event.side, event.price, event.quantity);
-  processed_events_.insert(event.event_id);
-  return ApplyResult::success();
 }
 
-ApplyResult OrderBook::apply_cancel(const CancelOrderEvent& event) {
-  ApplyResult result = validate_new_event(event.event_id);
-  if (!result.applied) {
-    return result;
+void OrderBook::apply_continuous_order(const Event& event) {
+  Quantity remaining_quantity = event.quantity;
+
+  if (event.side == '1') {
+    // asks_ 默认按价格升序，因此 begin() 就是当前卖一。
+    // 买单只要还有数量，并且卖一不高于买入限价，就继续逐档成交。
+    while (remaining_quantity > 0 && !asks_.empty()) {
+      AskLevels::iterator best_ask = asks_.begin();
+      if (best_ask->first > event.price) {
+        break;
+      }
+
+      const Quantity traded_quantity = std::min(remaining_quantity, best_ask->second);
+      record_trade(best_ask->first, traded_quantity);
+
+      remaining_quantity -= traded_quantity;
+      best_ask->second -= traded_quantity;
+      if (best_ask->second == 0) {
+        asks_.erase(best_ask);
+      }
+    }
+
+    // 对手盘已经不能继续成交时，买单剩余数量进入自己的限价档。
+    if (remaining_quantity > 0) {
+      bids_[event.price] += remaining_quantity;
+    }
+    return;
   }
 
-  result = validate_order_scope(event.event_id, event.order_id);
-  if (!result.applied) {
-    return result;
-  }
-  if (!is_valid_side(event.side)) {
-    return ApplyResult::failure(ApplyErrorCode::InvalidSide, "cancel side is invalid");
+  // bids_ 使用降序比较器，因此 begin() 就是当前买一。
+  // 卖单从最高买价开始，只要买一不低于卖出限价，就继续逐档成交。
+  while (remaining_quantity > 0 && !bids_.empty()) {
+    BidLevels::iterator best_bid = bids_.begin();
+    if (best_bid->first < event.price) {
+      break;
+    }
+
+    const Quantity traded_quantity = std::min(remaining_quantity, best_bid->second);
+    record_trade(best_bid->first, traded_quantity);
+
+    remaining_quantity -= traded_quantity;
+    best_bid->second -= traded_quantity;
+    if (best_bid->second == 0) {
+      bids_.erase(best_bid);
+    }
   }
 
-  OrderRegistry::iterator order = orders_.find(event.order_id);
-  if (order == orders_.end()) {
-    return ApplyResult::failure(ApplyErrorCode::UnknownOrder,
-                                "cancel references an unknown live order");
+  // 卖单没有完全成交时，剩余数量进入自己的限价档。
+  if (remaining_quantity > 0) {
+    asks_[event.price] += remaining_quantity;
   }
-
-  result = validate_reduction(order, event.side, event.quantity);
-  if (!result.applied) {
-    return result;
-  }
-
-  reduce_order(order, event.quantity);
-  processed_events_.insert(event.event_id);
-  return ApplyResult::success();
 }
 
-ApplyResult OrderBook::apply_trade(const TradeEvent& event) {
-  ApplyResult result = validate_new_event(event.event_id);
-  if (!result.applied) {
-    return result;
-  }
-  if (event.bid_order_id == event.ask_order_id) {
-    return ApplyResult::failure(ApplyErrorCode::InvalidTradeReferences,
-                                "trade must reference two distinct orders");
-  }
-
-  result = validate_order_scope(event.event_id, event.bid_order_id);
-  if (!result.applied) {
-    return result;
-  }
-  result = validate_order_scope(event.event_id, event.ask_order_id);
-  if (!result.applied) {
-    return result;
-  }
-  if (event.trade_price.value <= 0) {
-    return ApplyResult::failure(ApplyErrorCode::InvalidPrice, "trade price must be positive");
+void OrderBook::apply_cancel(const Event& event) {
+  // event.csv 已经把撤单引用的原订单价格补到了 TradePrice。
+  // 当前 demo 假设这个价格只会出现在买卖一侧，因此先查买盘，找不到就查卖盘。
+  BidLevels::iterator bid = bids_.find(event.price);
+  if (bid != bids_.end()) {
+    bid->second -= event.quantity;
+    if (bid->second == 0) {
+      bids_.erase(bid);
+    }
+    return;
   }
 
-  OrderRegistry::iterator bid_order = orders_.find(event.bid_order_id);
-  OrderRegistry::iterator ask_order = orders_.find(event.ask_order_id);
-  if (bid_order == orders_.end() || ask_order == orders_.end()) {
-    return ApplyResult::failure(ApplyErrorCode::UnknownOrder,
-                                "trade references an unknown buy or sell order");
+  // 输入保证撤单价格存在、数量充足，所以这里不再添加 unknown order、超量撤单等
+  // 防御性分支，直接修改找到的卖盘价格档。
+  AskLevels::iterator ask = asks_.find(event.price);
+  ask->second -= event.quantity;
+  if (ask->second == 0) {
+    asks_.erase(ask);
   }
-
-  // Both sides are checked before either side is changed. This is the key atomicity rule.
-  result = validate_reduction(bid_order, Side::Buy, event.quantity);
-  if (!result.applied) {
-    return result;
-  }
-  result = validate_reduction(ask_order, Side::Sell, event.quantity);
-  if (!result.applied) {
-    return result;
-  }
-
-  reduce_order(bid_order, event.quantity);
-  reduce_order(ask_order, event.quantity);
-  processed_events_.insert(event.event_id);
-  return ApplyResult::success();
 }
 
-std::size_t OrderBook::order_count() const { return orders_.size(); }
+void OrderBook::record_trade(Price price, Quantity quantity) {
+  cumulative_trade_quantity_ += quantity;
+  cumulative_turnover_ += price * quantity;
+}
 
-std::size_t OrderBook::processed_event_count() const { return processed_events_.size(); }
+bool OrderBook::find_call_auction_result(Price& auction_price, Quantity& trade_quantity) const {
+  // 候选价格就是当前买卖申报价格的并集。
+  std::vector<Price> prices;
+  BidLevels::const_iterator bid = bids_.begin();
+  for (; bid != bids_.end(); ++bid) {
+    prices.push_back(bid->first);
+  }
+  AskLevels::const_iterator ask = asks_.begin();
+  for (; ask != asks_.end(); ++ask) {
+    prices.push_back(ask->first);
+  }
 
-bool OrderBook::get_remaining_quantity(const OrderId& order_id, Quantity* quantity) const {
-  OrderRegistry::const_iterator order = orders_.find(order_id);
-  if (order == orders_.end()) {
+  std::sort(prices.begin(), prices.end());
+  prices.erase(std::unique(prices.begin(), prices.end()), prices.end());
+
+  std::vector<AuctionCandidate> candidates;
+  std::vector<Price>::const_iterator price = prices.begin();
+  for (; price != prices.end(); ++price) {
+    Quantity buy_quantity = 0;
+    bid = bids_.begin();
+    for (; bid != bids_.end(); ++bid) {
+      if (bid->first >= *price) {
+        buy_quantity += bid->second;
+      }
+    }
+
+    Quantity sell_quantity = 0;
+    ask = asks_.begin();
+    for (; ask != asks_.end(); ++ask) {
+      if (ask->first <= *price) {
+        sell_quantity += ask->second;
+      }
+    }
+
+    const Quantity possible_trade = std::min(buy_quantity, sell_quantity);
+    if (possible_trade == 0) {
+      continue;
+    }
+
+    // 严格高于候选价的买单、严格低于候选价的卖单，都必须能够全部成交。
+    Quantity better_buy_quantity = 0;
+    bid = bids_.begin();
+    for (; bid != bids_.end(); ++bid) {
+      if (bid->first > *price) {
+        better_buy_quantity += bid->second;
+      }
+    }
+
+    Quantity better_sell_quantity = 0;
+    ask = asks_.begin();
+    for (; ask != asks_.end(); ++ask) {
+      if (ask->first < *price) {
+        better_sell_quantity += ask->second;
+      }
+    }
+
+    if (better_buy_quantity > possible_trade || better_sell_quantity > possible_trade) {
+      continue;
+    }
+
+    // 候选价上的买方或卖方至少要有一方全部成交。
+    Quantity buy_at_price = 0;
+    BidLevels::const_iterator same_bid = bids_.find(*price);
+    if (same_bid != bids_.end()) {
+      buy_at_price = same_bid->second;
+    }
+
+    Quantity sell_at_price = 0;
+    AskLevels::const_iterator same_ask = asks_.find(*price);
+    if (same_ask != asks_.end()) {
+      sell_at_price = same_ask->second;
+    }
+
+    const bool all_buys_at_price_trade = better_buy_quantity + buy_at_price <= possible_trade;
+    const bool all_sells_at_price_trade = better_sell_quantity + sell_at_price <= possible_trade;
+    if (!all_buys_at_price_trade && !all_sells_at_price_trade) {
+      continue;
+    }
+
+    AuctionCandidate candidate;
+    candidate.price = *price;
+    candidate.trade_quantity = possible_trade;
+    candidate.quantity_difference = better_buy_quantity >= better_sell_quantity
+                                        ? better_buy_quantity - better_sell_quantity
+                                        : better_sell_quantity - better_buy_quantity;
+    candidates.push_back(candidate);
+  }
+
+  if (candidates.empty()) {
     return false;
   }
-  if (quantity != NULL) {
-    *quantity = order->second.remaining_quantity;
+
+  // 第一轮：只保留最大可成交量对应的候选价格。
+  Quantity maximum_trade_quantity = 0;
+  std::vector<AuctionCandidate>::const_iterator candidate = candidates.begin();
+  for (; candidate != candidates.end(); ++candidate) {
+    if (candidate->trade_quantity > maximum_trade_quantity) {
+      maximum_trade_quantity = candidate->trade_quantity;
+    }
   }
+
+  std::vector<AuctionCandidate> maximum_candidates;
+  candidate = candidates.begin();
+  for (; candidate != candidates.end(); ++candidate) {
+    if (candidate->trade_quantity == maximum_trade_quantity) {
+      maximum_candidates.push_back(*candidate);
+    }
+  }
+
+  // 第二轮：如果最大成交量相同，选择严格高买量与严格低卖量差最小者。
+  Quantity minimum_difference = maximum_candidates[0].quantity_difference;
+  candidate = maximum_candidates.begin();
+  for (; candidate != maximum_candidates.end(); ++candidate) {
+    if (candidate->quantity_difference < minimum_difference) {
+      minimum_difference = candidate->quantity_difference;
+    }
+  }
+
+  std::vector<AuctionCandidate> final_candidates;
+  candidate = maximum_candidates.begin();
+  for (; candidate != maximum_candidates.end(); ++candidate) {
+    if (candidate->quantity_difference == minimum_difference) {
+      final_candidates.push_back(*candidate);
+    }
+  }
+
+  // 当前 demo 不使用 reference price，约定合法输入到这里一定只剩一个价格。
+  assert(final_candidates.size() == 1U);
+  auction_price = final_candidates[0].price;
+  trade_quantity = maximum_trade_quantity;
   return true;
 }
 
-bool OrderBook::get_level_quantity(Side side, Price price, Quantity* quantity) const {
-  if (side == Side::Buy) {
-    BidLevels::const_iterator level = bid_levels_.find(price);
-    if (level == bid_levels_.end()) {
-      return false;
-    }
-    if (quantity != NULL) {
-      *quantity = level->second;
-    }
-    return true;
+void OrderBook::finish_call_auction() {
+  Price auction_price = 0;
+  Quantity trade_quantity = 0;
+  if (!find_call_auction_result(auction_price, trade_quantity)) {
+    return;
   }
-  if (side == Side::Sell) {
-    AskLevels::const_iterator level = ask_levels_.find(price);
-    if (level == ask_levels_.end()) {
-      return false;
-    }
-    if (quantity != NULL) {
-      *quantity = level->second;
-    }
-    return true;
-  }
-  return false;
-}
 
-std::vector<PriceLevel> OrderBook::bid_levels() const {
-  std::vector<PriceLevel> levels;
-  levels.reserve(bid_levels_.size());
-  BidLevels::const_iterator it = bid_levels_.begin();
-  for (; it != bid_levels_.end(); ++it) {
-    levels.push_back(PriceLevel(it->first, it->second));
-  }
-  return levels;
-}
+  // 买方从最高价向下扣减所有不低于集合竞价成交价的数量。
+  Quantity bid_quantity_left = trade_quantity;
+  BidLevels::iterator bid = bids_.begin();
+  while (bid != bids_.end() && bid_quantity_left > 0 && bid->first >= auction_price) {
+    const Quantity reduced = std::min(bid_quantity_left, bid->second);
+    bid->second -= reduced;
+    bid_quantity_left -= reduced;
 
-std::vector<PriceLevel> OrderBook::ask_levels() const {
-  std::vector<PriceLevel> levels;
-  levels.reserve(ask_levels_.size());
-  AskLevels::const_iterator it = ask_levels_.begin();
-  for (; it != ask_levels_.end(); ++it) {
-    levels.push_back(PriceLevel(it->first, it->second));
-  }
-  return levels;
-}
-
-ValidationResult OrderBook::validate_invariants() const {
-  BidLevels expected_bids;
-  AskLevels expected_asks;
-
-  OrderRegistry::const_iterator order = orders_.begin();
-  for (; order != orders_.end(); ++order) {
-    const OrderId& order_id = order->first;
-    const OrderState& state = order->second;
-
-    if (order_id.trading_day == 0U || order_id.channel == 0U ||
-        order_id.application_sequence == 0U) {
-      return ValidationResult(false, "live order has an invalid scoped id");
-    }
-    if (!is_valid_side(state.side)) {
-      return ValidationResult(false, "live order has an invalid side");
-    }
-    if (state.order_type != OrderType::Limit) {
-      return ValidationResult(false, "live order has an unsupported order type");
-    }
-    if (state.price.value <= 0 || state.remaining_quantity.value == 0U) {
-      return ValidationResult(false, "live order has an invalid price or quantity");
-    }
-
-    if (state.side == Side::Buy) {
-      BidLevels::iterator level = expected_bids.find(state.price);
-      std::uint64_t current = level == expected_bids.end() ? 0U : level->second.value;
-      if (state.remaining_quantity.value > std::numeric_limits<std::uint64_t>::max() - current) {
-        return ValidationResult(false, "recomputed bid aggregate overflowed");
-      }
-      Quantity total(current + state.remaining_quantity.value);
-      if (level == expected_bids.end()) {
-        expected_bids.insert(std::make_pair(state.price, total));
-      } else {
-        level->second = total;
-      }
+    if (bid->second == 0) {
+      BidLevels::iterator empty_level = bid;
+      ++bid;
+      bids_.erase(empty_level);
     } else {
-      AskLevels::iterator level = expected_asks.find(state.price);
-      std::uint64_t current = level == expected_asks.end() ? 0U : level->second.value;
-      if (state.remaining_quantity.value > std::numeric_limits<std::uint64_t>::max() - current) {
-        return ValidationResult(false, "recomputed ask aggregate overflowed");
-      }
-      Quantity total(current + state.remaining_quantity.value);
-      if (level == expected_asks.end()) {
-        expected_asks.insert(std::make_pair(state.price, total));
-      } else {
-        level->second = total;
-      }
+      ++bid;
     }
   }
 
-  if (expected_bids != bid_levels_) {
-    return ValidationResult(false, "bid levels do not equal the sum of live buy orders");
-  }
-  if (expected_asks != ask_levels_) {
-    return ValidationResult(false, "ask levels do not equal the sum of live sell orders");
-  }
-  return ValidationResult(true, "");
-}
+  // 卖方从最低价向上扣减所有不高于集合竞价成交价的数量。
+  Quantity ask_quantity_left = trade_quantity;
+  AskLevels::iterator ask = asks_.begin();
+  while (ask != asks_.end() && ask_quantity_left > 0 && ask->first <= auction_price) {
+    const Quantity reduced = std::min(ask_quantity_left, ask->second);
+    ask->second -= reduced;
+    ask_quantity_left -= reduced;
 
-ApplyResult OrderBook::validate_new_event(const EventId& event_id) const {
-  if (event_id.trading_day == 0U || event_id.channel == 0U || event_id.application_sequence == 0U) {
-    return ApplyResult::failure(ApplyErrorCode::InvalidEventId,
-                                "event id requires non-zero trading day, channel, and sequence");
-  }
-  if (processed_events_.find(event_id) != processed_events_.end()) {
-    return ApplyResult::failure(ApplyErrorCode::DuplicateEvent, "event id was already applied");
-  }
-  return ApplyResult::success();
-}
-
-ApplyResult OrderBook::validate_order_scope(const EventId& event_id,
-                                            const OrderId& order_id) const {
-  if (order_id.trading_day == 0U || order_id.channel == 0U || order_id.application_sequence == 0U) {
-    return ApplyResult::failure(ApplyErrorCode::ScopeMismatch,
-                                "referenced order id has an invalid scope");
-  }
-  if (!is_same_scope(event_id, order_id)) {
-    return ApplyResult::failure(ApplyErrorCode::ScopeMismatch,
-                                "event and referenced order must share trading day and channel");
-  }
-  return ApplyResult::success();
-}
-
-ApplyResult OrderBook::validate_reduction(OrderRegistry::const_iterator order, Side expected_side,
-                                          Quantity quantity) const {
-  if (quantity.value == 0U) {
-    return ApplyResult::failure(ApplyErrorCode::InvalidQuantity,
-                                "reduction quantity must be positive");
-  }
-  if (order->second.side != expected_side) {
-    return ApplyResult::failure(ApplyErrorCode::SideMismatch,
-                                "referenced order side does not match the event role");
-  }
-  if (quantity.value > order->second.remaining_quantity.value) {
-    return ApplyResult::failure(ApplyErrorCode::OverReduce,
-                                "event quantity exceeds referenced order remaining quantity");
-  }
-
-  Quantity aggregate(0U);
-  if (!get_level_quantity(order->second.side, order->second.price, &aggregate) ||
-      aggregate.value < quantity.value) {
-    return ApplyResult::failure(ApplyErrorCode::InternalInvariantViolation,
-                                "price level cannot satisfy a validated order reduction");
-  }
-  return ApplyResult::success();
-}
-
-void OrderBook::add_to_level(Side side, Price price, Quantity quantity) {
-  if (side == Side::Buy) {
-    BidLevels::iterator level = bid_levels_.find(price);
-    if (level == bid_levels_.end()) {
-      bid_levels_.insert(std::make_pair(price, quantity));
+    if (ask->second == 0) {
+      AskLevels::iterator empty_level = ask;
+      ++ask;
+      asks_.erase(empty_level);
     } else {
-      level->second = Quantity(level->second.value + quantity.value);
-    }
-  } else {
-    AskLevels::iterator level = ask_levels_.find(price);
-    if (level == ask_levels_.end()) {
-      ask_levels_.insert(std::make_pair(price, quantity));
-    } else {
-      level->second = Quantity(level->second.value + quantity.value);
+      ++ask;
     }
   }
+
+  // 集合竞价双方成交数量相同，并且全部使用同一个 auction_price 计算成交额。
+  record_trade(auction_price, trade_quantity);
 }
 
-void OrderBook::reduce_order(OrderRegistry::iterator order, Quantity quantity) {
-  Side side = order->second.side;
-  Price price = order->second.price;
-  Quantity new_remaining(order->second.remaining_quantity.value - quantity.value);
+Snapshot OrderBook::make_snapshot(const Event& event) const {
+  Snapshot snapshot;
+  snapshot.caa = event.caa;
+  snapshot.event_type = event.type;
 
-  if (side == Side::Buy) {
-    BidLevels::iterator level = bid_levels_.find(price);
-    Quantity new_aggregate(level->second.value - quantity.value);
-    if (new_aggregate.value == 0U) {
-      bid_levels_.erase(level);
-    } else {
-      level->second = new_aggregate;
-    }
-  } else {
-    AskLevels::iterator level = ask_levels_.find(price);
-    Quantity new_aggregate(level->second.value - quantity.value);
-    if (new_aggregate.value == 0U) {
-      ask_levels_.erase(level);
-    } else {
-      level->second = new_aggregate;
-    }
+  // bids_ 本来就是降序，直接取前五个元素就是买一到买五。
+  BidLevels::const_iterator bid = bids_.begin();
+  for (; bid != bids_.end() && snapshot.bids.size() < 5U; ++bid) {
+    PriceLevel level = {bid->first, bid->second};
+    snapshot.bids.push_back(level);
   }
 
-  if (new_remaining.value == 0U) {
-    orders_.erase(order);
-  } else {
-    order->second.remaining_quantity = new_remaining;
+  // asks_ 本来就是升序，直接取前五个元素就是卖一到卖五。
+  AskLevels::const_iterator ask = asks_.begin();
+  for (; ask != asks_.end() && snapshot.asks.size() < 5U; ++ask) {
+    PriceLevel level = {ask->first, ask->second};
+    snapshot.asks.push_back(level);
   }
+
+  return snapshot;
 }
+
+Quantity OrderBook::cumulative_trade_quantity() const { return cumulative_trade_quantity_; }
+
+Turnover OrderBook::cumulative_turnover() const { return cumulative_turnover_; }
 
 } // namespace obr

@@ -1,33 +1,22 @@
 #include "obr/order_book.hpp"
 
-#include <cstdlib>
 #include <iostream>
-#include <string>
 #include <vector>
 
 namespace {
 
-void require(bool condition, const std::string& message) {
-  if (!condition) {
-    std::cerr << "study check failed: " << message << '\n';
-    std::exit(EXIT_FAILURE);
-  }
-}
-
-void require_applied(const obr::ApplyResult& result, const std::string& operation) {
-  if (!result.applied) {
-    std::cerr << operation << " failed: " << result.message << '\n';
-    std::exit(EXIT_FAILURE);
-  }
-}
-
 void print_levels(const char* name, const std::vector<obr::PriceLevel>& levels) {
   std::cout << name << '\n';
-  for (std::vector<obr::PriceLevel>::const_iterator level = levels.begin(); level != levels.end();
-       ++level) {
-    std::cout << "  price=" << level->price.value
-              << ", quantity=" << level->aggregate_quantity.value << '\n';
+  std::vector<obr::PriceLevel>::const_iterator level = levels.begin();
+  for (; level != levels.end(); ++level) {
+    std::cout << "  internal_price=" << level->price << ", quantity=" << level->quantity << '\n';
   }
+}
+
+void print_snapshot(const obr::Snapshot& snapshot) {
+  std::cout << "snapshot caa=" << snapshot.caa << '\n';
+  print_levels("bid levels:", snapshot.bids);
+  print_levels("ask levels:", snapshot.asks);
 }
 
 } // namespace
@@ -35,90 +24,35 @@ void print_levels(const char* name, const std::vector<obr::PriceLevel>& levels) 
 int main() {
   obr::OrderBook book;
 
-  const std::uint32_t trading_day = 20260903U;
-  const std::uint32_t channel = 2010U;
+  // 这里直接构造正式代码使用的 Event。
+  // 价格 101000 的单位是 0.0001 元，所以它表示 10.1000 元。
+  const obr::Event bid_1 = {"09:15", "91500790", obr::EventType::Order, '1', '2', 101000, 100};
+  const obr::Event bid_2 = {"09:16", "91600000", obr::EventType::Order, '1', '2', 100000, 100};
+  const obr::Event ask = {"09:17", "91700000", obr::EventType::Order, '2', '2', 99000, 100};
 
-  const obr::OrderId bid_order_1(trading_day, channel, 1U);
-  const obr::OrderId bid_order_2(trading_day, channel, 2U);
-  const obr::OrderId ask_order_1(trading_day, channel, 3U);
+  // 集合竞价期间 apply 只累加价格档。直到显式调用 finish_call_auction，
+  // 三个交叉的价格档才会按照集合竞价规则统一成交。
+  book.apply(bid_1, obr::TradingSession::OpeningAuction);
+  book.apply(bid_2, obr::TradingSession::OpeningAuction);
+  book.apply(ask, obr::TradingSession::OpeningAuction);
+  book.finish_call_auction();
+  print_snapshot(book.make_snapshot(ask));
 
-  // 这里直接使用 domain.hpp 中的真实事件结构，不再定义教学替身。
-  const obr::AddOrderEvent add_bid_1 = {
-      obr::EventId(trading_day, channel, 1U),
-      bid_order_1,
-      obr::Side::Buy,
-      obr::OrderType::Limit,
-      obr::Price(100000),
-      obr::Quantity(100U),
-  };
-  const obr::AddOrderEvent add_bid_2 = {
-      obr::EventId(trading_day, channel, 2U),
-      bid_order_2,
-      obr::Side::Buy,
-      obr::OrderType::Limit,
-      obr::Price(100000),
-      obr::Quantity(50U),
-  };
-  const obr::AddOrderEvent add_ask_1 = {
-      obr::EventId(trading_day, channel, 3U),
-      ask_order_1,
-      obr::Side::Sell,
-      obr::OrderType::Limit,
-      obr::Price(100100),
-      obr::Quantity(80U),
-  };
+  // 简化 Event 已经把撤单的 TradePrice/TradeQty 归一成 price/quantity。
+  // 当前盘口只剩 10.0000 买量 100，这里撤掉其中 20。
+  const obr::Event cancel = {"09:19", "91900000", obr::EventType::Cancel, '\0', '\0', 100000, 20};
+  book.apply(cancel, obr::TradingSession::OpeningAuction);
+  print_snapshot(book.make_snapshot(cancel));
 
-  require_applied(book.apply_add(add_bid_1), "add bid 1");
-  require_applied(book.apply_add(add_bid_2), "add bid 2");
-  require_applied(book.apply_add(add_ask_1), "add ask 1");
+  // 连续竞价卖单 9.9000 低于当前买一 10.0000，所以立即以买一价格成交 30。
+  const obr::Event continuous_ask = {"10:04", "100407190", obr::EventType::Order, '2', '2',
+                                     99000,   30};
+  book.apply(continuous_ask, obr::TradingSession::ContinuousAuction);
+  print_snapshot(book.make_snapshot(continuous_ask));
 
-  // 两个同价买单在价位表中聚合成 150，但订单表仍分别保存 100 和 50。
-  obr::Quantity bid_level_quantity(0U);
-  require(book.get_level_quantity(obr::Side::Buy, obr::Price(100000), &bid_level_quantity),
-          "aggregated bid level should exist");
-  require(bid_level_quantity.value == 150U, "two bid orders should aggregate to 150");
+  std::cout << "cumulative trade quantity: " << book.cumulative_trade_quantity() << '\n';
+  std::cout << "cumulative turnover in 0.0001 units: " << book.cumulative_turnover() << '\n';
 
-  const obr::TradeEvent trade = {
-      obr::EventId(trading_day, channel, 4U),
-      bid_order_1,
-      ask_order_1,
-      obr::Price(100050),
-      obr::Quantity(30U),
-  };
-  require_applied(book.apply_trade(trade), "trade");
-
-  const obr::CancelOrderEvent cancel = {
-      obr::EventId(trading_day, channel, 5U),
-      bid_order_2,
-      obr::Side::Buy,
-      obr::Quantity(20U),
-  };
-  require_applied(book.apply_cancel(cancel), "cancel bid 2");
-
-  // 相同事件再次到达会被 processed_events_ 拒绝，状态不会重复扣减。
-  const obr::ApplyResult duplicate_cancel = book.apply_cancel(cancel);
-  require(!duplicate_cancel.applied, "duplicate event must fail");
-  require(duplicate_cancel.code == obr::ApplyErrorCode::DuplicateEvent,
-          "duplicate event should have the expected error code");
-
-  obr::Quantity bid_1_remaining(0U);
-  obr::Quantity bid_2_remaining(0U);
-  obr::Quantity ask_1_remaining(0U);
-  require(book.get_remaining_quantity(bid_order_1, &bid_1_remaining), "bid 1 should remain live");
-  require(book.get_remaining_quantity(bid_order_2, &bid_2_remaining), "bid 2 should remain live");
-  require(book.get_remaining_quantity(ask_order_1, &ask_1_remaining), "ask 1 should remain live");
-
-  std::cout << "bid order 1 remaining: " << bid_1_remaining.value << '\n';
-  std::cout << "bid order 2 remaining: " << bid_2_remaining.value << '\n';
-  std::cout << "ask order 1 remaining: " << ask_1_remaining.value << '\n';
-  std::cout << "duplicate message: " << duplicate_cancel.message << '\n';
-  print_levels("bid levels:", book.bid_levels());
-  print_levels("ask levels:", book.ask_levels());
-
-  const obr::ValidationResult validation = book.validate_invariants();
-  require(validation.valid, validation.message);
-  std::cout << "invariants valid: yes\n";
-
-  // 小练习：把成交量从 30 改成 90。先判断哪条校验失败，以及三个订单是否会被修改。
-  return EXIT_SUCCESS;
+  // 小练习：把 continuous_ask 的数量从 30 改成 120，预测卖单最终是否会进入卖盘。
+  return 0;
 }

@@ -1,133 +1,70 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace obr {
 
-// Price stores an integer number of price units. The CSV adapter will define the scale later.
-struct Price {
-  explicit Price(std::int64_t initial_value) : value(initial_value) {}
+// 第一版不用复杂的价格类。Price 就是一个 64 位整数，单位是 0.0001 元。
+// 例如 CSV 中的 10.10 会保存成 101000，写回 CSV 时再恢复成 10.1000。
+// 这样仍然能避免 double 带来的小数误差，同时语法很基础。
+typedef std::int64_t Price;
 
-  std::int64_t value;
-};
+// 数量和成交额也直接使用 64 位整数。
+// Turnover 的单位是“价格的 0.0001 单位 × 数量”。
+typedef std::int64_t Quantity;
+typedef std::int64_t Turnover;
 
-inline bool operator==(const Price& left, const Price& right) { return left.value == right.value; }
-
-inline bool operator!=(const Price& left, const Price& right) { return !(left == right); }
-
-inline bool operator<(const Price& left, const Price& right) { return left.value < right.value; }
-
-inline bool operator>(const Price& left, const Price& right) { return right < left; }
-
-struct Quantity {
-  explicit Quantity(std::uint64_t initial_value) : value(initial_value) {}
-
-  std::uint64_t value;
-};
-
-inline bool operator==(const Quantity& left, const Quantity& right) {
-  return left.value == right.value;
-}
-
-inline bool operator!=(const Quantity& left, const Quantity& right) { return !(left == right); }
-
+// event.csv 里只有两类需要 replay 的事件：order 和 ExecType=4 的撤单。
 enum class EventType {
-  AddOrder,
-  CancelOrder,
-  Trade,
+  Order,
+  Cancel,
 };
 
-enum class Side {
-  Buy,
-  Sell,
+// TransactionTime 决定当前事件属于哪个交易阶段。
+enum class TradingSession {
+  OpeningAuction,
+  ContinuousAuction,
+  ClosingAuction,
 };
 
-// These are normalized meanings. A future CSV adapter will translate raw SZSE codes.
-enum class OrderType {
-  Market,
-  Limit,
-  OwnSideBest,
-};
-
-struct OrderId {
-  OrderId(std::uint32_t day, std::uint32_t channel_number, std::uint64_t sequence)
-      : trading_day(day), channel(channel_number), application_sequence(sequence) {}
-
-  std::uint32_t trading_day;
-  std::uint32_t channel;
-  std::uint64_t application_sequence;
-};
-
-inline bool operator==(const OrderId& left, const OrderId& right) {
-  return left.trading_day == right.trading_day && left.channel == right.channel &&
-         left.application_sequence == right.application_sequence;
-}
-
-inline bool operator!=(const OrderId& left, const OrderId& right) { return !(left == right); }
-
-inline bool operator<(const OrderId& left, const OrderId& right) {
-  if (left.trading_day != right.trading_day) {
-    return left.trading_day < right.trading_day;
-  }
-  if (left.channel != right.channel) {
-    return left.channel < right.channel;
-  }
-  return left.application_sequence < right.application_sequence;
-}
-
-struct EventId {
-  EventId(std::uint32_t day, std::uint32_t channel_number, std::uint64_t sequence)
-      : trading_day(day), channel(channel_number), application_sequence(sequence) {}
-
-  std::uint32_t trading_day;
-  std::uint32_t channel;
-  std::uint64_t application_sequence;
-};
-
-inline bool operator==(const EventId& left, const EventId& right) {
-  return left.trading_day == right.trading_day && left.channel == right.channel &&
-         left.application_sequence == right.application_sequence;
-}
-
-inline bool operator<(const EventId& left, const EventId& right) {
-  if (left.trading_day != right.trading_day) {
-    return left.trading_day < right.trading_day;
-  }
-  if (left.channel != right.channel) {
-    return left.channel < right.channel;
-  }
-  return left.application_sequence < right.application_sequence;
-}
-
-// Three concrete event structures keep the first version readable without std::variant.
-struct AddOrderEvent {
-  EventId event_id;
-  OrderId order_id;
-  Side side;
-  OrderType order_type;
+// CSV 的 order 行和 cancel 行最终都转换成这个简单 Event。
+//
+// order：
+//   side       <- Side
+//   order_type <- OrderType
+//   price      <- Price
+//   quantity   <- OrderQty
+//
+// cancel：
+//   type       <- ExecType=4
+//   price      <- TradePrice
+//   quantity   <- TradeQty
+//
+// cancel 不需要 side 和 order_type，所以这两个字符会填成 '\0'。
+struct Event {
+  std::string caa;
+  std::string transaction_time;
+  EventType type;
+  char side;
+  char order_type;
   Price price;
   Quantity quantity;
-
-  EventType event_type() const { return EventType::AddOrder; }
 };
 
-struct CancelOrderEvent {
-  EventId event_id;
-  OrderId order_id;
-  Side side;
+// 一个 PriceLevel 就是一档“价格 + 聚合数量”。
+struct PriceLevel {
+  Price price;
   Quantity quantity;
-
-  EventType event_type() const { return EventType::CancelOrder; }
 };
 
-struct TradeEvent {
-  EventId event_id;
-  OrderId bid_order_id;
-  OrderId ask_order_id;
-  Price trade_price;
-  Quantity quantity;
-
-  EventType event_type() const { return EventType::Trade; }
+// 每处理完一条 Event，就从全深度订单簿中截取买卖各五档形成 Snapshot。
+struct Snapshot {
+  std::string caa;
+  EventType event_type;
+  std::vector<PriceLevel> bids;
+  std::vector<PriceLevel> asks;
 };
 
 } // namespace obr

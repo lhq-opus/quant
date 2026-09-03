@@ -12,15 +12,16 @@
 
 | 课程 | 先理解什么 | 对应正式代码 |
 | --- | --- | --- |
-| `01_values_references_const.cpp` | 值、函数、值传递、引用、指针输出、`const`、定点价格 | `OrderBook` 的参数和查询接口 |
-| `02_structs_enums_operators.cpp` | `struct`、构造函数、初始化列表、`explicit`、`enum class`、运算符 | `include/obr/domain.hpp` |
-| `03_containers_iterators.cpp` | `vector`、`map`、`set`、迭代器、排序规则 | `OrderBook` 的订单表、价位表、事件集合 |
-| `04_class_result_atomicity.cpp` | `class`、`public/private`、结果对象、先校验后修改、不变量 | `include/obr/order_book.hpp` 与 `src/order_book.cpp` |
+| `01_values_references_const.cpp` | 值、函数、值传递、引用、指针输出、`const`、定点价格 | `OrderBook` 的参数和集合竞价输出参数 |
+| `02_structs_enums_operators.cpp` | `struct`、构造函数、初始化列表、`explicit`、`enum class`、运算符 | `Event`/`Snapshot` 的基础语法及后续强类型思路 |
+| `03_containers_iterators.cpp` | `vector`、`map`、`set`、迭代器、排序规则 | `OrderBook` 的买卖价位表与五档快照 |
+| `04_class_result_atomicity.cpp` | `class`、`public/private`、结果对象、先校验后修改、不变量 | 后续工业化版本可能恢复的错误处理思路 |
 | `05_price_time_queue.cpp` | 价格优先和同价 FIFO，`deque` 的队首/队尾 | 后续若要显式保存队列优先级时可能使用 |
-| `06_use_real_order_book.cpp` | 把前面语法放回真实类型，执行新增、成交、撤单 | 当前正式重建核心 |
+| `06_use_real_order_book.cpp` | 把前面语法放回真实类型，执行集合竞价、连续竞价和撤单 | 当前简化重建核心 |
 
-第 5 节只是容器与“价优、时优”的预习。当前 SZSE 重建核心处理的是交易所已经给出
-订单引用的事件，并不自己决定哪两笔订单撮合；不要把重建器和撮合引擎混为一谈。
+第 4、5 节保留了订单 ID、错误结果和同价 FIFO 的学习例子，供后续工业化迭代参考。
+当前第一版正式核心更简单：它和 Python replay 一样只维护聚合价格档，不恢复具体订单，
+并在价格档层面推导成交。不要把这个教学假设当成完整的交易所逐笔成交模型。
 
 ## 编译和运行
 
@@ -66,13 +67,13 @@ c++ -std=c++11 -Wall -Wextra -Wconversion -Werror -Wpedantic -Wshadow \
 先把第 6 节当作一个具体例子：
 
 1. `#include "obr/order_book.hpp"` 会让编译器看到类型和函数的声明，例如
-   `OrderBook::apply_add` 可以接收什么参数。
+   `OrderBook::apply` 可以接收什么参数。
 2. `06_use_real_order_book.cpp` 和 `src/order_book.cpp` 分别是翻译单元，各自先编译成
    目标文件；前者包含调用，后者包含函数定义。
 3. 链接器最后把两份目标文件合成 `obr_study_06_real_core`。如果只编译第 6 节而漏掉
    `order_book.cpp`，通常会得到“未定义符号”，不是语法错误。
-4. `#pragma once` 避免一个头文件在同一翻译单元中被重复展开。定义在头文件里的短小
-   运算符标记为 `inline`，使多个翻译单元包含它时仍满足定义规则。
+4. `#pragma once` 避免一个头文件在同一翻译单元中被重复展开；头文件主要告诉各个
+   翻译单元有哪些类型和公开成员函数。
 5. `namespace obr` 把正式类型放进项目自己的名字空间；教学文件中的匿名
    `namespace {}` 则让辅助函数只在当前 `.cpp` 内可见。
 
@@ -88,9 +89,9 @@ c++ -std=c++11 -Wall -Wextra -Wconversion -Werror -Wpedantic -Wshadow \
 
 ## 后续课程按实际代码增加
 
-事件双流合并很可能会引入 `std::sort`、比较函数或简单 lambda；CSV 适配层会进一步
-使用 `std::string`、流和显式的数字转换错误处理。模板、移动语义、智能指针和并发不会
-为了“展示高级语法”提前塞进教程，等生产实现真正需要时再增加对应的最小例子。
+当前 CSV replay 已经使用 `std::stable_sort`、比较函数、`std::string` 和文件流；可以在
+读完第 6 节后继续阅读 `src/replay_event_main.cpp`。模板、移动语义、智能指针和并发不会
+为了“展示高级语法”提前塞进教程，等后续实现真正需要时再增加对应的最小例子。
 
 ## 怎么学，而不是只把程序跑一遍
 
@@ -104,9 +105,9 @@ c++ -std=c++11 -Wall -Wextra -Wconversion -Werror -Wpedantic -Wshadow \
 
 可以先回答三个检查问题：
 
-- 为什么查询函数常接收 `const OrderId&`，而不是复制一份 `OrderId`？
+- 为什么 `OrderBook::apply` 使用 `const Event&`，而不是复制一份 `Event`？
 - 为什么买价 `map` 使用 `std::greater`，卖价却使用默认排序？
-- 为什么一次成交必须先把买卖两边都校验通过，再修改任何一边？
+- 为什么集合竞价阶段不能在每条订单到来时立即撮合？
 
 这些程序通过只说明示例在当前工具链下可用，不等于你已经掌握。真正的学习证据是你
 能解释对象如何变化，或自己完成一个小改动。
