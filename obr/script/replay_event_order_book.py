@@ -61,12 +61,6 @@ def parse_args():
     )
     parser.add_argument("--event", required=True, type=Path, help="输入 event.csv")
     parser.add_argument(
-        "--previous-close",
-        required=True,
-        type=Decimal,
-        help="前收盘价；开盘集合竞价最终并列时用于选择成交价",
-    )
-    parser.add_argument(
         "--output",
         type=Path,
         default=Path("book.csv"),
@@ -117,7 +111,7 @@ def trading_session(transaction_time):
 class EventOrderBook:
     """维护全深度聚合盘口，并在价格档层面处理可成交数量。"""
 
-    def __init__(self, previous_close):
+    def __init__(self):
         # bids 和 asks 都是“价格 -> 当前聚合数量”。
         # 订单簿只需要价格档总量，因此不为同价订单维护 FIFO 队列。
         self.bids = {}
@@ -127,10 +121,6 @@ class EventOrderBook:
         # 这两个累计值供后续完整 book.csv 的 cvl、cto 字段使用。
         self.cumulative_trade_quantity = 0
         self.cumulative_turnover = Decimal("0")
-
-        # 开盘最终并列要参考前收盘价；收盘参考当天最近成交价。
-        self.previous_close = previous_close
-        self.last_trade_price = None
 
         # 保存当前 order 在各价格档推导出的成交量和成交额，便于观察单条事件的结果。
         # 撤单不会产生成交，因此应用每个新事件前都重置为 0。
@@ -220,17 +210,10 @@ class EventOrderBook:
         self.event_turnover += trade_turnover
         self.cumulative_trade_quantity += trade_quantity
         self.cumulative_turnover += trade_turnover
-        self.last_trade_price = trade_price
 
-    def finish_call_auction(self, session):
+    def finish_call_auction(self):
         """在开盘或收盘集合竞价结束时，以一个成交价统一撮合。"""
-        if session == OPENING_AUCTION:
-            reference_price = self.previous_close
-        else:
-            # 当天此前没有成交时，用前收盘价作为最近成交价的后备。
-            reference_price = self.last_trade_price or self.previous_close
-
-        auction_price, trade_quantity = self._find_call_auction_result(reference_price)
+        auction_price, trade_quantity = self._find_call_auction_result()
         if auction_price is None:
             return
 
@@ -243,8 +226,8 @@ class EventOrderBook:
         self._reduce_levels(self.asks, ask_prices, trade_quantity)
         self._record_trade(auction_price, trade_quantity)
 
-    def _find_call_auction_result(self, reference_price):
-        """按照深交所集合竞价规则选择唯一成交价和最大成交量。"""
+    def _find_call_auction_result(self):
+        """根据当前买卖盘口选择集合竞价成交价和最大成交量。"""
         # 候选价格来自当前买卖申报价格的并集。
         # 为了让规则一眼可见，demo 对每个价格直接重新求和，不做前缀和优化。
         prices = sorted(set(self.bids) | set(self.asks))
@@ -308,12 +291,10 @@ class EventOrderBook:
         minimum_difference = min(item[2] for item in candidates)
         candidates = [item for item in candidates if item[2] == minimum_difference]
 
-        # 最后一层：开盘参考前收盘价，收盘参考最近成交价。
-        # 合法输入约定保证这一步能够唯一选出价格。
-        auction_price = min(
-            (item[0] for item in candidates),
-            key=lambda price: abs(price - reference_price),
-        )
+        # demo 约定：经过上述规则后，合法输入只剩一个候选价。
+        # 因此开盘和收盘都直接使用订单簿算出的这个价格，不再引入参考价。
+        assert len(candidates) == 1
+        auction_price = candidates[0][0]
         return auction_price, maximum_trade_quantity
 
     @staticmethod
@@ -382,7 +363,7 @@ def main():
     validate_output_path(args.event, args.output, args.overwrite)
 
     events = read_events(args.event)
-    order_book = EventOrderBook(args.previous_close)
+    order_book = EventOrderBook()
 
     # 先算出每条事件的阶段，便于识别一段集合竞价中的最后一条事件。
     event_rows = list(events.itertuples(index=False))
@@ -397,7 +378,7 @@ def main():
         # 这样不额外制造 event，输出行数仍与输入行数相同。
         next_session = sessions[index + 1] if index + 1 < len(sessions) else None
         if session in (OPENING_AUCTION, CLOSING_AUCTION) and next_session != session:
-            order_book.finish_call_auction(session)
+            order_book.finish_call_auction()
 
         rows.append(order_book.snapshot(event.caa, event_type))
 
