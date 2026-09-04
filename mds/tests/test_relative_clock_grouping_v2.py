@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from mds.relative_clock_grouping import build_relative_clock_vectors
 from mds.relative_clock_grouping_v2 import (
     COSINE_GROUPING_METHOD_GREEDY,
     COSINE_GROUPING_METHOD_MINIMIZE,
@@ -77,6 +78,14 @@ def make_market_data() -> pd.DataFrame:
             ],
         }
     ).astype({"clock": "int64", "stock_id": "string", "time": "string"})
+
+
+def read_relationship_matrix(csv_path: Path) -> pd.DataFrame:
+    """回读矩阵 CSV，并恢复第一列为股票行索引。"""
+
+    matrix = pd.read_csv(csv_path, dtype={"stock_id": "string"}).set_index("stock_id")
+    matrix.index = matrix.index.astype(str)
+    return matrix
 
 
 class CosineSimilarityTest(unittest.TestCase):
@@ -277,11 +286,14 @@ class AllPairsGroupingTest(unittest.TestCase):
 
 
 class V2CommandLineTest(unittest.TestCase):
-    def test_cli_only_writes_the_grouping_csv(self) -> None:
+    def test_cli_writes_grouping_and_relationship_matrix_csvs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
             input_csv = directory / "market.csv"
             groups_csv = directory / "groups.csv"
+            cosine_similarity_csv = directory / "groups_cosine_similarity.csv"
+            common_counts_csv = directory / "groups_common_counts.csv"
+            compatibility_csv = directory / "groups_compatibility.csv"
             make_market_data().to_csv(input_csv, index=False)
 
             output = io.StringIO()
@@ -309,19 +321,77 @@ class V2CommandLineTest(unittest.TestCase):
                     {"stock_id": "z", "group_id": 3},
                 ],
             )
-            self.assertEqual(set(directory.iterdir()), {input_csv, groups_csv})
+            expected_vectors = build_relative_clock_vectors(make_market_data())
+            expected_similarities, expected_common_counts = (
+                calculate_cosine_similarity_matrix(
+                    expected_vectors,
+                    min_common_snapshots=3,
+                    min_common_rate=1.0,
+                )
+            )
+            expected_compatibility = build_cosine_compatibility_matrix(
+                expected_similarities,
+                min_cosine_similarity=0.99,
+            )
+            written_similarities = read_relationship_matrix(cosine_similarity_csv)
+            written_common_counts = read_relationship_matrix(common_counts_csv)
+            written_compatibility = read_relationship_matrix(compatibility_csv)
+
+            self.assertEqual(
+                written_similarities.index.tolist(),
+                expected_similarities.index.tolist(),
+            )
+            self.assertEqual(
+                written_similarities.columns.tolist(),
+                expected_similarities.columns.tolist(),
+            )
+            np.testing.assert_allclose(
+                written_similarities.to_numpy(),
+                expected_similarities.to_numpy(),
+                equal_nan=True,
+            )
+            np.testing.assert_array_equal(
+                written_common_counts.to_numpy(),
+                expected_common_counts.to_numpy(),
+            )
+            np.testing.assert_array_equal(
+                written_compatibility.to_numpy(),
+                expected_compatibility.to_numpy(),
+            )
+            self.assertEqual(
+                set(directory.iterdir()),
+                {
+                    input_csv,
+                    groups_csv,
+                    cosine_similarity_csv,
+                    common_counts_csv,
+                    compatibility_csv,
+                },
+            )
             self.assertIn("最终分组数：3", output.getvalue())
             self.assertIn(
                 "分组方法：minimum clique partition（余弦兼容矩阵）",
                 output.getvalue(),
             )
             self.assertIn("已证明当前分组数为全局最少", output.getvalue())
+            self.assertIn(
+                f"余弦相似度矩阵 CSV：{cosine_similarity_csv}",
+                output.getvalue(),
+            )
+            self.assertIn(
+                f"共同 snapshot 数矩阵 CSV：{common_counts_csv}",
+                output.getvalue(),
+            )
+            self.assertIn(f"兼容矩阵 CSV：{compatibility_csv}", output.getvalue())
 
     def test_cli_can_select_cosine_greedy_grouping(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
             input_csv = directory / "market.csv"
             groups_csv = directory / "groups.csv"
+            cosine_similarity_csv = directory / "custom-cosine.csv"
+            common_counts_csv = directory / "custom-common-counts.csv"
+            compatibility_csv = directory / "custom-compatibility.csv"
             make_market_data().to_csv(input_csv, index=False)
 
             output = io.StringIO()
@@ -338,11 +408,26 @@ class V2CommandLineTest(unittest.TestCase):
                         "1.0",
                         "--grouping-method",
                         "cosine_greedy",
+                        "--cosine-similarity-csv",
+                        str(cosine_similarity_csv),
+                        "--common-counts-csv",
+                        str(common_counts_csv),
+                        "--compatibility-csv",
+                        str(compatibility_csv),
                     ]
                 )
 
             self.assertEqual(exit_code, 0)
-            self.assertEqual(set(directory.iterdir()), {input_csv, groups_csv})
+            self.assertEqual(
+                set(directory.iterdir()),
+                {
+                    input_csv,
+                    groups_csv,
+                    cosine_similarity_csv,
+                    common_counts_csv,
+                    compatibility_csv,
+                },
+            )
             self.assertIn("最终分组数：3", output.getvalue())
             self.assertIn("分组方法：按余弦相似度降序贪心合并", output.getvalue())
             self.assertIn("贪心方法不保证当前分组数为全局最少", output.getvalue())

@@ -10,6 +10,12 @@
 - ``VECTORS.csv``：每行一只股票，每个 ``time`` 是一个向量维度；
 - ``GROUPS.csv``：``stock_id,group_id`` 映射；
 - ``VECTORS.png``：按推断组排序后的相对 clock 向量热图。
+- ``GROUPS_match_counts.csv``：股票两两匹配次数矩阵；
+- ``GROUPS_match_rates.csv``：股票两两匹配率矩阵；
+- ``GROUPS_compatibility.csv``：应用当前阈值后的股票两两兼容矩阵。
+
+后三个文件默认根据 ``GROUPS.csv`` 的文件名生成，也可以使用对应命令行参数
+指定其他路径。矩阵 CSV 的第一列和第一行都保存 ``stock_id``。
 
 这是一版便于观察向量结构的简单 baseline，不是最终分组算法。默认参数是
 探索性启发式，不是已经确认的业务阈值。默认使用 ``minimize`` 尽量减少组数；
@@ -37,6 +43,44 @@ GROUPING_METHOD_MINIMIZE = "minimize"
 GROUPING_METHOD_RATE_GREEDY = "rate_greedy"
 GROUPING_METHODS = (GROUPING_METHOD_MINIMIZE, GROUPING_METHOD_RATE_GREEDY)
 DEFAULT_GROUPING_METHOD = GROUPING_METHOD_MINIMIZE
+
+
+def resolve_relationship_matrix_csv_path(
+    groups_csv: Path | str,
+    requested_csv: Path | str | None,
+    matrix_name: str,
+) -> Path:
+    """确定一个股票关系矩阵的输出路径。
+
+    调用方显式传入路径时直接使用；否则在 ``groups_csv`` 同一目录中自动生成。
+    例如 ``groups.csv`` 与 ``matrix_name="match_counts"`` 会得到
+    ``groups_match_counts.csv``。单独放在这个小函数里，可确保 V1、V2 的默认
+    命名规则完全一致。
+    """
+
+    if requested_csv is not None:
+        return Path(requested_csv)
+
+    groups_path = Path(groups_csv)
+    return groups_path.with_name(f"{groups_path.stem}_{matrix_name}.csv")
+
+
+def write_relationship_matrix_csv(
+    matrix: pd.DataFrame,
+    output_csv: Path | str,
+) -> None:
+    """把 ``stock_id × stock_id`` 关系矩阵写成可直接回读的 CSV。
+
+    DataFrame 的 index 表示第一只股票，columns 表示第二只股票。普通
+    ``to_csv(index=False)`` 会丢失行对应的股票 ID，所以这里必须保留 index，
+    并把左上角第一列表头明确写成 ``stock_id``。CSV 结构示例：
+
+    ``stock_id,000001,600000,...``
+
+    余弦相似度矩阵中的 ``NaN`` 会写成空单元格，继续表示“共同维度证据不足”。
+    """
+
+    matrix.to_csv(output_csv, index=True, index_label="stock_id")
 
 
 def build_relative_clock_vectors(data: pd.DataFrame) -> pd.DataFrame:
@@ -686,6 +730,49 @@ def minimize_compatibility_groups(
     return result
 
 
+def group_pairwise_match_matrices(
+    match_counts: pd.DataFrame,
+    match_rates: pd.DataFrame,
+    *,
+    min_close_snapshots: int = DEFAULT_MIN_CLOSE_SNAPSHOTS,
+    min_close_rate: float = DEFAULT_MIN_CLOSE_RATE,
+    grouping_method: str = DEFAULT_GROUPING_METHOD,
+    max_exact_component_stocks: int = DEFAULT_MAX_EXACT_COMPONENT_STOCKS,
+    exact_search_node_limit: int = DEFAULT_EXACT_SEARCH_NODE_LIMIT,
+) -> pd.DataFrame:
+    """直接从已计算的匹配次数/匹配率矩阵执行指定分组方法。
+
+    这个入口把“计算股票关系矩阵”与“使用关系矩阵分组”分开。CSV 流程因此
+    可以先计算一次矩阵，同时将它们写盘和传给分组逻辑，不必为了输出诊断
+    文件再重复扫描全部 snapshot。
+    """
+
+    if grouping_method not in GROUPING_METHODS:
+        raise ValueError(
+            f"grouping_method must be one of {', '.join(GROUPING_METHODS)}"
+        )
+
+    if grouping_method == GROUPING_METHOD_RATE_GREEDY:
+        return greedy_group_by_match_rate(
+            match_counts,
+            match_rates,
+            min_close_snapshots=min_close_snapshots,
+            min_close_rate=min_close_rate,
+        )
+
+    compatibility = build_compatibility_matrix(
+        match_counts,
+        match_rates,
+        min_close_snapshots=min_close_snapshots,
+        min_close_rate=min_close_rate,
+    )
+    return minimize_compatibility_groups(
+        compatibility,
+        max_exact_component_stocks=max_exact_component_stocks,
+        exact_search_node_limit=exact_search_node_limit,
+    )
+
+
 def group_relative_clock_vectors(
     vectors: pd.DataFrame,
     *,
@@ -709,32 +796,16 @@ def group_relative_clock_vectors(
     精确搜索，``rate_greedy`` 不保证最少组数。
     """
 
-    if grouping_method not in GROUPING_METHODS:
-        raise ValueError(
-            f"grouping_method must be one of {', '.join(GROUPING_METHODS)}"
-        )
-
     match_counts, match_rates = calculate_pairwise_match_matrices(
         vectors,
         max_clock_gap_us=max_clock_gap_us,
     )
-
-    if grouping_method == GROUPING_METHOD_RATE_GREEDY:
-        return greedy_group_by_match_rate(
-            match_counts,
-            match_rates,
-            min_close_snapshots=min_close_snapshots,
-            min_close_rate=min_close_rate,
-        )
-
-    compatibility = build_compatibility_matrix(
+    return group_pairwise_match_matrices(
         match_counts,
         match_rates,
         min_close_snapshots=min_close_snapshots,
         min_close_rate=min_close_rate,
-    )
-    return minimize_compatibility_groups(
-        compatibility,
+        grouping_method=grouping_method,
         max_exact_component_stocks=max_exact_component_stocks,
         exact_search_node_limit=exact_search_node_limit,
     )
@@ -831,8 +902,11 @@ def process_csv(
     grouping_method: str = DEFAULT_GROUPING_METHOD,
     max_exact_component_stocks: int = DEFAULT_MAX_EXACT_COMPONENT_STOCKS,
     exact_search_node_limit: int = DEFAULT_EXACT_SEARCH_NODE_LIMIT,
+    match_counts_csv: Path | str | None = None,
+    match_rates_csv: Path | str | None = None,
+    compatibility_csv: Path | str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """读取 CSV，依次构造向量、分组并写出三个结果文件。"""
+    """读取 CSV，构造向量和分组，并写出结果及三张股票关系矩阵。"""
 
     # 输入格式由业务保证正确，因此只读取真正需要的三列，不增加多层清洗逻辑。
     data = pd.read_csv(
@@ -841,9 +915,19 @@ def process_csv(
         dtype={"clock": "int64", "stock_id": "string", "time": "string"},
     )
     vectors = build_relative_clock_vectors(data)
-    groups = group_relative_clock_vectors(
+    match_counts, match_rates = calculate_pairwise_match_matrices(
         vectors,
         max_clock_gap_us=max_clock_gap_us,
+    )
+    compatibility = build_compatibility_matrix(
+        match_counts,
+        match_rates,
+        min_close_snapshots=min_close_snapshots,
+        min_close_rate=min_close_rate,
+    )
+    groups = group_pairwise_match_matrices(
+        match_counts,
+        match_rates,
         min_close_snapshots=min_close_snapshots,
         min_close_rate=min_close_rate,
         grouping_method=grouping_method,
@@ -851,8 +935,27 @@ def process_csv(
         exact_search_node_limit=exact_search_node_limit,
     )
 
+    resolved_match_counts_csv = resolve_relationship_matrix_csv_path(
+        groups_csv,
+        match_counts_csv,
+        "match_counts",
+    )
+    resolved_match_rates_csv = resolve_relationship_matrix_csv_path(
+        groups_csv,
+        match_rates_csv,
+        "match_rates",
+    )
+    resolved_compatibility_csv = resolve_relationship_matrix_csv_path(
+        groups_csv,
+        compatibility_csv,
+        "compatibility",
+    )
+
     vectors.reset_index().to_csv(vectors_csv, index=False)
     groups.to_csv(groups_csv, index=False)
+    write_relationship_matrix_csv(match_counts, resolved_match_counts_csv)
+    write_relationship_matrix_csv(match_rates, resolved_match_rates_csv)
+    write_relationship_matrix_csv(compatibility, resolved_compatibility_csv)
     plot_relative_clock_vectors(vectors, groups, plot_png)
     return vectors, groups
 
@@ -906,6 +1009,21 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=DEFAULT_EXACT_SEARCH_NODE_LIMIT,
         help="minimize 方法每次精确搜索的节点上限；0 表示不限制（默认：%(default)s）",
     )
+    parser.add_argument(
+        "--match-counts-csv",
+        type=Path,
+        help="匹配次数矩阵 CSV；默认写到 GROUPS 同目录的 *_match_counts.csv",
+    )
+    parser.add_argument(
+        "--match-rates-csv",
+        type=Path,
+        help="匹配率矩阵 CSV；默认写到 GROUPS 同目录的 *_match_rates.csv",
+    )
+    parser.add_argument(
+        "--compatibility-csv",
+        type=Path,
+        help="阈值兼容矩阵 CSV；默认写到 GROUPS 同目录的 *_compatibility.csv",
+    )
     return parser
 
 
@@ -913,6 +1031,21 @@ def main(argv: list[str] | None = None) -> int:
     """执行命令行程序并打印结果摘要。"""
 
     arguments = build_argument_parser().parse_args(argv)
+    match_counts_csv = resolve_relationship_matrix_csv_path(
+        arguments.groups_csv,
+        arguments.match_counts_csv,
+        "match_counts",
+    )
+    match_rates_csv = resolve_relationship_matrix_csv_path(
+        arguments.groups_csv,
+        arguments.match_rates_csv,
+        "match_rates",
+    )
+    compatibility_csv = resolve_relationship_matrix_csv_path(
+        arguments.groups_csv,
+        arguments.compatibility_csv,
+        "compatibility",
+    )
     vectors, groups = process_csv(
         arguments.input_csv,
         arguments.vectors_csv,
@@ -924,6 +1057,9 @@ def main(argv: list[str] | None = None) -> int:
         grouping_method=arguments.grouping_method,
         max_exact_component_stocks=arguments.max_exact_component_stocks,
         exact_search_node_limit=arguments.exact_search_node_limit,
+        match_counts_csv=match_counts_csv,
+        match_rates_csv=match_rates_csv,
+        compatibility_csv=compatibility_csv,
     )
 
     print(f"snapshot 数：{vectors.shape[1]}")
@@ -943,6 +1079,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     print(f"向量 CSV：{arguments.vectors_csv}")
     print(f"分组 CSV：{arguments.groups_csv}")
+    print(f"匹配次数矩阵 CSV：{match_counts_csv}")
+    print(f"匹配率矩阵 CSV：{match_rates_csv}")
+    print(f"兼容矩阵 CSV：{compatibility_csv}")
     print(f"热图 PNG：{arguments.plot_png}")
     return 0
 

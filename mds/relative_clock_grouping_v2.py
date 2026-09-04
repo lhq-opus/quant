@@ -4,8 +4,15 @@ V2 只负责分组，不再生成向量 CSV 或图片。从 ``quant/`` 目录运
 
     python -m mds.relative_clock_grouping_v2 INPUT.csv GROUPS.csv
 
-输入仍然只使用 ``clock``、``stock_id``、``time`` 三列；输出是
-``stock_id,group_id`` 映射。
+输入仍然只使用 ``clock``、``stock_id``、``time`` 三列；输出包括：
+
+- ``GROUPS.csv``：``stock_id,group_id`` 映射；
+- ``GROUPS_cosine_similarity.csv``：股票两两余弦相似度矩阵；
+- ``GROUPS_common_counts.csv``：股票两两共同 snapshot 数矩阵；
+- ``GROUPS_compatibility.csv``：应用当前阈值后的股票两两兼容矩阵。
+
+后三个文件默认根据 ``GROUPS.csv`` 的文件名生成，也可用命令行参数指定路径。
+矩阵 CSV 的第一列和第一行都保存 ``stock_id``；证据不足的余弦相似度为空值。
 
 这是一版用于观察余弦相似度效果的 baseline。余弦相似度只比较向量方向，
 忽略绝对大小；默认阈值是可调启发式参数，不是已经确认的业务事实。
@@ -30,6 +37,8 @@ from mds.relative_clock_grouping import (
     REQUIRED_COLUMNS,
     build_relative_clock_vectors,
     minimize_compatibility_groups,
+    resolve_relationship_matrix_csv_path,
+    write_relationship_matrix_csv,
 )
 
 DEFAULT_MIN_COSINE_SIMILARITY = 0.99
@@ -388,8 +397,11 @@ def process_csv(
     grouping_method: str = DEFAULT_COSINE_GROUPING_METHOD,
     max_exact_component_stocks: int = DEFAULT_MAX_EXACT_COMPONENT_STOCKS,
     exact_search_node_limit: int = DEFAULT_EXACT_SEARCH_NODE_LIMIT,
+    cosine_similarity_csv: Path | str | None = None,
+    common_counts_csv: Path | str | None = None,
+    compatibility_csv: Path | str | None = None,
 ) -> pd.DataFrame:
-    """读取 market data CSV，只输出最终股票分组 CSV。"""
+    """读取 market data CSV，输出分组及三张股票关系矩阵 CSV。"""
 
     data = pd.read_csv(
         input_csv,
@@ -397,16 +409,46 @@ def process_csv(
         dtype={"clock": "int64", "stock_id": "string", "time": "string"},
     )
     vectors = build_relative_clock_vectors(data)
-    groups = group_relative_clock_vectors_v2(
+    similarity_matrix, common_counts = calculate_cosine_similarity_matrix(
         vectors,
-        min_cosine_similarity=min_cosine_similarity,
         min_common_snapshots=min_common_snapshots,
         min_common_rate=min_common_rate,
+    )
+    compatibility = build_cosine_compatibility_matrix(
+        similarity_matrix,
+        min_cosine_similarity=min_cosine_similarity,
+    )
+    groups = group_by_cosine_similarity(
+        similarity_matrix,
+        min_cosine_similarity=min_cosine_similarity,
         grouping_method=grouping_method,
         max_exact_component_stocks=max_exact_component_stocks,
         exact_search_node_limit=exact_search_node_limit,
     )
+
+    resolved_cosine_similarity_csv = resolve_relationship_matrix_csv_path(
+        groups_csv,
+        cosine_similarity_csv,
+        "cosine_similarity",
+    )
+    resolved_common_counts_csv = resolve_relationship_matrix_csv_path(
+        groups_csv,
+        common_counts_csv,
+        "common_counts",
+    )
+    resolved_compatibility_csv = resolve_relationship_matrix_csv_path(
+        groups_csv,
+        compatibility_csv,
+        "compatibility",
+    )
+
     groups.to_csv(groups_csv, index=False)
+    write_relationship_matrix_csv(
+        similarity_matrix,
+        resolved_cosine_similarity_csv,
+    )
+    write_relationship_matrix_csv(common_counts, resolved_common_counts_csv)
+    write_relationship_matrix_csv(compatibility, resolved_compatibility_csv)
     return groups
 
 
@@ -457,6 +499,21 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=DEFAULT_EXACT_SEARCH_NODE_LIMIT,
         help="minimize 方法每次精确搜索的节点上限；0 表示不限制（默认：%(default)s）",
     )
+    parser.add_argument(
+        "--cosine-similarity-csv",
+        type=Path,
+        help="余弦相似度矩阵 CSV；默认写到 GROUPS 同目录的 *_cosine_similarity.csv",
+    )
+    parser.add_argument(
+        "--common-counts-csv",
+        type=Path,
+        help="共同 snapshot 数矩阵 CSV；默认写到 GROUPS 同目录的 *_common_counts.csv",
+    )
+    parser.add_argument(
+        "--compatibility-csv",
+        type=Path,
+        help="阈值兼容矩阵 CSV；默认写到 GROUPS 同目录的 *_compatibility.csv",
+    )
     return parser
 
 
@@ -464,6 +521,21 @@ def main(argv: list[str] | None = None) -> int:
     """执行命令行程序并打印结果摘要。"""
 
     arguments = build_argument_parser().parse_args(argv)
+    cosine_similarity_csv = resolve_relationship_matrix_csv_path(
+        arguments.groups_csv,
+        arguments.cosine_similarity_csv,
+        "cosine_similarity",
+    )
+    common_counts_csv = resolve_relationship_matrix_csv_path(
+        arguments.groups_csv,
+        arguments.common_counts_csv,
+        "common_counts",
+    )
+    compatibility_csv = resolve_relationship_matrix_csv_path(
+        arguments.groups_csv,
+        arguments.compatibility_csv,
+        "compatibility",
+    )
     groups = process_csv(
         arguments.input_csv,
         arguments.groups_csv,
@@ -473,6 +545,9 @@ def main(argv: list[str] | None = None) -> int:
         grouping_method=arguments.grouping_method,
         max_exact_component_stocks=arguments.max_exact_component_stocks,
         exact_search_node_limit=arguments.exact_search_node_limit,
+        cosine_similarity_csv=cosine_similarity_csv,
+        common_counts_csv=common_counts_csv,
+        compatibility_csv=compatibility_csv,
     )
 
     print(f"股票数：{len(groups)}")
@@ -491,6 +566,9 @@ def main(argv: list[str] | None = None) -> int:
                 f"当前上界={groups.attrs['group_count_upper_bound']}"
             )
     print(f"分组 CSV：{arguments.groups_csv}")
+    print(f"余弦相似度矩阵 CSV：{cosine_similarity_csv}")
+    print(f"共同 snapshot 数矩阵 CSV：{common_counts_csv}")
+    print(f"兼容矩阵 CSV：{compatibility_csv}")
     return 0
 
 

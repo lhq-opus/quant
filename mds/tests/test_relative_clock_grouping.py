@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from mds.relative_clock_grouping import (
@@ -17,6 +18,7 @@ from mds.relative_clock_grouping import (
     main,
     minimize_compatibility_groups,
     plot_relative_clock_vectors,
+    write_relationship_matrix_csv,
 )
 
 
@@ -73,6 +75,14 @@ def make_market_data() -> pd.DataFrame:
             ],
         }
     ).astype({"clock": "int64", "stock_id": "string", "time": "string"})
+
+
+def read_relationship_matrix(csv_path: Path) -> pd.DataFrame:
+    """回读矩阵 CSV，并恢复第一列为股票行索引。"""
+
+    matrix = pd.read_csv(csv_path, dtype={"stock_id": "string"}).set_index("stock_id")
+    matrix.index = matrix.index.astype(str)
+    return matrix
 
 
 class RelativeClockVectorTest(unittest.TestCase):
@@ -281,6 +291,30 @@ class MinimumGroupPartitionTest(unittest.TestCase):
         self.assertEqual(best_effort_groups.attrs["group_count_upper_bound"], 3)
 
 
+class RelationshipMatrixCsvTest(unittest.TestCase):
+    def test_matrix_csv_keeps_stock_ids_on_both_axes(self) -> None:
+        matrix = pd.DataFrame(
+            [[1.0, 0.25], [0.25, 1.0]],
+            index=["000001", "600000"],
+            columns=["000001", "600000"],
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_csv = Path(temporary_directory) / "matrix.csv"
+            write_relationship_matrix_csv(matrix, output_csv)
+            written = read_relationship_matrix(output_csv)
+
+        self.assertEqual(
+            written.index.tolist(),
+            ["000001", "600000"],
+        )
+        self.assertEqual(
+            written.columns.tolist(),
+            ["000001", "600000"],
+        )
+        np.testing.assert_allclose(written.to_numpy(), matrix.to_numpy())
+
+
 class RelativeClockVisualizationTest(unittest.TestCase):
     def test_visualization_and_cli_write_all_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -289,6 +323,9 @@ class RelativeClockVisualizationTest(unittest.TestCase):
             vectors_csv = directory / "vectors.csv"
             groups_csv = directory / "groups.csv"
             plot_png = directory / "vectors.png"
+            match_counts_csv = directory / "groups_match_counts.csv"
+            match_rates_csv = directory / "groups_match_rates.csv"
+            compatibility_csv = directory / "groups_compatibility.csv"
             make_market_data().to_csv(input_csv, index=False)
 
             output = io.StringIO()
@@ -324,14 +361,66 @@ class RelativeClockVisualizationTest(unittest.TestCase):
                 ["stock_id", "t1", "t2", "t3"],
             )
             self.assertTrue(plot_png.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
+            expected_vectors = build_relative_clock_vectors(make_market_data())
+            expected_counts, expected_rates = calculate_pairwise_match_matrices(
+                expected_vectors,
+                max_clock_gap_us=100,
+            )
+            expected_compatibility = build_compatibility_matrix(
+                expected_counts,
+                expected_rates,
+                min_close_snapshots=2,
+                min_close_rate=0.5,
+            )
+            written_counts = read_relationship_matrix(match_counts_csv)
+            written_rates = read_relationship_matrix(match_rates_csv)
+            written_compatibility = read_relationship_matrix(compatibility_csv)
+
+            self.assertEqual(
+                written_counts.index.tolist(), expected_counts.index.tolist()
+            )
+            self.assertEqual(
+                written_counts.columns.tolist(),
+                expected_counts.columns.tolist(),
+            )
+            np.testing.assert_array_equal(
+                written_counts.to_numpy(),
+                expected_counts.to_numpy(),
+            )
+            np.testing.assert_allclose(
+                written_rates.to_numpy(),
+                expected_rates.to_numpy(),
+            )
+            np.testing.assert_array_equal(
+                written_compatibility.to_numpy(),
+                expected_compatibility.to_numpy(),
+            )
+            self.assertEqual(
+                set(directory.iterdir()),
+                {
+                    input_csv,
+                    vectors_csv,
+                    groups_csv,
+                    plot_png,
+                    match_counts_csv,
+                    match_rates_csv,
+                    compatibility_csv,
+                },
+            )
             self.assertIn("snapshot 数：3", output.getvalue())
             self.assertIn("最终分组数：3", output.getvalue())
             self.assertIn("已证明当前分组数为全局最少", output.getvalue())
+            self.assertIn(f"匹配次数矩阵 CSV：{match_counts_csv}", output.getvalue())
+            self.assertIn(f"匹配率矩阵 CSV：{match_rates_csv}", output.getvalue())
+            self.assertIn(f"兼容矩阵 CSV：{compatibility_csv}", output.getvalue())
 
     def test_cli_can_select_rate_greedy_grouping(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
             input_csv = directory / "market.csv"
+            match_counts_csv = directory / "custom-counts.csv"
+            match_rates_csv = directory / "custom-rates.csv"
+            compatibility_csv = directory / "custom-compatibility.csv"
             make_market_data().to_csv(input_csv, index=False)
 
             output = io.StringIO()
@@ -348,10 +437,19 @@ class RelativeClockVisualizationTest(unittest.TestCase):
                         "2",
                         "--grouping-method",
                         "rate_greedy",
+                        "--match-counts-csv",
+                        str(match_counts_csv),
+                        "--match-rates-csv",
+                        str(match_rates_csv),
+                        "--compatibility-csv",
+                        str(compatibility_csv),
                     ]
                 )
 
             self.assertEqual(exit_code, 0)
+            self.assertTrue(match_counts_csv.is_file())
+            self.assertTrue(match_rates_csv.is_file())
+            self.assertTrue(compatibility_csv.is_file())
             self.assertIn("分组方法：按匹配率降序贪心合并", output.getvalue())
 
     def test_plot_function_is_callable_without_grouping_function(self) -> None:
