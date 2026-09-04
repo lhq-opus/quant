@@ -9,6 +9,9 @@ V2 只负责分组，不再生成向量 CSV 或图片。从 ``quant/`` 目录运
 
 这是一版用于观察余弦相似度效果的 baseline。余弦相似度只比较向量方向，
 忽略绝对大小；默认阈值是可调启发式参数，不是已经确认的业务事实。
+
+默认使用 ``minimize`` 尽量减少满足组内全配对约束的组数；也可以用
+``--grouping-method cosine_greedy``，按余弦相似度从高到低贪心合并。
 """
 
 from __future__ import annotations
@@ -20,13 +23,23 @@ import numpy as np
 import pandas as pd
 
 from mds.relative_clock_grouping import (
+    DEFAULT_EXACT_SEARCH_NODE_LIMIT,
+    DEFAULT_MAX_EXACT_COMPONENT_STOCKS,
     DEFAULT_MIN_CLOSE_RATE,
     DEFAULT_MIN_CLOSE_SNAPSHOTS,
     REQUIRED_COLUMNS,
     build_relative_clock_vectors,
+    minimize_compatibility_groups,
 )
 
 DEFAULT_MIN_COSINE_SIMILARITY = 0.99
+COSINE_GROUPING_METHOD_MINIMIZE = "minimize"
+COSINE_GROUPING_METHOD_GREEDY = "cosine_greedy"
+COSINE_GROUPING_METHODS = (
+    COSINE_GROUPING_METHOD_MINIMIZE,
+    COSINE_GROUPING_METHOD_GREEDY,
+)
+DEFAULT_COSINE_GROUPING_METHOD = COSINE_GROUPING_METHOD_MINIMIZE
 
 
 def calculate_cosine_similarity_matrix(
@@ -132,54 +145,207 @@ def calculate_cosine_similarity_matrix(
     return similarity_frame, common_count_frame
 
 
-def group_by_cosine_similarity(
+def build_cosine_compatibility_matrix(
     similarity_matrix: pd.DataFrame,
     *,
     min_cosine_similarity: float = DEFAULT_MIN_COSINE_SIMILARITY,
 ) -> pd.DataFrame:
-    """按组内全配对相似度约束执行稳定 first-fit 分组。
+    """把余弦相似度矩阵转换成“能否进入同组”的布尔矩阵。
 
-    候选股票只有与已有组内的每一只股票都满足
-    ``similarity >= min_cosine_similarity`` 时，才能进入该组。NaN 表示证据不足，
-    也不满足入组要求。
-
-    例如 ``a-b`` 和 ``b-c`` 通过阈值，但 ``a-c`` 不通过，则结果不会是
-    ``{a,b,c}``。按稳定股票顺序处理时，通常得到 ``{a,b}`` 与 ``{c}``。
+    两只股票的余弦相似度达到阈值时才兼容。``NaN`` 表示共同维度证据不足，
+    因而也判为不兼容。矩阵理论上应当对称；这里保守地要求 ``(i, j)`` 与
+    ``(j, i)`` 两个方向都通过，避免外部传入的非对称矩阵造成单向入组。
+    对角线固定为 ``True``，因为一只股票单独成组总是合法。
     """
 
     if not -1 <= min_cosine_similarity <= 1:
         raise ValueError("min_cosine_similarity must be between -1 and 1")
 
-    # 排序保证相同输入每次都按相同顺序执行 first-fit。
-    ordered_similarities = similarity_matrix.sort_index()
-    ordered_similarities = ordered_similarities.reindex(
-        columns=ordered_similarities.index
+    ordered = similarity_matrix.copy()
+    ordered.index = ordered.index.astype(str)
+    ordered.columns = ordered.columns.astype(str)
+    ordered = ordered.sort_index()
+    if set(ordered.index) != set(ordered.columns):
+        raise ValueError("similarity matrix must use the same row and column labels")
+    ordered = ordered.reindex(columns=ordered.index)
+
+    compatibility = ordered.to_numpy(dtype="float64") >= min_cosine_similarity
+    compatibility &= compatibility.T
+    np.fill_diagonal(compatibility, True)
+    return pd.DataFrame(
+        compatibility,
+        index=ordered.index,
+        columns=ordered.columns,
     )
-    stock_ids = ordered_similarities.index.astype(str).tolist()
-    groups: list[list[str]] = []
 
-    for stock_id in stock_ids:
-        for group in groups:
-            # all(...) 是本版最关键的约束：不是与组内任意一只相似即可，而是
-            # 必须与每个已有成员都达到阈值。NaN 与阈值比较会得到 False。
-            can_join = all(
-                ordered_similarities.loc[stock_id, member] >= min_cosine_similarity
-                for member in group
+
+def minimize_cosine_similarity_groups(
+    similarity_matrix: pd.DataFrame,
+    *,
+    min_cosine_similarity: float = DEFAULT_MIN_COSINE_SIMILARITY,
+    max_exact_component_stocks: int = DEFAULT_MAX_EXACT_COMPONENT_STOCKS,
+    exact_search_node_limit: int = DEFAULT_EXACT_SEARCH_NODE_LIMIT,
+) -> pd.DataFrame:
+    """在余弦兼容矩阵上求尽量少的组，并保持组内任意两只股票兼容。
+
+    每个合法组在兼容图中都是一个 clique。函数复用 V1 的 minimum clique
+    partition 求解器：先求上下界，再对规模允许的连通分量做精确分支限界。
+    如果规模或搜索节点上限阻止了完整搜索，仍返回当前找到的最好结果，并在
+    ``DataFrame.attrs["optimal_group_count_proven"]`` 中标记尚未证明全局最优。
+    """
+
+    compatibility = build_cosine_compatibility_matrix(
+        similarity_matrix,
+        min_cosine_similarity=min_cosine_similarity,
+    )
+    return minimize_compatibility_groups(
+        compatibility,
+        max_exact_component_stocks=max_exact_component_stocks,
+        exact_search_node_limit=exact_search_node_limit,
+    )
+
+
+def greedy_group_by_cosine_similarity(
+    similarity_matrix: pd.DataFrame,
+    *,
+    min_cosine_similarity: float = DEFAULT_MIN_COSINE_SIMILARITY,
+) -> pd.DataFrame:
+    """按余弦相似度从高到低贪心合并，并保持组内全配对约束。
+
+    算法从“每只股票各自一组”开始，只处理达到阈值的股票对，并按余弦相似度
+    从高到低尝试合并它们当前所在的两个组。相似度相同时按 ``stock_id`` 排序，
+    保证相同输入得到稳定结果。
+
+    一次合并必须满足：第一个组中的每只股票，都与第二个组中的每只股票兼容。
+    所以最终组内任意成员仍两两达到阈值。早期合并不会回退，因此这种方法优先
+    保留最强相似对，但不保证组数最少。
+    """
+
+    compatibility_frame = build_cosine_compatibility_matrix(
+        similarity_matrix,
+        min_cosine_similarity=min_cosine_similarity,
+    )
+    stock_ids = compatibility_frame.index.tolist()
+    stock_count = len(stock_ids)
+    compatibility = compatibility_frame.to_numpy(dtype=bool)
+
+    ordered_similarities = similarity_matrix.copy()
+    ordered_similarities.index = ordered_similarities.index.astype(str)
+    ordered_similarities.columns = ordered_similarities.columns.astype(str)
+    ordered_similarities = ordered_similarities.reindex(
+        index=stock_ids,
+        columns=stock_ids,
+    )
+    similarity_values = ordered_similarities.to_numpy(dtype="float64")
+
+    candidate_pairs: list[tuple[float, str, str, int, int]] = []
+    for first_stock in range(stock_count):
+        for second_stock in range(first_stock + 1, stock_count):
+            if not compatibility[first_stock, second_stock]:
+                continue
+
+            # 兼容矩阵已要求双向相似度都通过。排序时也取较小的双向值，保证
+            # 外部传入轻微非对称矩阵时不会高估这一股票对的证据强度。
+            pair_similarity = min(
+                similarity_values[first_stock, second_stock],
+                similarity_values[second_stock, first_stock],
             )
-            if can_join:
-                group.append(stock_id)
-                break
-        else:
-            groups.append([stock_id])
+            candidate_pairs.append(
+                (
+                    -pair_similarity,
+                    stock_ids[first_stock],
+                    stock_ids[second_stock],
+                    first_stock,
+                    second_stock,
+                )
+            )
+    candidate_pairs.sort()
 
-    # 这是简单且确定的 greedy clique partition，不保证得到全局最少组数。
-    # 如果一只股票同时满足多个组，它进入最先建立的那个组。
+    # group_of 保存每只股票当前所属的内部组 ID，groups 保存组内位置编号。
+    # 股票规模相对于余弦矩阵的 O(S^2) 存储已经不是额外瓶颈，因此这里使用 set
+    # 直接表达“检查两个组的所有交叉股票对”，让后续调整逻辑更容易理解。
+    group_of = list(range(stock_count))
+    groups: dict[int, set[int]] = {
+        stock_position: {stock_position} for stock_position in range(stock_count)
+    }
+
+    for _, _, _, first_stock, second_stock in candidate_pairs:
+        first_group = group_of[first_stock]
+        second_group = group_of[second_stock]
+        if first_group == second_group:
+            continue
+
+        first_members = groups[first_group]
+        second_members = groups[second_group]
+        can_merge = all(
+            compatibility[first_member, second_member]
+            for first_member in first_members
+            for second_member in second_members
+        )
+        if not can_merge:
+            continue
+
+        # 保留较小内部 ID 仅用于结果可复现；最终仍会按组内最小 stock_id 编号。
+        kept_group = min(first_group, second_group)
+        removed_group = max(first_group, second_group)
+        removed_members = groups.pop(removed_group)
+        groups[kept_group].update(removed_members)
+        for member in removed_members:
+            group_of[member] = kept_group
+
+    grouped_stock_ids = [
+        sorted(stock_ids[position] for position in members)
+        for members in groups.values()
+    ]
+    grouped_stock_ids.sort(key=lambda group: group[0])
     rows = [
         (stock_id, group_id)
-        for group_id, group in enumerate(groups, start=1)
+        for group_id, group in enumerate(grouped_stock_ids, start=1)
         for stock_id in group
     ]
-    return pd.DataFrame(rows, columns=["stock_id", "group_id"])
+    result = pd.DataFrame(rows, columns=["stock_id", "group_id"])
+    result.attrs["grouping_method"] = COSINE_GROUPING_METHOD_GREEDY
+    result.attrs["optimal_group_count_proven"] = False
+    result.attrs["group_count_lower_bound"] = None
+    result.attrs["group_count_upper_bound"] = len(grouped_stock_ids)
+    result.attrs["exact_search_nodes"] = 0
+    return result
+
+
+def group_by_cosine_similarity(
+    similarity_matrix: pd.DataFrame,
+    *,
+    min_cosine_similarity: float = DEFAULT_MIN_COSINE_SIMILARITY,
+    grouping_method: str = DEFAULT_COSINE_GROUPING_METHOD,
+    max_exact_component_stocks: int = DEFAULT_MAX_EXACT_COMPONENT_STOCKS,
+    exact_search_node_limit: int = DEFAULT_EXACT_SEARCH_NODE_LIMIT,
+) -> pd.DataFrame:
+    """从余弦相似度矩阵选择最少分组或相似度降序贪心分组。
+
+    例如 ``a-b`` 和 ``b-c`` 通过阈值，但 ``a-c`` 不通过，则结果不会是
+    ``{a,b,c}``。两种方法都严格保持这项组内全配对约束；区别是：
+
+    - ``minimize`` 尽量减少组数，并报告是否已经证明是全局最少；
+    - ``cosine_greedy`` 优先合并相似度最高的股票对，不保证组数最少。
+    """
+
+    if grouping_method not in COSINE_GROUPING_METHODS:
+        raise ValueError(
+            f"grouping_method must be one of {', '.join(COSINE_GROUPING_METHODS)}"
+        )
+
+    if grouping_method == COSINE_GROUPING_METHOD_GREEDY:
+        return greedy_group_by_cosine_similarity(
+            similarity_matrix,
+            min_cosine_similarity=min_cosine_similarity,
+        )
+
+    return minimize_cosine_similarity_groups(
+        similarity_matrix,
+        min_cosine_similarity=min_cosine_similarity,
+        max_exact_component_stocks=max_exact_component_stocks,
+        exact_search_node_limit=exact_search_node_limit,
+    )
 
 
 def group_relative_clock_vectors_v2(
@@ -188,8 +354,11 @@ def group_relative_clock_vectors_v2(
     min_cosine_similarity: float = DEFAULT_MIN_COSINE_SIMILARITY,
     min_common_snapshots: int = DEFAULT_MIN_CLOSE_SNAPSHOTS,
     min_common_rate: float = DEFAULT_MIN_CLOSE_RATE,
+    grouping_method: str = DEFAULT_COSINE_GROUPING_METHOD,
+    max_exact_component_stocks: int = DEFAULT_MAX_EXACT_COMPONENT_STOCKS,
+    exact_search_node_limit: int = DEFAULT_EXACT_SEARCH_NODE_LIMIT,
 ) -> pd.DataFrame:
-    """V2 主入口：计算余弦相似度，再执行组内全配对分组。"""
+    """V2 主入口：计算余弦相似度，再按指定策略执行全配对分组。"""
 
     similarity_matrix, _ = calculate_cosine_similarity_matrix(
         vectors,
@@ -199,6 +368,9 @@ def group_relative_clock_vectors_v2(
     return group_by_cosine_similarity(
         similarity_matrix,
         min_cosine_similarity=min_cosine_similarity,
+        grouping_method=grouping_method,
+        max_exact_component_stocks=max_exact_component_stocks,
+        exact_search_node_limit=exact_search_node_limit,
     )
 
 
@@ -213,6 +385,9 @@ def process_csv(
     min_cosine_similarity: float = DEFAULT_MIN_COSINE_SIMILARITY,
     min_common_snapshots: int = DEFAULT_MIN_CLOSE_SNAPSHOTS,
     min_common_rate: float = DEFAULT_MIN_CLOSE_RATE,
+    grouping_method: str = DEFAULT_COSINE_GROUPING_METHOD,
+    max_exact_component_stocks: int = DEFAULT_MAX_EXACT_COMPONENT_STOCKS,
+    exact_search_node_limit: int = DEFAULT_EXACT_SEARCH_NODE_LIMIT,
 ) -> pd.DataFrame:
     """读取 market data CSV，只输出最终股票分组 CSV。"""
 
@@ -227,6 +402,9 @@ def process_csv(
         min_cosine_similarity=min_cosine_similarity,
         min_common_snapshots=min_common_snapshots,
         min_common_rate=min_common_rate,
+        grouping_method=grouping_method,
+        max_exact_component_stocks=max_exact_component_stocks,
+        exact_search_node_limit=exact_search_node_limit,
     )
     groups.to_csv(groups_csv, index=False)
     return groups
@@ -258,6 +436,27 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MIN_CLOSE_RATE,
         help="较少出现股票所需的最小共同维度比例（默认：%(default)s）",
     )
+    parser.add_argument(
+        "--grouping-method",
+        choices=COSINE_GROUPING_METHODS,
+        default=DEFAULT_COSINE_GROUPING_METHOD,
+        help=(
+            "分组方法：minimize 尽量减少组数；cosine_greedy 按余弦相似度"
+            "降序贪心合并（默认：%(default)s）"
+        ),
+    )
+    parser.add_argument(
+        "--max-exact-component-stocks",
+        type=int,
+        default=DEFAULT_MAX_EXACT_COMPONENT_STOCKS,
+        help="minimize 方法允许精确搜索的最大连通分量股票数（默认：%(default)s）",
+    )
+    parser.add_argument(
+        "--exact-search-node-limit",
+        type=int,
+        default=DEFAULT_EXACT_SEARCH_NODE_LIMIT,
+        help="minimize 方法每次精确搜索的节点上限；0 表示不限制（默认：%(default)s）",
+    )
     return parser
 
 
@@ -271,10 +470,26 @@ def main(argv: list[str] | None = None) -> int:
         min_cosine_similarity=arguments.min_cosine_similarity,
         min_common_snapshots=arguments.min_common_snapshots,
         min_common_rate=arguments.min_common_rate,
+        grouping_method=arguments.grouping_method,
+        max_exact_component_stocks=arguments.max_exact_component_stocks,
+        exact_search_node_limit=arguments.exact_search_node_limit,
     )
 
     print(f"股票数：{len(groups)}")
     print(f"最终分组数：{groups['group_id'].nunique()}")
+    if groups.attrs["grouping_method"] == COSINE_GROUPING_METHOD_GREEDY:
+        print("分组方法：按余弦相似度降序贪心合并")
+        print("最少分组证明：贪心方法不保证当前分组数为全局最少")
+    else:
+        print("分组方法：minimum clique partition（余弦兼容矩阵）")
+        if groups.attrs["optimal_group_count_proven"]:
+            print("最少分组证明：已证明当前分组数为全局最少")
+        else:
+            print(
+                "最少分组证明：尚未证明；"
+                f"已知下界={groups.attrs['group_count_lower_bound']}，"
+                f"当前上界={groups.attrs['group_count_upper_bound']}"
+            )
     print(f"分组 CSV：{arguments.groups_csv}")
     return 0
 
