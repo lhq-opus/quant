@@ -1,78 +1,60 @@
 from __future__ import annotations
 
 import contextlib
-import inspect
 import io
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 import numpy as np
 import pandas as pd
 
-import mds.relative_clock_grouping_v2 as v2_module
-from mds.relative_clock_grouping import group_relative_clock_vectors
 from mds.relative_clock_grouping_v2 import (
-    build_single_linkage,
-    calculate_normalized_vector_distances,
+    calculate_cosine_similarity_matrix,
+    group_by_cosine_similarity,
+    group_relative_clock_vectors,
     group_relative_clock_vectors_v2,
     main,
-    plot_normalized_distance_clusters,
 )
-from mds.relative_clock_grouping_v2 import (
-    group_relative_clock_vectors as compatible_v2_grouping,
-)
-
-
-def make_vectors() -> pd.DataFrame:
-    """构造两个清晰组和一只证据不足的股票。"""
-
-    return pd.DataFrame(
-        {
-            "t1": [0, 20, 5_000, 5_020, pd.NA],
-            "t2": [0, 30, 6_000, 6_030, pd.NA],
-            "t3": [0, 40, 7_000, 7_040, 5],
-        },
-        index=["a", "b", "c", "d", "e"],
-        dtype="Int64",
-    )
 
 
 def make_market_data() -> pd.DataFrame:
-    """把 make_vectors 的结构写成 snapshot 内 clock 已排序的长表。"""
+    """构造方向相同的 a/b、方向不同的 c，以及零向量 z。"""
 
     return pd.DataFrame(
         {
+            # 每个 time 内按 clock 升序排列。以 z 为零点后：
+            # a = [100, 200, 300]
+            # b = [200, 400, 600]，与 a 的余弦相似度为 1
+            # c = [300, 100, 400]，与 a/b 的相似度约为 0.891
+            # z = [0, 0, 0]
             "clock": [
                 1_000,
-                1_020,
-                6_000,
-                6_020,
+                1_100,
+                1_200,
+                1_300,
                 2_000,
-                2_030,
-                8_000,
-                8_030,
+                2_100,
+                2_200,
+                2_400,
                 3_000,
-                3_005,
-                3_040,
-                10_000,
-                10_040,
+                3_300,
+                3_400,
+                3_600,
             ],
             "stock_id": [
+                "z",
                 "a",
                 "b",
                 "c",
-                "d",
+                "z",
+                "c",
                 "a",
                 "b",
-                "c",
-                "d",
+                "z",
                 "a",
-                "e",
-                "b",
                 "c",
-                "d",
+                "b",
             ],
             "time": [
                 "t1",
@@ -87,172 +69,134 @@ def make_market_data() -> pd.DataFrame:
                 "t3",
                 "t3",
                 "t3",
-                "t3",
             ],
         }
     ).astype({"clock": "int64", "stock_id": "string", "time": "string"})
 
 
-class NormalizedVectorDistanceTest(unittest.TestCase):
-    def test_distance_ignores_missing_dimensions_and_divides_by_sqrt_k(
-        self,
-    ) -> None:
+class CosineSimilarityTest(unittest.TestCase):
+    def test_similarity_uses_only_common_dimensions_and_ignores_scale(self) -> None:
         vectors = pd.DataFrame(
             {
-                # a-b 只在 t1、t2 共同出现；t3 中 b 的 10000 不参与两者距离。
-                "t1": [0, 3, pd.NA],
-                "t2": [0, 4, pd.NA],
-                "t3": [pd.NA, 10_000, 0],
+                # a-b 只共同拥有 t1、t2；b 在 t3 的 999 不参与这对股票的计算。
+                "t1": [1, 10, pd.NA],
+                "t2": [2, 20, pd.NA],
+                "t3": [pd.NA, 999, 1],
             },
             index=["a", "b", "c"],
             dtype="Int64",
         )
 
-        distances, common_counts = calculate_normalized_vector_distances(
+        similarities, common_counts = calculate_cosine_similarity_matrix(
             vectors,
             min_common_snapshots=2,
             min_common_rate=0.5,
         )
 
-        # sqrt(3² + 4²) / sqrt(2) = 5 / sqrt(2)。
-        self.assertAlmostEqual(distances.loc["a", "b"], 5 / np.sqrt(2))
+        # [1, 2] 与 [10, 20] 方向相同，虽然绝对大小相差 10 倍，余弦仍为 1。
+        self.assertAlmostEqual(similarities.loc["a", "b"], 1.0)
         self.assertEqual(common_counts.loc["a", "b"], 2)
 
-        # b-c 只有一个共同维度，不满足最少 2 个共同维度，因此是“证据不足”。
-        self.assertTrue(np.isnan(distances.loc["b", "c"]))
+        # b-c 只有一个共同维度，没有达到最少 2 个共同 snapshot。
+        self.assertTrue(np.isnan(similarities.loc["b", "c"]))
         self.assertEqual(common_counts.loc["b", "c"], 1)
 
     def test_common_rate_filters_pairs_with_too_little_overlap(self) -> None:
         vectors = pd.DataFrame(
             {
                 # 两只股票各出现 4 次，但只有 t1、t2 重合，common_rate = 2 / 4。
-                "t1": [0, 0],
-                "t2": [10, 10],
-                "t3": [20, pd.NA],
-                "t4": [30, pd.NA],
-                "t5": [pd.NA, 40],
-                "t6": [pd.NA, 50],
+                "t1": [1, 10],
+                "t2": [2, 20],
+                "t3": [3, pd.NA],
+                "t4": [4, pd.NA],
+                "t5": [pd.NA, 30],
+                "t6": [pd.NA, 40],
             },
             index=["a", "b"],
             dtype="Int64",
         )
 
-        accepted, _ = calculate_normalized_vector_distances(
+        accepted, _ = calculate_cosine_similarity_matrix(
             vectors,
             min_common_snapshots=2,
             min_common_rate=0.5,
         )
-        rejected, _ = calculate_normalized_vector_distances(
+        rejected, _ = calculate_cosine_similarity_matrix(
             vectors,
             min_common_snapshots=2,
             min_common_rate=0.75,
         )
 
-        self.assertEqual(accepted.loc["a", "b"], 0)
+        self.assertAlmostEqual(accepted.loc["a", "b"], 1.0)
         self.assertTrue(np.isnan(rejected.loc["a", "b"]))
 
+    def test_zero_vector_rule_is_explicit(self) -> None:
+        vectors = pd.DataFrame(
+            {
+                "t1": [0, 0, 1],
+                "t2": [0, 0, 2],
+            },
+            index=["zero_a", "zero_b", "nonzero"],
+            dtype="Int64",
+        )
 
-class DistanceGroupingTest(unittest.TestCase):
-    def test_v2_has_the_same_interface_and_output_schema_as_v1(self) -> None:
-        self.assertIs(compatible_v2_grouping, group_relative_clock_vectors_v2)
-        self.assertEqual(
-            list(inspect.signature(group_relative_clock_vectors).parameters),
-            list(inspect.signature(group_relative_clock_vectors_v2).parameters),
+        similarities, _ = calculate_cosine_similarity_matrix(
+            vectors,
+            min_common_snapshots=2,
+            min_common_rate=1.0,
+        )
+
+        self.assertEqual(similarities.loc["zero_a", "zero_b"], 1.0)
+        self.assertEqual(similarities.loc["zero_a", "nonzero"], 0.0)
+
+
+class AllPairsGroupingTest(unittest.TestCase):
+    def test_stock_must_match_every_existing_group_member(self) -> None:
+        # 三个二维向量方向约为 0°、30°、60°。
+        # 阈值 0.8 下 a-b、b-c 通过，而 a-c 不通过。
+        vectors = pd.DataFrame(
+            {
+                "t1": [100, 87, 50],
+                "t2": [0, 50, 87],
+            },
+            index=["a", "b", "c"],
+            dtype="Int64",
         )
 
         groups = group_relative_clock_vectors_v2(
-            make_vectors(),
-            max_clock_gap_us=100,
-            min_close_snapshots=2,
-            min_close_rate=0.5,
-        )
-
-        self.assertEqual(
-            groups.to_dict("records"),
-            [
-                {"stock_id": "a", "group_id": 1},
-                {"stock_id": "b", "group_id": 1},
-                {"stock_id": "c", "group_id": 2},
-                {"stock_id": "d", "group_id": 2},
-                {"stock_id": "e", "group_id": 3},
-            ],
-        )
-
-    def test_pre_grouping_plot_is_generated_without_group_ids(self) -> None:
-        distances, _ = calculate_normalized_vector_distances(
-            make_vectors(),
+            vectors,
+            min_cosine_similarity=0.8,
             min_common_snapshots=2,
-            min_common_rate=0.5,
-        )
-        linkage_matrix = build_single_linkage(
-            distances,
-            max_clock_gap_us=100,
+            min_common_rate=1.0,
         )
 
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            output_png = Path(temporary_directory) / "distance-clusters.png"
-            plot_normalized_distance_clusters(
-                distances,
-                linkage_matrix,
-                output_png,
-                max_clock_gap_us=100,
-            )
+        mapping = groups.set_index("stock_id")["group_id"].to_dict()
+        self.assertEqual(mapping, {"a": 1, "b": 1, "c": 2})
 
-            self.assertTrue(output_png.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
-            self.assertGreater(output_png.stat().st_size, 1_000)
+    def test_nan_similarity_does_not_satisfy_the_group_threshold(self) -> None:
+        similarities = pd.DataFrame(
+            [[1.0, np.nan], [np.nan, 1.0]],
+            index=["a", "b"],
+            columns=["a", "b"],
+        )
+
+        groups = group_by_cosine_similarity(
+            similarities,
+            min_cosine_similarity=0.9,
+        )
+
+        self.assertEqual(groups["group_id"].tolist(), [1, 2])
+
+    def test_short_alias_points_to_the_v2_grouping_function(self) -> None:
+        self.assertIs(group_relative_clock_vectors, group_relative_clock_vectors_v2)
 
 
 class V2CommandLineTest(unittest.TestCase):
-    def test_process_plots_before_cutting_the_threshold_groups(self) -> None:
-        events: list[str] = []
-
-        def record_plot(*args: object, **kwargs: object) -> None:
-            events.append("plot")
-
-        def record_grouping(
-            stock_ids: list[str], *args: object, **kwargs: object
-        ) -> pd.DataFrame:
-            events.append("group")
-            return pd.DataFrame(
-                {"stock_id": stock_ids, "group_id": range(1, len(stock_ids) + 1)}
-            )
-
+    def test_cli_only_writes_the_grouping_csv(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
             input_csv = directory / "market.csv"
-            make_market_data().to_csv(input_csv, index=False)
-
-            with (
-                mock.patch.object(
-                    v2_module,
-                    "plot_normalized_distance_clusters",
-                    side_effect=record_plot,
-                ),
-                mock.patch.object(
-                    v2_module,
-                    "cut_single_linkage_groups",
-                    side_effect=record_grouping,
-                ),
-            ):
-                v2_module.process_csv(
-                    input_csv,
-                    directory / "vectors.csv",
-                    directory / "groups.csv",
-                    directory / "vectors.png",
-                    max_clock_gap_us=100,
-                    min_close_snapshots=2,
-                    min_close_rate=0.5,
-                )
-
-        self.assertEqual(events, ["plot", "group"])
-
-    def test_cli_keeps_v1_input_and_output_files(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            directory = Path(temporary_directory)
-            input_csv = directory / "market.csv"
-            vectors_csv = directory / "vectors.csv"
             groups_csv = directory / "groups.csv"
-            plot_png = directory / "vectors.png"
             make_market_data().to_csv(input_csv, index=False)
 
             output = io.StringIO()
@@ -260,36 +204,28 @@ class V2CommandLineTest(unittest.TestCase):
                 exit_code = main(
                     [
                         str(input_csv),
-                        str(vectors_csv),
                         str(groups_csv),
-                        str(plot_png),
-                        "--max-clock-gap-us",
-                        "100",
-                        "--min-close-snapshots",
-                        "2",
-                        "--min-close-rate",
-                        "0.5",
+                        "--min-cosine-similarity",
+                        "0.99",
+                        "--min-common-snapshots",
+                        "3",
+                        "--min-common-rate",
+                        "1.0",
                     ]
                 )
 
             self.assertEqual(exit_code, 0)
-            self.assertEqual(
-                pd.read_csv(vectors_csv).columns.tolist(),
-                ["stock_id", "t1", "t2", "t3"],
-            )
             self.assertEqual(
                 pd.read_csv(groups_csv).to_dict("records"),
                 [
                     {"stock_id": "a", "group_id": 1},
                     {"stock_id": "b", "group_id": 1},
                     {"stock_id": "c", "group_id": 2},
-                    {"stock_id": "d", "group_id": 2},
-                    {"stock_id": "e", "group_id": 3},
+                    {"stock_id": "z", "group_id": 3},
                 ],
             )
-            self.assertTrue(plot_png.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
+            self.assertEqual(set(directory.iterdir()), {input_csv, groups_csv})
             self.assertIn("最终分组数：3", output.getvalue())
-            self.assertIn("切组前距离图 PNG", output.getvalue())
 
 
 if __name__ == "__main__":
