@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +30,8 @@ REQUIRED_COLUMNS = ["clock", "stock_id", "time"]
 DEFAULT_MAX_CLOCK_GAP_US = 1_000
 DEFAULT_MIN_CLOSE_SNAPSHOTS = 2
 DEFAULT_MIN_CLOSE_RATE = 0.5
+DEFAULT_MAX_EXACT_COMPONENT_STOCKS = 60
+DEFAULT_EXACT_SEARCH_NODE_LIMIT = 200_000
 
 
 def build_relative_clock_vectors(data: pd.DataFrame) -> pd.DataFrame:
@@ -71,163 +72,510 @@ def build_relative_clock_vectors(data: pd.DataFrame) -> pd.DataFrame:
     return vectors.reindex(columns=snapshot_order).sort_index().astype("Int64")
 
 
+def calculate_pairwise_match_matrices(
+    vectors: pd.DataFrame,
+    *,
+    max_clock_gap_us: int = DEFAULT_MAX_CLOCK_GAP_US,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """计算股票两两之间的匹配次数矩阵和匹配率矩阵。
+
+    两只股票在同一个 snapshot 都有值，并且相对 ``clock`` 之差不超过
+    ``max_clock_gap_us``，就记作一次匹配。匹配率定义为：
+
+    ``match_rate(i, j) = match_count(i, j) / common_count(i, j)``
+
+    其中 ``common_count`` 是两只股票同时出现的 snapshot 数。没有匹配的股票对
+    在两个矩阵中都保留为 0；由于后续要求最少匹配次数大于 0，它们一定不会被
+    判为兼容。矩阵对称，行列均按 ``stock_id`` 排序。
+    """
+
+    if max_clock_gap_us < 0:
+        raise ValueError("max_clock_gap_us must be non-negative")
+
+    ordered_vectors = vectors.copy()
+    ordered_vectors.index = ordered_vectors.index.astype(str)
+    ordered_vectors = ordered_vectors.sort_index()
+    stock_ids = ordered_vectors.index.tolist()
+    stock_positions = {
+        stock_id: position for position, stock_id in enumerate(stock_ids)
+    }
+    stock_count = len(stock_ids)
+
+    # 一个 int32 单元格足以容纳一天约数千个 3 秒 snapshot 的计数。矩阵直接
+    # 暴露给下一阶段，因此可以独立检查任意股票对的证据。
+    match_counts = np.zeros((stock_count, stock_count), dtype="int32")
+    # Python 整数的每一位代表一个 snapshot 是否出现。相比为每只股票保存一组
+    # Python int，bit mask 更省内存，两个 mask 做 & 后 bit_count 即共同维度数。
+    active_snapshot_masks = [0] * stock_count
+    matched_pairs: list[tuple[int, int]] = []
+
+    # 每个 snapshot 内仍使用滑动窗口，只枚举 clock 差能够通过阈值的股票对；
+    # 避免在每个 snapshot 中对所有已出现股票做 Python 层的两两比较。
+    for snapshot_position, time_value in enumerate(ordered_vectors.columns):
+        observed = ordered_vectors[time_value].dropna().sort_values(kind="stable")
+        observed_stocks = observed.index.tolist()
+        observed_positions = [stock_positions[stock_id] for stock_id in observed_stocks]
+        observed_clocks = observed.to_numpy(dtype="int64")
+
+        for stock_position in observed_positions:
+            active_snapshot_masks[stock_position] |= 1 << snapshot_position
+
+        window_start = 0
+        for current_position, current_clock in enumerate(observed_clocks):
+            while current_clock - observed_clocks[window_start] > max_clock_gap_us:
+                window_start += 1
+
+            current_stock = observed_positions[current_position]
+            for previous_position in range(window_start, current_position):
+                previous_stock = observed_positions[previous_position]
+                if match_counts[current_stock, previous_stock] == 0:
+                    matched_pairs.append(
+                        (
+                            min(current_stock, previous_stock),
+                            max(current_stock, previous_stock),
+                        )
+                    )
+                match_counts[current_stock, previous_stock] += 1
+                match_counts[previous_stock, current_stock] += 1
+
+    match_rates = np.zeros((stock_count, stock_count), dtype="float64")
+
+    # 对角线只用于让矩阵便于阅读：股票与自身的匹配次数等于它出现的 snapshot
+    # 数，匹配率记为 1。最终约束只检查不同股票之间的单元格。
+    for stock_position, snapshot_mask in enumerate(active_snapshot_masks):
+        match_counts[stock_position, stock_position] = snapshot_mask.bit_count()
+        match_rates[stock_position, stock_position] = 1.0
+
+    # 只有 match_count > 0 的股票对才可能通过“最少匹配次数”门槛，因此只为
+    # 这些位置计算集合交集。match_count=0 的位置保持 rate=0，不影响最终判定。
+    for first_stock, second_stock in matched_pairs:
+        common_count = (
+            active_snapshot_masks[first_stock] & active_snapshot_masks[second_stock]
+        ).bit_count()
+        match_rate = match_counts[first_stock, second_stock] / common_count
+        match_rates[first_stock, second_stock] = match_rate
+        match_rates[second_stock, first_stock] = match_rate
+
+    labels = pd.Index(stock_ids, name="stock_id")
+    return (
+        pd.DataFrame(match_counts, index=labels, columns=labels),
+        pd.DataFrame(match_rates, index=labels, columns=labels),
+    )
+
+
+def build_compatibility_matrix(
+    match_counts: pd.DataFrame,
+    match_rates: pd.DataFrame,
+    *,
+    min_close_snapshots: int = DEFAULT_MIN_CLOSE_SNAPSHOTS,
+    min_close_rate: float = DEFAULT_MIN_CLOSE_RATE,
+) -> pd.DataFrame:
+    """把两张证据矩阵转换成“能否进入同组”的布尔矩阵。"""
+
+    if min_close_snapshots < 1:
+        raise ValueError("min_close_snapshots must be at least 1")
+    if not 0 <= min_close_rate <= 1:
+        raise ValueError("min_close_rate must be between 0 and 1")
+
+    ordered_counts = match_counts.copy()
+    ordered_counts.index = ordered_counts.index.astype(str)
+    ordered_counts.columns = ordered_counts.columns.astype(str)
+    ordered_counts = ordered_counts.sort_index().reindex(columns=ordered_counts.index)
+    ordered_rates = match_rates.copy()
+    ordered_rates.index = ordered_rates.index.astype(str)
+    ordered_rates.columns = ordered_rates.columns.astype(str)
+    ordered_rates = ordered_rates.reindex(
+        index=ordered_counts.index,
+        columns=ordered_counts.columns,
+    )
+
+    compatibility = (ordered_counts.to_numpy() >= min_close_snapshots) & (
+        ordered_rates.to_numpy(dtype="float64") >= min_close_rate
+    )
+
+    # 生成逻辑本来就是对称的；这里取双向交集，使任意外部传入的矩阵也必须在
+    # (i,j) 与 (j,i) 两个方向都通过。对角线固定为 True，因为单例组总是合法。
+    compatibility &= compatibility.T
+    np.fill_diagonal(compatibility, True)
+    return pd.DataFrame(
+        compatibility,
+        index=ordered_counts.index,
+        columns=ordered_counts.columns,
+    )
+
+
+def _boolean_matrix_to_bit_masks(matrix: np.ndarray) -> list[int]:
+    """把布尔矩阵每一行压成 Python 整数，便于快速做图集合运算。"""
+
+    if not len(matrix):
+        return []
+    all_vertices = (1 << len(matrix)) - 1
+    packed_rows = np.packbits(matrix, axis=1, bitorder="little")
+    return [
+        int.from_bytes(row.tobytes(), byteorder="little") & all_vertices
+        for row in packed_rows
+    ]
+
+
+def _vertices_from_mask(mask: int) -> list[int]:
+    """按编号升序展开 bit mask。"""
+
+    vertices: list[int] = []
+    while mask:
+        lowest_bit = mask & -mask
+        vertices.append(lowest_bit.bit_length() - 1)
+        mask ^= lowest_bit
+    return vertices
+
+
+def _connected_components(adjacency_masks: list[int]) -> list[list[int]]:
+    """求兼容图连通分量；不同分量的股票不可能放进同一个 clique。"""
+
+    remaining = (1 << len(adjacency_masks)) - 1
+    components: list[list[int]] = []
+
+    while remaining:
+        seed = remaining & -remaining
+        remaining ^= seed
+        frontier = seed
+        component_mask = 0
+
+        while frontier:
+            vertex_bit = frontier & -frontier
+            frontier ^= vertex_bit
+            component_mask |= vertex_bit
+            vertex = vertex_bit.bit_length() - 1
+
+            new_neighbors = adjacency_masks[vertex] & remaining
+            remaining ^= new_neighbors
+            frontier |= new_neighbors
+
+        components.append(_vertices_from_mask(component_mask))
+
+    return components
+
+
+def _dsatur_greedy_coloring(conflict_masks: list[int]) -> list[int]:
+    """用 DSATUR 贪心给“不兼容图”着色，快速得到分组数上界。"""
+
+    vertex_count = len(conflict_masks)
+    colors = [-1] * vertex_count
+    neighbor_color_masks = [0] * vertex_count
+    degrees = [neighbors.bit_count() for neighbors in conflict_masks]
+    uncolored = (1 << vertex_count) - 1
+    color_count = 0
+
+    while uncolored:
+        # DSATUR 优先选择“已看到颜色种类最多”的股票；并列时优先冲突度高、
+        # stock_id 顺序靠前者。这通常比按 stock_id 直接 first-fit 使用更少颜色。
+        vertex = max(
+            _vertices_from_mask(uncolored),
+            key=lambda candidate: (
+                neighbor_color_masks[candidate].bit_count(),
+                degrees[candidate],
+                -candidate,
+            ),
+        )
+        blocked_colors = neighbor_color_masks[vertex]
+
+        for color in range(color_count):
+            if not blocked_colors & (1 << color):
+                break
+        else:
+            color = color_count
+            color_count += 1
+
+        colors[vertex] = color
+        uncolored ^= 1 << vertex
+
+        neighbors = conflict_masks[vertex] & uncolored
+        while neighbors:
+            neighbor_bit = neighbors & -neighbors
+            neighbors ^= neighbor_bit
+            neighbor = neighbor_bit.bit_length() - 1
+            neighbor_color_masks[neighbor] |= 1 << color
+
+    return colors
+
+
+def _greedy_conflict_clique_lower_bound(conflict_masks: list[int]) -> int:
+    """在不兼容图中寻找一个 clique，作为最少颜色数的可靠下界。"""
+
+    vertex_count = len(conflict_masks)
+    if vertex_count == 0:
+        return 0
+
+    degrees = [neighbors.bit_count() for neighbors in conflict_masks]
+    seed_order = sorted(
+        range(vertex_count), key=lambda vertex: (-degrees[vertex], vertex)
+    )
+    best_size = 1
+
+    # 任意冲突 clique 中的成员都必须使用不同颜色。这里只尝试若干高冲突起点，
+    # 目的是快速得到“至少需要多少组”的下界，而不是在这里再解一次最大 clique。
+    for seed in seed_order[: min(vertex_count, 16)]:
+        clique_size = 1
+        candidates = conflict_masks[seed]
+        while candidates:
+            vertex = max(
+                _vertices_from_mask(candidates),
+                key=lambda candidate: (degrees[candidate], -candidate),
+            )
+            clique_size += 1
+            candidates &= conflict_masks[vertex]
+        best_size = max(best_size, clique_size)
+
+    return best_size
+
+
+def _search_minimum_coloring(
+    conflict_masks: list[int],
+    initial_colors: list[int],
+    lower_bound: int,
+    *,
+    search_node_limit: int,
+) -> tuple[list[int], bool, int]:
+    """用 DSATUR 分支限界搜索更少颜色；返回结果、是否已证明最优、节点数。"""
+
+    vertex_count = len(conflict_masks)
+    best_colors = initial_colors.copy()
+    best_color_count = max(initial_colors, default=-1) + 1
+    degrees = [neighbors.bit_count() for neighbors in conflict_masks]
+
+    colors = [-1] * vertex_count
+    neighbor_color_masks = [0] * vertex_count
+    color_sizes = [0] * vertex_count
+    searched_nodes = 0
+    search_was_cut_off = False
+
+    def search(uncolored: int, used_color_count: int) -> None:
+        nonlocal best_colors
+        nonlocal best_color_count
+        nonlocal searched_nodes
+        nonlocal search_was_cut_off
+
+        # 已经达到可靠下界时，不可能再找到颜色更少的方案，因而已经证明最优。
+        if best_color_count == lower_bound or search_was_cut_off:
+            return
+        if not uncolored:
+            best_colors = colors.copy()
+            best_color_count = used_color_count
+            return
+        if used_color_count >= best_color_count:
+            return
+        if search_node_limit and searched_nodes >= search_node_limit:
+            search_was_cut_off = True
+            return
+        searched_nodes += 1
+
+        vertex = max(
+            _vertices_from_mask(uncolored),
+            key=lambda candidate: (
+                neighbor_color_masks[candidate].bit_count(),
+                degrees[candidate],
+                -candidate,
+            ),
+        )
+        remaining = uncolored ^ (1 << vertex)
+        blocked_colors = neighbor_color_masks[vertex]
+
+        # 先尝试已有且成员较多的颜色，通常可以更快找到比当前上界更好的方案。
+        available_colors = [
+            color
+            for color in range(used_color_count)
+            if not blocked_colors & (1 << color)
+        ]
+        available_colors.sort(key=lambda color: (-color_sizes[color], color))
+
+        for color in available_colors:
+            colors[vertex] = color
+            color_sizes[color] += 1
+            changed_neighbors: list[tuple[int, int]] = []
+            color_bit = 1 << color
+            neighbors = conflict_masks[vertex] & remaining
+            while neighbors:
+                neighbor_bit = neighbors & -neighbors
+                neighbors ^= neighbor_bit
+                neighbor = neighbor_bit.bit_length() - 1
+                old_mask = neighbor_color_masks[neighbor]
+                if not old_mask & color_bit:
+                    changed_neighbors.append((neighbor, old_mask))
+                    neighbor_color_masks[neighbor] = old_mask | color_bit
+
+            search(remaining, used_color_count)
+
+            for neighbor, old_mask in changed_neighbors:
+                neighbor_color_masks[neighbor] = old_mask
+            color_sizes[color] -= 1
+            colors[vertex] = -1
+            if best_color_count == lower_bound or search_was_cut_off:
+                return
+
+        # 新颜色的编号固定为 used_color_count，避免枚举只是颜色编号不同的重复解。
+        # 新建后若已经达到当前最优组数，就不可能改进，因此只尝试严格更小的情况。
+        if used_color_count + 1 < best_color_count:
+            color = used_color_count
+            colors[vertex] = color
+            color_sizes[color] = 1
+            changed_neighbors = []
+            color_bit = 1 << color
+            neighbors = conflict_masks[vertex] & remaining
+            while neighbors:
+                neighbor_bit = neighbors & -neighbors
+                neighbors ^= neighbor_bit
+                neighbor = neighbor_bit.bit_length() - 1
+                old_mask = neighbor_color_masks[neighbor]
+                if not old_mask & color_bit:
+                    changed_neighbors.append((neighbor, old_mask))
+                    neighbor_color_masks[neighbor] = old_mask | color_bit
+
+            search(remaining, used_color_count + 1)
+
+            for neighbor, old_mask in changed_neighbors:
+                neighbor_color_masks[neighbor] = old_mask
+            color_sizes[color] = 0
+            colors[vertex] = -1
+
+    search((1 << vertex_count) - 1, 0)
+    is_optimal = best_color_count == lower_bound or not search_was_cut_off
+    return best_colors, is_optimal, searched_nodes
+
+
+def minimize_compatibility_groups(
+    compatibility_matrix: pd.DataFrame,
+    *,
+    max_exact_component_stocks: int = DEFAULT_MAX_EXACT_COMPONENT_STOCKS,
+    exact_search_node_limit: int = DEFAULT_EXACT_SEARCH_NODE_LIMIT,
+) -> pd.DataFrame:
+    """把兼容矩阵划分成尽量少的全配对兼容组。
+
+    在兼容图中，每个合法组必须是 clique。把不兼容关系取补图后，问题等价于
+    “用尽量少的颜色给冲突图着色”，一般情形属于 NP-hard 问题。
+
+    本函数先用 DSATUR 得到较好的上界，再用冲突 clique 得到可靠下界：若二者
+    相等就已证明最优；否则仅对不超过 ``max_exact_component_stocks`` 的兼容图
+    连通分量做分支限界精确搜索。搜索节点达到 ``exact_search_node_limit`` 后
+    返回当前最好结果，并通过 DataFrame.attrs 明确标记尚未证明最优。将节点上限
+    设为 0 可取消搜索节点限制，但 NP-hard 输入可能运行很久。
+    """
+
+    if max_exact_component_stocks < 0:
+        raise ValueError("max_exact_component_stocks must be non-negative")
+    if exact_search_node_limit < 0:
+        raise ValueError("exact_search_node_limit must be non-negative")
+
+    ordered = compatibility_matrix.copy()
+    ordered.index = ordered.index.astype(str)
+    ordered.columns = ordered.columns.astype(str)
+    ordered = ordered.sort_index()
+    if set(ordered.index) != set(ordered.columns):
+        raise ValueError("compatibility matrix must use the same row and column labels")
+    ordered = ordered.reindex(columns=ordered.index)
+    if ordered.isna().any().any():
+        raise ValueError("compatibility matrix must not contain missing values")
+
+    compatibility = ordered.to_numpy(dtype=bool, copy=True)
+    if not np.array_equal(compatibility, compatibility.T):
+        raise ValueError("compatibility matrix must be symmetric")
+    np.fill_diagonal(compatibility, True)
+
+    stock_ids = ordered.index.tolist()
+    compatibility_masks = _boolean_matrix_to_bit_masks(compatibility)
+    components = _connected_components(compatibility_masks)
+
+    groups: list[list[str]] = []
+    total_lower_bound = 0
+    all_components_proven_optimal = True
+    total_searched_nodes = 0
+
+    # 不同兼容连通分量之间没有任何兼容边，所以一个合法组不可能跨分量；分别
+    # 求解再相加不会损失全局最优性，也能把多数实际问题缩成更小的子问题。
+    for component in components:
+        local_compatibility = compatibility[np.ix_(component, component)]
+        local_conflicts = ~local_compatibility
+        np.fill_diagonal(local_conflicts, False)
+        conflict_masks = _boolean_matrix_to_bit_masks(local_conflicts)
+
+        colors = _dsatur_greedy_coloring(conflict_masks)
+        color_count = max(colors, default=-1) + 1
+        lower_bound = _greedy_conflict_clique_lower_bound(conflict_masks)
+        component_is_optimal = color_count == lower_bound
+
+        if not component_is_optimal and len(component) <= max_exact_component_stocks:
+            colors, component_is_optimal, searched_nodes = _search_minimum_coloring(
+                conflict_masks,
+                colors,
+                lower_bound,
+                search_node_limit=exact_search_node_limit,
+            )
+            color_count = max(colors, default=-1) + 1
+            total_searched_nodes += searched_nodes
+
+        if component_is_optimal:
+            # 搜索穷尽或上下界相遇后，真实下界就是已经得到的最优组数。
+            lower_bound = color_count
+        else:
+            all_components_proven_optimal = False
+        total_lower_bound += lower_bound
+
+        groups_by_color: dict[int, list[str]] = {}
+        for local_vertex, color in enumerate(colors):
+            global_vertex = component[local_vertex]
+            groups_by_color.setdefault(color, []).append(stock_ids[global_vertex])
+        groups.extend(groups_by_color.values())
+
+    # 颜色编号只是求解器内部符号。最终按每组最小 stock_id 稳定排序、重新编号，
+    # 使同一输入的 CSV 输出可复现。
+    groups = [sorted(group) for group in groups]
+    groups.sort(key=lambda group: group[0])
+    rows = [
+        (stock_id, group_id)
+        for group_id, group in enumerate(groups, start=1)
+        for stock_id in group
+    ]
+    result = pd.DataFrame(rows, columns=["stock_id", "group_id"])
+    result.attrs["optimal_group_count_proven"] = all_components_proven_optimal
+    result.attrs["group_count_lower_bound"] = total_lower_bound
+    result.attrs["group_count_upper_bound"] = len(groups)
+    result.attrs["exact_search_nodes"] = total_searched_nodes
+    return result
+
+
 def group_relative_clock_vectors(
     vectors: pd.DataFrame,
     *,
     max_clock_gap_us: int = DEFAULT_MAX_CLOCK_GAP_US,
     min_close_snapshots: int = DEFAULT_MIN_CLOSE_SNAPSHOTS,
     min_close_rate: float = DEFAULT_MIN_CLOSE_RATE,
+    max_exact_component_stocks: int = DEFAULT_MAX_EXACT_COMPONENT_STOCKS,
+    exact_search_node_limit: int = DEFAULT_EXACT_SEARCH_NODE_LIMIT,
 ) -> pd.DataFrame:
-    """根据相对 clock 向量的重复接近程度生成固定分组 baseline。
+    """构造两两证据矩阵，并在全配对约束下尽量减少最终分组数。
 
-    这是本脚本中唯一负责“如何分组”的函数。它只接收已经构造好的向量表，
-    不读取 CSV，也不调用绘图函数。因此以后修改相似度、归一化或图聚类规则时，
-    可以只替换这个函数，向量构造和可视化代码不需要跟着改变。
+    逻辑明确拆成三步，后续可以分别替换：
 
-    ``vectors`` 的结构：
+    1. 从相对 ``clock`` 向量计算匹配数和匹配率；
+    2. 用两个阈值生成兼容矩阵；
+    3. 将兼容矩阵做最少 clique partition。
 
-    - 每一行是一只股票；
-    - 每一列是一个 snapshot；
-    - 单元格是该股票在该 snapshot 中的相对 clock；
-    - 股票没有出现时单元格为 ``<NA>``。
-
-    观察依据是：同组股票在共同出现的 snapshot 中，其相对 clock 应反复接近；
-    不同组即使偶尔同时到达，也不应在大多数共同维度上持续接近。
-
-    两只股票满足以下条件时连接一条相似边：
-
-    - 至少在 ``min_close_snapshots`` 个共同维度上，clock 差不大于
-      ``max_clock_gap_us``；
-    - 接近次数占两只股票共同出现次数的比例不小于 ``min_close_rate``。
-
-    第二条就是共同维度数量不同时的基础归一化。例如 ``a-b`` 在 1000 个共同
-    维度中接近 800 次，接近比例为 0.8；``b-c`` 在 2000 个共同维度中接近
-    1500 次，比例为 0.75。当前 baseline 认为前者关系更强。这个比例还没有
-    使用 Wilson 下界或随机碰撞背景校正，后续可以集中在本函数中替换。
-
-    最终分组要求组内任意两只股票之间都有相似边。已有组为 ``{a, b}`` 时，
-    ``c`` 必须同时与 ``a``、``b`` 满足上述两道阈值才能加入；只满足其中一个
-    不够。缺失维度不算正证据，也不算负证据，但如果一对股票始终缺少足够的
-    共同证据，它们之间不会有相似边，因此不会进入同一个最终组。
+    精确性和规模限制详见 :func:`minimize_compatibility_groups`。
     """
 
-    if max_clock_gap_us < 0:
-        raise ValueError("max_clock_gap_us must be non-negative")
-    if min_close_snapshots < 1:
-        raise ValueError("min_close_snapshots must be at least 1")
-    if not 0 <= min_close_rate <= 1:
-        raise ValueError("min_close_rate must be between 0 and 1")
-
-    # -------------------- 第 1 步：准备股票关系图和证据容器 --------------------
-    # 图中的一个节点代表一只股票。只要两只股票最终满足下方的相似规则，就在
-    # adjacency 中连接一条无向边。即使某只股票没有任何边，它也会作为单例输出。
-    ordered_vectors = vectors.sort_index()
-    stock_ids = ordered_vectors.index.astype(str).tolist()
-    adjacency: dict[str, set[str]] = {stock_id: set() for stock_id in stock_ids}
-
-    # active_snapshots：股票 -> 它实际出现过的 snapshot 位置集合。
-    # 两只股票的集合取交集，就得到双方“可以进行比较”的共同维度数量。某只股票
-    # 缺失的 snapshot 不会进入交集，所以既不会被视为接近，也不会被视为不接近。
-    active_snapshots: dict[str, set[int]] = {stock_id: set() for stock_id in stock_ids}
-
-    # close_counts：(较小 stock_id, 较大 stock_id) -> clock 足够接近的 snapshot 数。
-    # 股票对按 ID 排序后再作为键，保证 (a, b) 和 (b, a) 不会重复计数。
-    close_counts: Counter[tuple[str, str]] = Counter()
-
-    # -------------------- 第 2 步：逐 snapshot 累计接近次数 --------------------
-    # 这里没有先枚举全市场所有股票对。每个 snapshot 内先删除 <NA> 并按相对
-    # clock 排序，然后用滑动窗口只生成 clock 差不超过阈值的候选对。通常候选
-    # 数量远少于 O(股票数²)，同时仍然使用 n 维向量中的每一个 snapshot 坐标。
-    for snapshot_position, time_value in enumerate(ordered_vectors.columns):
-        # dropna 的含义是：本 snapshot 未出现的股票不参与本轮比较。
-        observed = ordered_vectors[time_value].dropna().sort_values(kind="stable")
-        observed_stocks = observed.index.astype(str).tolist()
-        observed_clocks = observed.to_numpy(dtype="int64")
-
-        # 先记录每只股票在当前 snapshot 出现过，后面计算共同维度的分母时使用。
-        for stock_id in observed_stocks:
-            active_snapshots[stock_id].add(snapshot_position)
-
-        # observed_clocks 已经升序排列。window_start 始终指向仍满足
-        # current_clock - previous_clock <= max_clock_gap_us 的最左记录。
-        # 因此 [window_start, current_position) 中的每只股票都与当前股票接近。
-        window_start = 0
-        for current_position, current_clock in enumerate(observed_clocks):
-            while current_clock - observed_clocks[window_start] > max_clock_gap_us:
-                window_start += 1
-
-            # 每个股票对在一个 snapshot 中至多累计一次。这里累计的是跨 snapshot
-            # 重复出现的近时证据，而不是把一次偶然接近直接当成永久同组关系。
-            for previous_position in range(window_start, current_position):
-                pair = tuple(
-                    sorted(
-                        (
-                            observed_stocks[previous_position],
-                            observed_stocks[current_position],
-                        )
-                    )
-                )
-                close_counts[pair] += 1
-
-    # -------------------- 第 3 步：归一化证据并决定是否建边 --------------------
-    # 只比较 close_count 不公平：800 次接近可能来自 1000 次机会，也可能来自
-    # 100000 次机会。因此用 common_count 作为分母，得到 close_rate。
-    #
-    # 这里只遍历至少接近过一次的股票对；从未接近的股票对自然不会建立边。
-    for (first_stock, second_stock), close_count in sorted(close_counts.items()):
-        common_count = len(
-            active_snapshots[first_stock] & active_snapshots[second_stock]
-        )
-
-        # close_count > 0 时 common_count 一定大于 0，因为一次“接近”首先要求两只
-        # 股票在同一个 snapshot 中都出现。缺失维度没有进入这个分母。
-        close_rate = close_count / common_count
-
-        # 两道门槛分别控制：
-        # 1. 绝对证据量：避免 1/1 这种比例很高但样本极少的关系；
-        # 2. 归一化比例：让共同维度数量不同的股票对可以放在同一尺度上比较。
-        # 当前规则仍是简单启发式。以后改成 Wilson 下界、背景碰撞校正或其他
-        # 相似度时，主要替换这一小段判断即可。
-        if close_count < min_close_snapshots or close_rate < min_close_rate:
-            continue
-
-        adjacency[first_stock].add(second_stock)
-        adjacency[second_stock].add(first_stock)
-
-    # -------------------- 第 4 步：按组内全配对约束生成最终分组 --------------------
-    # 按 stock_id 的稳定顺序逐只处理股票，并尝试放入第一个满足条件的已有组。
-    # 条件不是“与组内任意一个成员相似”，而是“与组内每一个成员都相似”。
-    #
-    # 例如 adjacency 中有 a-b、b-c 两条边，但没有 a-c：
-    # 1. a 先建立组 [a]；
-    # 2. b 与 a 相似，可以加入，得到 [a, b]；
-    # 3. c 虽然与 b 相似，但与 a 不相似，因此不能加入 [a, b]，必须新建组。
-    #
-    # 这样每个输出组在相似图中都是一个 clique（组内任意两点都有边），消除了
-    # 原连通分量算法的链式误合并。代价是结果可能更碎：同组股票如果因为缺失
-    # 而没有形成直接边，也无法再通过中间股票间接加入。
-    groups: list[list[str]] = []
-
-    for stock_id in stock_ids:
-        for group in groups:
-            # all(...) 实现用户指定的严格条件：候选股票必须通过与当前组内每一只
-            # 股票的配对阈值。只要有一只不满足，就继续尝试下一个已有组。
-            if all(member in adjacency[stock_id] for member in group):
-                group.append(stock_id)
-                break
-        else:
-            # 没有任何已有组能完整接纳该股票时，新建一个单例组。
-            groups.append([stock_id])
-
-    # first-fit 是为了保持实现简单且结果可复现，并不保证用最少的组完成 clique
-    # 划分。若一只股票同时满足多个组，它进入按 stock_id 过程最先建立的那个组。
-    rows = [
-        (stock_id, group_id)
-        for group_id, group in enumerate(groups, start=1)
-        for stock_id in group
-    ]
-
-    return pd.DataFrame(rows, columns=["stock_id", "group_id"])
+    match_counts, match_rates = calculate_pairwise_match_matrices(
+        vectors,
+        max_clock_gap_us=max_clock_gap_us,
+    )
+    compatibility = build_compatibility_matrix(
+        match_counts,
+        match_rates,
+        min_close_snapshots=min_close_snapshots,
+        min_close_rate=min_close_rate,
+    )
+    return minimize_compatibility_groups(
+        compatibility,
+        max_exact_component_stocks=max_exact_component_stocks,
+        exact_search_node_limit=exact_search_node_limit,
+    )
 
 
 def plot_relative_clock_vectors(
@@ -318,6 +666,8 @@ def process_csv(
     max_clock_gap_us: int = DEFAULT_MAX_CLOCK_GAP_US,
     min_close_snapshots: int = DEFAULT_MIN_CLOSE_SNAPSHOTS,
     min_close_rate: float = DEFAULT_MIN_CLOSE_RATE,
+    max_exact_component_stocks: int = DEFAULT_MAX_EXACT_COMPONENT_STOCKS,
+    exact_search_node_limit: int = DEFAULT_EXACT_SEARCH_NODE_LIMIT,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """读取 CSV，依次构造向量、分组并写出三个结果文件。"""
 
@@ -333,6 +683,8 @@ def process_csv(
         max_clock_gap_us=max_clock_gap_us,
         min_close_snapshots=min_close_snapshots,
         min_close_rate=min_close_rate,
+        max_exact_component_stocks=max_exact_component_stocks,
+        exact_search_node_limit=exact_search_node_limit,
     )
 
     vectors.reset_index().to_csv(vectors_csv, index=False)
@@ -369,6 +721,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MIN_CLOSE_RATE,
         help="接近次数占共同 snapshot 数的最小比例（默认：%(default)s）",
     )
+    parser.add_argument(
+        "--max-exact-component-stocks",
+        type=int,
+        default=DEFAULT_MAX_EXACT_COMPONENT_STOCKS,
+        help="允许精确搜索的最大兼容连通分量股票数（默认：%(default)s）",
+    )
+    parser.add_argument(
+        "--exact-search-node-limit",
+        type=int,
+        default=DEFAULT_EXACT_SEARCH_NODE_LIMIT,
+        help="每次精确搜索的节点上限；0 表示不限制（默认：%(default)s）",
+    )
     return parser
 
 
@@ -384,11 +748,21 @@ def main(argv: list[str] | None = None) -> int:
         max_clock_gap_us=arguments.max_clock_gap_us,
         min_close_snapshots=arguments.min_close_snapshots,
         min_close_rate=arguments.min_close_rate,
+        max_exact_component_stocks=arguments.max_exact_component_stocks,
+        exact_search_node_limit=arguments.exact_search_node_limit,
     )
 
     print(f"snapshot 数：{vectors.shape[1]}")
     print(f"股票数：{vectors.shape[0]}")
     print(f"最终分组数：{groups['group_id'].nunique()}")
+    if groups.attrs["optimal_group_count_proven"]:
+        print("最少分组证明：已证明当前分组数为全局最少")
+    else:
+        print(
+            "最少分组证明：尚未证明；"
+            f"已知下界={groups.attrs['group_count_lower_bound']}，"
+            f"当前上界={groups.attrs['group_count_upper_bound']}"
+        )
     print(f"向量 CSV：{arguments.vectors_csv}")
     print(f"分组 CSV：{arguments.groups_csv}")
     print(f"热图 PNG：{arguments.plot_png}")

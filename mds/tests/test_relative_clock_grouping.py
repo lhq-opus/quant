@@ -9,9 +9,12 @@ from pathlib import Path
 import pandas as pd
 
 from mds.relative_clock_grouping import (
+    build_compatibility_matrix,
     build_relative_clock_vectors,
+    calculate_pairwise_match_matrices,
     group_relative_clock_vectors,
     main,
+    minimize_compatibility_groups,
     plot_relative_clock_vectors,
 )
 
@@ -169,6 +172,94 @@ class RelativeClockVectorTest(unittest.TestCase):
         self.assertEqual(loose_groups["group_id"].tolist(), [1, 1])
         self.assertEqual(strict_groups["group_id"].tolist(), [1, 2])
 
+    def test_pairwise_matrices_record_match_count_and_rate(self) -> None:
+        vectors = pd.DataFrame(
+            {
+                # a-b 共同出现 3 次，其中 t1、t2 的差不超过 100 微秒。
+                "t1": [0, 20, pd.NA],
+                "t2": [0, 80, 5_000],
+                "t3": [0, 500, 5_000],
+            },
+            index=["a", "b", "c"],
+            dtype="Int64",
+        )
+
+        match_counts, match_rates = calculate_pairwise_match_matrices(
+            vectors,
+            max_clock_gap_us=100,
+        )
+
+        self.assertEqual(match_counts.loc["a", "b"], 2)
+        self.assertAlmostEqual(match_rates.loc["a", "b"], 2 / 3)
+        self.assertEqual(match_counts.loc["a", "c"], 0)
+        self.assertEqual(match_rates.loc["a", "c"], 0)
+        self.assertEqual(match_counts.loc["a", "a"], 3)
+        self.assertEqual(match_rates.loc["a", "a"], 1)
+
+
+class MinimumGroupPartitionTest(unittest.TestCase):
+    def test_minimization_beats_stock_id_first_fit_counterexample(self) -> None:
+        # 通过阈值的兼容边只有 a-c、a-d、b-c。
+        # 旧 stock_id first-fit 会依次得到 {a,c}、{b}、{d}，一共 3 组；
+        # 但最优划分是 {a,d}、{b,c}，只需要 2 组。
+        stock_ids = ["a", "b", "c", "d"]
+        match_counts = pd.DataFrame(0, index=stock_ids, columns=stock_ids)
+        match_rates = pd.DataFrame(0.0, index=stock_ids, columns=stock_ids)
+        for stock_id in stock_ids:
+            match_counts.loc[stock_id, stock_id] = 3
+            match_rates.loc[stock_id, stock_id] = 1.0
+        for first_stock, second_stock in [("a", "c"), ("a", "d"), ("b", "c")]:
+            match_counts.loc[first_stock, second_stock] = 3
+            match_counts.loc[second_stock, first_stock] = 3
+            match_rates.loc[first_stock, second_stock] = 1.0
+            match_rates.loc[second_stock, first_stock] = 1.0
+
+        compatibility = build_compatibility_matrix(
+            match_counts,
+            match_rates,
+            min_close_snapshots=2,
+            min_close_rate=0.5,
+        )
+        groups = minimize_compatibility_groups(compatibility)
+
+        grouped_stocks = {
+            frozenset(group["stock_id"])
+            for _, group in groups.groupby("group_id", sort=True)
+        }
+        self.assertEqual(grouped_stocks, {frozenset({"a", "d"}), frozenset({"b", "c"})})
+        self.assertTrue(groups.attrs["optimal_group_count_proven"])
+        self.assertEqual(groups.attrs["group_count_lower_bound"], 2)
+        self.assertEqual(groups.attrs["group_count_upper_bound"], 2)
+
+    def test_exact_search_and_best_effort_status_are_distinguished(self) -> None:
+        # 不兼容图是长度为 5 的奇环：最大冲突 clique 只有 2 个点，但至少需要
+        # 3 种颜色。它迫使分支限界真正搜索，不能只靠上下界立即得出结论。
+        stock_ids = ["a", "b", "c", "d", "e"]
+        compatibility = pd.DataFrame(True, index=stock_ids, columns=stock_ids)
+        for first_stock, second_stock in [
+            ("a", "b"),
+            ("b", "c"),
+            ("c", "d"),
+            ("d", "e"),
+            ("e", "a"),
+        ]:
+            compatibility.loc[first_stock, second_stock] = False
+            compatibility.loc[second_stock, first_stock] = False
+
+        exact_groups = minimize_compatibility_groups(compatibility)
+        best_effort_groups = minimize_compatibility_groups(
+            compatibility,
+            max_exact_component_stocks=0,
+        )
+
+        self.assertEqual(exact_groups["group_id"].nunique(), 3)
+        self.assertTrue(exact_groups.attrs["optimal_group_count_proven"])
+        self.assertGreater(exact_groups.attrs["exact_search_nodes"], 0)
+        self.assertEqual(best_effort_groups["group_id"].nunique(), 3)
+        self.assertFalse(best_effort_groups.attrs["optimal_group_count_proven"])
+        self.assertEqual(best_effort_groups.attrs["group_count_lower_bound"], 2)
+        self.assertEqual(best_effort_groups.attrs["group_count_upper_bound"], 3)
+
 
 class RelativeClockVisualizationTest(unittest.TestCase):
     def test_visualization_and_cli_write_all_outputs(self) -> None:
@@ -215,6 +306,7 @@ class RelativeClockVisualizationTest(unittest.TestCase):
             self.assertTrue(plot_png.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
             self.assertIn("snapshot 数：3", output.getvalue())
             self.assertIn("最终分组数：3", output.getvalue())
+            self.assertIn("已证明当前分组数为全局最少", output.getvalue())
 
     def test_plot_function_is_callable_without_grouping_function(self) -> None:
         vectors = build_relative_clock_vectors(make_market_data())
