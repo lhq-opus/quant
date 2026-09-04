@@ -26,9 +26,21 @@ void OrderBook::apply(const Event& event, TradingSession session) {
     return;
   }
 
-  // 连续竞价中的新订单会马上尝试吃掉对手盘。
+  // 深交所逐笔行情只给出 OrderType=1/2/U，没有给出区分各种市价子类型所需的
+  // TimeInForce、MaxPriceLevels 和 MinQty。为了保持当前 demo 简单、结果确定，约定：
+  //   1 = 对手方最优，未成交部分按该价格转成限价单；
+  //   2 = 普通限价单；
+  //   U = 本方最优，直接加入本方当前最优档。
+  // 市价申报只用于连续竞价，因此合法的集合竞价 order 仍然都是限价单。
   if (session == TradingSession::ContinuousAuction) {
-    apply_continuous_order(event);
+    if (event.order_type == '1') {
+      apply_opponent_best_order(event);
+    } else if (event.order_type == 'U') {
+      apply_own_best_order(event);
+    } else {
+      // 输入保证 OrderType 只有 1、2、U，所以最后一个分支就是 2。
+      apply_limit_order(event, event.price);
+    }
     return;
   }
 
@@ -45,7 +57,43 @@ void OrderBook::add_order(const Event& event) {
   }
 }
 
-void OrderBook::apply_continuous_order(const Event& event) {
+void OrderBook::apply_opponent_best_order(const Event& event) {
+  if (event.side == '1') {
+    // 买单使用到达时的卖一作为限价。没有卖盘时，没有对手方最优价，申报自动撤销。
+    if (asks_.empty()) {
+      return;
+    }
+    apply_limit_order(event, asks_.begin()->first);
+    return;
+  }
+
+  // 卖单与之对称：使用到达时的买一；没有买盘时自动撤销。
+  if (bids_.empty()) {
+    return;
+  }
+  apply_limit_order(event, bids_.begin()->first);
+}
+
+void OrderBook::apply_own_best_order(const Event& event) {
+  if (event.side == '1') {
+    // 买方最高价就是买一。若本方盘口为空，则不存在本方最优价，申报自动撤销。
+    if (bids_.empty()) {
+      return;
+    }
+
+    // U 的 CSV Price 在本 demo 中不参与定价，订单直接加入到达时的买一档。
+    bids_[bids_.begin()->first] += event.quantity;
+    return;
+  }
+
+  // 卖方最低价就是卖一，处理方式与买方完全对称。
+  if (asks_.empty()) {
+    return;
+  }
+  asks_[asks_.begin()->first] += event.quantity;
+}
+
+void OrderBook::apply_limit_order(const Event& event, Price limit_price) {
   Quantity remaining_quantity = event.quantity;
 
   if (event.side == '1') {
@@ -53,7 +101,7 @@ void OrderBook::apply_continuous_order(const Event& event) {
     // 买单只要还有数量，并且卖一不高于买入限价，就继续逐档成交。
     while (remaining_quantity > 0 && !asks_.empty()) {
       AskLevels::iterator best_ask = asks_.begin();
-      if (best_ask->first > event.price) {
+      if (best_ask->first > limit_price) {
         break;
       }
 
@@ -69,7 +117,7 @@ void OrderBook::apply_continuous_order(const Event& event) {
 
     // 对手盘已经不能继续成交时，买单剩余数量进入自己的限价档。
     if (remaining_quantity > 0) {
-      bids_[event.price] += remaining_quantity;
+      bids_[limit_price] += remaining_quantity;
     }
     return;
   }
@@ -78,7 +126,7 @@ void OrderBook::apply_continuous_order(const Event& event) {
   // 卖单从最高买价开始，只要买一不低于卖出限价，就继续逐档成交。
   while (remaining_quantity > 0 && !bids_.empty()) {
     BidLevels::iterator best_bid = bids_.begin();
-    if (best_bid->first < event.price) {
+    if (best_bid->first < limit_price) {
       break;
     }
 
@@ -94,7 +142,7 @@ void OrderBook::apply_continuous_order(const Event& event) {
 
   // 卖单没有完全成交时，剩余数量进入自己的限价档。
   if (remaining_quantity > 0) {
-    asks_[event.price] += remaining_quantity;
+    asks_[limit_price] += remaining_quantity;
   }
 }
 

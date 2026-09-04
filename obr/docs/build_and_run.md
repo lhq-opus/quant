@@ -74,11 +74,17 @@ caa,TransactionTime,Side,OrderType,Price,OrderQty,ExecType,TradeQty,TradePrice
 
 - order 行填写 `caa,TransactionTime,Side,OrderType,Price,OrderQty`；
 - 撤单行填写 `caa,TransactionTime,Side,ExecType,TradeQty,TradePrice`；
+- `OrderType=2` 使用 `Price`；`1` 按本 demo 解释为对手方最优、剩余转限价；`U` 加入
+  本方最优档，后二者不读取 order 行的 `Price`；
 - `ExecType=4` 表示撤单；
 - `TransactionTime` 用于区分开盘集合、连续和收盘集合竞价；
 - 程序会按 `caa` 稳定排序，不要求 CSV 当前已经排好顺序。
 
 第一版假设 CSV 内容合法，并且字段中没有需要引号保护的逗号。
+
+注意：深交所正式申报要用额外字段区分 `OrderType=1` 的多种市价子类型，而当前
+`event.csv` 不含这些字段。这里选择“对手方最优、剩余转限价”只是教学 demo 的输入
+约定；具体原因和三种类型的逐步处理见 `docs/event_replay_book.md`。
 
 ## 5. 执行订单簿重放
 

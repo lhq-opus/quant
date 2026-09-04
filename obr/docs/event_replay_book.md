@@ -33,7 +33,7 @@ caa,TransactionTime,Side,OrderType,Price,OrderQty,ExecType,TradeQty,TradePrice
 - order 行使用 `caa,TransactionTime,Side,OrderType,Price,OrderQty`；
 - 撤单行使用 `caa,TransactionTime,Side,ExecType,TradeQty,TradePrice`；`Side` 和
   `TradePrice` 由上游从被撤原订单补全；
-- 必要枚举仍是 `Side=1/2`、`OrderType=2`、`ExecType=4`；
+- 必要枚举是 `Side=1/2`、`OrderType=1/2/U`、`ExecType=4`；
 - `TransactionTime` 不足 9 位时左补零，按 `HHMMSSmmm` 理解；阶段判断只读取
   `HHMMSS`。例如 `91500790` 属于 09:15:00，`100407190` 属于 10:04:07；
 - 事件仍按 `caa` 稳定排序，`TransactionTime` 只负责判断交易阶段。
@@ -43,6 +43,35 @@ caa,TransactionTime,Side,OrderType,Price,OrderQty,ExecType,TradeQty,TradePrice
 
 本版本按用户约定假设输入是单交易日、完整且合法的交易所事件，因此不增加时间格式、
 交易时段、枚举和数量的通用校验框架。
+
+## 三种 OrderType 怎样处理
+
+深交所逐笔行情把 `OrdType` 定义为 `1=市价`、`2=限价`、`U=本方最优`。但是交易
+申报接口中的一种完整市价类型还需要结合 `TimeInForce`、`MaxPriceLevels` 和 `MinQty`
+才能确定。例如，同一个 `OrdType=1` 可以表示对手方最优剩余转限价、市价立即成交剩余
+撤销、市价全额成交或撤销、最优五档成交剩余撤销。参见深交所
+[Binary 行情数据接口规范](https://www.szse.cn/marketServices/technicalservice/interface/P020250328368568358456.pdf)
+和 [STEP 交易数据接口规范](https://investor.szse.cn/marketServices/technicalservice/interface/P020250328368240326574.pdf)。
+
+当前 `event.csv` 没有后三个细分字段，所以无法完整区分所有市价子类型。为让教学 demo
+可以仅凭现有字段确定性重放，本版采用以下明确约定：
+
+- `2`：普通限价单。读取 CSV `Price`，买单逐档成交至该价格为止，卖单反向处理；
+  未成交数量以 `Price` 加入本方盘口；
+- `1`：对手方最优、剩余转限价。买单取到达时的卖一、卖单取到达时的买一作为实际
+  限价；因此只会消耗当时的对手方最优档，剩余数量留在这个实际价格。对手盘为空时
+  没有可采用的价格，申报自动撤销；
+- `U`：本方最优。买单加入到达时的买一，卖单加入到达时的卖一；不读取 CSV `Price`，
+  也不主动与对手盘成交。本方盘口为空时，申报自动撤销。
+
+市价申报只适用于连续竞价，所以合法的开盘、收盘集合竞价 order 仍是类型 `2`。这里
+对 `1` 的解释是当前缺字段输入的 demo 约定，不代表只凭深交所原始 `OrdType=1` 就能
+识别所有市价申报方式。后续完整实现应保留申报细分字段，或者按逐笔成交消息中的订单
+引用更新状态。
+
+如果类型 `1/U` 的剩余订单后来被撤销，上游必须把它实际挂入的价格写到撤单行
+`TradePrice`。当前聚合 event 已经删除订单 ID，无法在撤单发生时再从原始零价格恢复
+那一张订单。
 
 ## 集合竞价阶段
 
@@ -73,11 +102,14 @@ caa,TransactionTime,Side,OrderType,Price,OrderQty,ExecType,TradeQty,TradePrice
 
 ## 连续竞价阶段
 
-连续竞价保留原有逐档逻辑：
+连续竞价的公共限价撮合逻辑是：
 
 - 买单从最低卖价开始，只要卖价不高于买入限价，就继续消耗卖一、卖二；
 - 卖单从最高买价开始，只要买价不低于卖出限价，就继续消耗买一、买二；
 - 各档以被消耗的对手方价格成交；来单未成交数量最后进入自己的限价档。
+
+类型 `2` 直接把 CSV `Price` 传给这段逻辑；类型 `1` 先取对手方最优价，再把这个价格
+传给同一段逻辑；类型 `U` 不需要撮合，直接在本方最优档增加数量。
 
 这对应深交所规则第 3.4.4 条。内部仍只有“价格 → 聚合数量”，所以能重建价格档、
 成交总量和成交额，但不能推导同价位内具体哪两张订单成交，也不能推导成交笔数。

@@ -78,6 +78,19 @@ quantity = TradeQty
 简单 `Event`，所以 `OrderBook` 不需要知道原始列位置；集合竞价出现买卖同价时，也能
 按 `Side` 撤销正确一侧。
 
+`order_type` 在连续竞价中决定 `OrderBook` 怎样取得实际限价：
+
+- `2` 直接使用 `event.price`；
+- `1` 按当前 demo 约定使用对手方最优价，剩余量也挂在该价；
+- `U` 忽略 `event.price`，直接加入本方最优档。
+
+深交所行情里的 `OrderType=1` 只说明它属于市价订单。正式申报还需要
+`TimeInForce / MaxPriceLevels / MinQty` 才能区分不同市价子类型，而当前 event 没有
+这些字段。因此这里的 `1=对手方最优、剩余转限价` 是为现有输入选择的教学约定，不是
+完整交易所枚举映射。两份官方字段定义可分别查看
+[Binary 行情接口](https://www.szse.cn/marketServices/technicalservice/interface/P020250328368568358456.pdf)
+和 [STEP 交易接口](https://investor.szse.cn/marketServices/technicalservice/interface/P020250328368240326574.pdf)。
+
 ## 为什么价格仍使用整数
 
 代码没有复杂的强类型，但也没有使用 `double`。`Price` 是普通 `std::int64_t`，单位为
@@ -100,7 +113,10 @@ asks_: 价格从低到高 -> 聚合卖量
 ```
 
 - 集合竞价 order：只加入本方 map；阶段结束时统一筛选成交价并扣减双方数量；
-- 连续竞价 order：从对方 `map.begin()` 开始逐档成交，剩余量再进入本方 map；
+- 连续竞价类型 `2`：从对方 `map.begin()` 开始逐档成交，剩余量以 CSV 限价进入本方；
+- 连续竞价类型 `1`：先取对方 `map.begin()` 的价格作为限价，只成交该最优档，剩余
+  数量以这个价格进入本方；对手盘为空时自动撤销；
+- 连续竞价类型 `U`：直接加入本方 `map.begin()` 对应的最优档，本方为空时自动撤销；
 - cancel：用上游补好的 `TradePrice` 查找价格档并扣除 `TradeQty`；
 - snapshot：直接从两个已经排好序的 map 各取前五个元素。
 
@@ -126,6 +142,7 @@ asks_: 价格从低到高 -> 聚合卖量
 /tmp/obr-build/obr_validate_reconstruction_core
 ```
 
-验证程序只覆盖合法正常流程：开盘集合竞价、连续逐档成交、盘前撤单、收盘集合竞价、
-未成交数量结转以及累计成交量和成交额。端到端验证还会让 C++ 和 Python 读取同一份临时
-`event.csv`，并逐字节比较两份 `book.csv`。
+验证程序只覆盖合法正常流程：开盘集合竞价、连续逐档成交、三种 `OrderType` 的买卖
+方向、最优价为空时自动撤销、盘前撤单、收盘集合竞价、未成交数量结转以及累计成交量
+和成交额。端到端验证还会让 C++ 和 Python 读取同一份临时 `event.csv`，并逐字节比较
+两份 `book.csv`。

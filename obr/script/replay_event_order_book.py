@@ -136,9 +136,25 @@ class EventOrderBook:
             self._apply_cancel(event)
             event_type = "cancel"
         elif session == CONTINUOUS_AUCTION:
-            self._apply_continuous_order(event)
+            # 深交所逐笔行情只给出 OrderType=1/2/U，没有给出区分各种市价
+            # 子类型所需的其他申报字段。为了保持这个 demo 简单、结果确定，约定：
+            #   1 = 对手方最优，未成交部分按该价格转成限价单；
+            #   2 = 普通限价单；
+            #   U = 本方最优，直接加入本方当前最优档。
+            if event.OrderType == "1":
+                self._apply_opponent_best_order(event)
+            elif event.OrderType == "U":
+                self._apply_own_best_order(event)
+            else:
+                # 输入保证 OrderType 只有 1、2、U，所以最后一个分支就是 2。
+                self._apply_limit_order(
+                    event.Side,
+                    Decimal(event.Price),
+                    int(event.OrderQty),
+                )
             event_type = "order"
         else:
+            # 市价申报只用于连续竞价，因此合法的集合竞价 order 是限价单。
             self._add_order_to_book(event)
             event_type = "order"
 
@@ -151,12 +167,41 @@ class EventOrderBook:
         levels = self.bids if event.Side == "1" else self.asks
         levels[price] = levels.get(price, 0) + quantity
 
-    def _apply_continuous_order(self, event):
-        """按价格优先逐档消耗对手盘，再把未成交数量加入本方盘口。"""
-        limit_price = Decimal(event.Price)
-        remaining_quantity = int(event.OrderQty)
-
+    def _apply_opponent_best_order(self, event):
+        """把类型 1 按本 demo 的“对手方最优、剩余转限价”约定处理。"""
         if event.Side == "1":
+            # 买单用到达时的卖一作为限价。没有卖盘时，交易所自动撤销申报。
+            if not self.asks:
+                return
+            limit_price = min(self.asks)
+        else:
+            # 卖单与之对称：使用到达时的买一；没有买盘时自动撤销。
+            if not self.bids:
+                return
+            limit_price = max(self.bids)
+
+        # 以对手方最优价作为限价后，只可能吃掉这一价格档。
+        # 如果数量还有剩余，_apply_limit_order 会把它留在同一个价格上。
+        self._apply_limit_order(event.Side, limit_price, int(event.OrderQty))
+
+    def _apply_own_best_order(self, event):
+        """把类型 U 委托加入本方到达时的最优价格档。"""
+        levels = self.bids if event.Side == "1" else self.asks
+
+        # 本方没有任何申报时没有“本方最优价”，该申报自动撤销。
+        if not levels:
+            return
+
+        # 买方最高价是买一，卖方最低价是卖一。
+        # 本 demo 规定 U 的实际挂单价来自当前盘口，因此这里完全不读取 CSV Price。
+        best_own_price = max(levels) if event.Side == "1" else min(levels)
+        levels[best_own_price] += int(event.OrderQty)
+
+    def _apply_limit_order(self, side, limit_price, quantity):
+        """按价格优先逐档成交，再把未成交数量加入指定限价。"""
+        remaining_quantity = quantity
+
+        if side == "1":
             # 买单从最低卖价开始成交。只要卖一不高于买入限价，就继续看下一卖价。
             while remaining_quantity > 0 and self.asks:
                 best_ask_price = min(self.asks)

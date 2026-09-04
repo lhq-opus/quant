@@ -17,7 +17,7 @@ public:
   OrderBook();
 
   // 应用一条已经从 CSV 转换好的 Event。
-  // 连续竞价 order 会立即撮合；集合竞价 order 只进入本方价格档。
+  // 连续竞价根据 OrderType 分别处理 1、2、U；集合竞价的合法限价单只进入本方价格档。
   void apply(const Event& event, TradingSession session);
 
   // 一段开盘或收盘集合竞价结束时调用一次，统一确定成交价并扣减数量。
@@ -34,7 +34,9 @@ private:
   typedef std::map<Price, Quantity> AskLevels;
 
   void add_order(const Event& event);
-  void apply_continuous_order(const Event& event);
+  void apply_opponent_best_order(const Event& event);
+  void apply_own_best_order(const Event& event);
+  void apply_limit_order(const Event& event, Price limit_price);
   void apply_cancel(const Event& event);
   void record_trade(Price price, Quantity quantity);
 

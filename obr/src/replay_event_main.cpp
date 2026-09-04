@@ -98,7 +98,7 @@ obr::Event parse_event(const std::vector<std::string>& columns) {
     event.quantity = static_cast<obr::Quantity>(std::stoll(columns[7]));
   } else {
     // order 行：直接读取 Side、OrderType、Price 和 OrderQty。
-    // 当前 demo 的合法输入都是限价单，所以 order_type 只保存，不做分支判断。
+    // OrderType 的 1、2、U 分支在 OrderBook::apply 中处理；CSV 层只负责保存原始值。
     event.type = obr::EventType::Order;
     event.side = columns[2][0];
     event.order_type = columns[3][0];

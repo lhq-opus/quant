@@ -33,8 +33,8 @@ enum class TradingSession {
 //
 // order：
 //   side       <- Side
-//   order_type <- OrderType
-//   price      <- Price
+//   order_type <- OrderType（1=市价、2=限价、U=本方最优）
+//   price      <- Price（只有类型 2 直接把它当成限价使用）
 //   quantity   <- OrderQty
 //
 // cancel：
