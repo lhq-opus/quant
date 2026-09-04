@@ -105,9 +105,10 @@ def group_relative_clock_vectors(
     1500 次，比例为 0.75。当前 baseline 认为前者关系更强。这个比例还没有
     使用 Wilson 下界或随机碰撞背景校正，后续可以集中在本函数中替换。
 
-    最终以相似图的连通分量作为组。缺失维度不算正证据，也不算负证据；共同
-    数据不足的股票会保留为单例。连通分量存在链式误合并风险，所以这只是
-    透明、易检查的第一版，而不是最终统计方案。
+    最终分组要求组内任意两只股票之间都有相似边。已有组为 ``{a, b}`` 时，
+    ``c`` 必须同时与 ``a``、``b`` 满足上述两道阈值才能加入；只满足其中一个
+    不够。缺失维度不算正证据，也不算负证据，但如果一对股票始终缺少足够的
+    共同证据，它们之间不会有相似边，因此不会进入同一个最终组。
     """
 
     if max_clock_gap_us < 0:
@@ -193,36 +194,38 @@ def group_relative_clock_vectors(
         adjacency[first_stock].add(second_stock)
         adjacency[second_stock].add(first_stock)
 
-    # -------------------- 第 4 步：把相似图转换成最终固定分组 --------------------
-    # 用简单的深度优先遍历寻找连通分量：如果 a-b、b-c 都有边，即使 a-c 没有
-    # 直接边，三只股票仍会进入同一个组。这允许利用间接同组证据，但也意味着
-    # 一条错误边可能造成链式误合并，是当前 baseline 的明确限制。
+    # -------------------- 第 4 步：按组内全配对约束生成最终分组 --------------------
+    # 按 stock_id 的稳定顺序逐只处理股票，并尝试放入第一个满足条件的已有组。
+    # 条件不是“与组内任意一个成员相似”，而是“与组内每一个成员都相似”。
     #
-    # 按 stock_id 稳定遍历和排序，使相同输入每次产生相同 group_id；group_id
-    # 从 1 开始。
-    visited: set[str] = set()
-    rows: list[tuple[str, int]] = []
-    group_id = 0
+    # 例如 adjacency 中有 a-b、b-c 两条边，但没有 a-c：
+    # 1. a 先建立组 [a]；
+    # 2. b 与 a 相似，可以加入，得到 [a, b]；
+    # 3. c 虽然与 b 相似，但与 a 不相似，因此不能加入 [a, b]，必须新建组。
+    #
+    # 这样每个输出组在相似图中都是一个 clique（组内任意两点都有边），消除了
+    # 原连通分量算法的链式误合并。代价是结果可能更碎：同组股票如果因为缺失
+    # 而没有形成直接边，也无法再通过中间股票间接加入。
+    groups: list[list[str]] = []
 
-    for first_stock in stock_ids:
-        if first_stock in visited:
-            continue
+    for stock_id in stock_ids:
+        for group in groups:
+            # all(...) 实现用户指定的严格条件：候选股票必须通过与当前组内每一只
+            # 股票的配对阈值。只要有一只不满足，就继续尝试下一个已有组。
+            if all(member in adjacency[stock_id] for member in group):
+                group.append(stock_id)
+                break
+        else:
+            # 没有任何已有组能完整接纳该股票时，新建一个单例组。
+            groups.append([stock_id])
 
-        group_id += 1
-        component: list[str] = []
-        stack = [first_stock]
-        visited.add(first_stock)
-
-        while stack:
-            stock_id = stack.pop()
-            component.append(stock_id)
-
-            for neighbor in sorted(adjacency[stock_id], reverse=True):
-                if neighbor not in visited:
-                    visited.add(neighbor)
-                    stack.append(neighbor)
-
-        rows.extend((stock_id, group_id) for stock_id in sorted(component))
+    # first-fit 是为了保持实现简单且结果可复现，并不保证用最少的组完成 clique
+    # 划分。若一只股票同时满足多个组，它进入按 stock_id 过程最先建立的那个组。
+    rows = [
+        (stock_id, group_id)
+        for group_id, group in enumerate(groups, start=1)
+        for stock_id in group
+    ]
 
     return pd.DataFrame(rows, columns=["stock_id", "group_id"])
 

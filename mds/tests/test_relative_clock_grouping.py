@@ -117,6 +117,30 @@ class RelativeClockVectorTest(unittest.TestCase):
         mapping = groups.set_index("stock_id")["group_id"].to_dict()
         self.assertEqual(mapping, {"a": 1, "b": 1, "c": 2, "d": 2})
 
+    def test_stock_must_match_every_existing_group_member(self) -> None:
+        vectors = pd.DataFrame(
+            {
+                # 每个 snapshot 都有：a-b 差 50、b-c 差 70、a-c 差 120。
+                # 阈值为 100 时只有 a-b 和 b-c 建边，a-c 不建边。
+                "t1": [0, 50, 120],
+                "t2": [0, 50, 120],
+                "t3": [0, 50, 120],
+            },
+            index=["a", "b", "c"],
+            dtype="Int64",
+        )
+
+        groups = group_relative_clock_vectors(
+            vectors,
+            max_clock_gap_us=100,
+            min_close_snapshots=2,
+            min_close_rate=0.5,
+        )
+
+        # a、b 先形成组。c 只满足与 b 的阈值，不满足与 a 的阈值，所以不能加入。
+        mapping = groups.set_index("stock_id")["group_id"].to_dict()
+        self.assertEqual(mapping, {"a": 1, "b": 1, "c": 2})
+
     def test_close_rate_can_be_adjusted_without_changing_other_stages(self) -> None:
         vectors = pd.DataFrame(
             {
