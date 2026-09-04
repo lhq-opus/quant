@@ -117,6 +117,34 @@ class RelativeClockVectorTest(unittest.TestCase):
         mapping = groups.set_index("stock_id")["group_id"].to_dict()
         self.assertEqual(mapping, {"a": 1, "b": 1, "c": 2, "d": 2})
 
+    def test_close_rate_can_be_adjusted_without_changing_other_stages(self) -> None:
+        vectors = pd.DataFrame(
+            {
+                # a-b 在三个共同维度中有两个维度接近，close_rate = 2 / 3。
+                "t1": [0, 20],
+                "t2": [0, 20],
+                "t3": [0, 500],
+            },
+            index=["a", "b"],
+            dtype="Int64",
+        )
+
+        loose_groups = group_relative_clock_vectors(
+            vectors,
+            max_clock_gap_us=100,
+            min_close_snapshots=2,
+            min_close_rate=0.5,
+        )
+        strict_groups = group_relative_clock_vectors(
+            vectors,
+            max_clock_gap_us=100,
+            min_close_snapshots=2,
+            min_close_rate=0.8,
+        )
+
+        self.assertEqual(loose_groups["group_id"].tolist(), [1, 1])
+        self.assertEqual(strict_groups["group_id"].tolist(), [1, 2])
+
 
 class RelativeClockVisualizationTest(unittest.TestCase):
     def test_visualization_and_cli_write_all_outputs(self) -> None:
@@ -140,6 +168,8 @@ class RelativeClockVisualizationTest(unittest.TestCase):
                         "100",
                         "--min-close-snapshots",
                         "2",
+                        "--min-close-rate",
+                        "0.5",
                     ]
                 )
 

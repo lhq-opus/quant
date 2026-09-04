@@ -30,6 +30,7 @@ from matplotlib.figure import Figure
 REQUIRED_COLUMNS = ["clock", "stock_id", "time"]
 DEFAULT_MAX_CLOCK_GAP_US = 1_000
 DEFAULT_MIN_CLOSE_SNAPSHOTS = 2
+DEFAULT_MIN_CLOSE_RATE = 0.5
 
 
 def build_relative_clock_vectors(data: pd.DataFrame) -> pd.DataFrame:
@@ -75,8 +76,20 @@ def group_relative_clock_vectors(
     *,
     max_clock_gap_us: int = DEFAULT_MAX_CLOCK_GAP_US,
     min_close_snapshots: int = DEFAULT_MIN_CLOSE_SNAPSHOTS,
+    min_close_rate: float = DEFAULT_MIN_CLOSE_RATE,
 ) -> pd.DataFrame:
-    """根据相对 clock 向量的重复接近程度生成简单固定分组。
+    """根据相对 clock 向量的重复接近程度生成固定分组 baseline。
+
+    这是本脚本中唯一负责“如何分组”的函数。它只接收已经构造好的向量表，
+    不读取 CSV，也不调用绘图函数。因此以后修改相似度、归一化或图聚类规则时，
+    可以只替换这个函数，向量构造和可视化代码不需要跟着改变。
+
+    ``vectors`` 的结构：
+
+    - 每一行是一只股票；
+    - 每一列是一个 snapshot；
+    - 单元格是该股票在该 snapshot 中的相对 clock；
+    - 股票没有出现时单元格为 ``<NA>``。
 
     观察依据是：同组股票在共同出现的 snapshot 中，其相对 clock 应反复接近；
     不同组即使偶尔同时到达，也不应在大多数共同维度上持续接近。
@@ -85,7 +98,12 @@ def group_relative_clock_vectors(
 
     - 至少在 ``min_close_snapshots`` 个共同维度上，clock 差不大于
       ``max_clock_gap_us``；
-    - 接近次数至少占两只股票共同出现次数的一半。
+    - 接近次数占两只股票共同出现次数的比例不小于 ``min_close_rate``。
+
+    第二条就是共同维度数量不同时的基础归一化。例如 ``a-b`` 在 1000 个共同
+    维度中接近 800 次，接近比例为 0.8；``b-c`` 在 2000 个共同维度中接近
+    1500 次，比例为 0.75。当前 baseline 认为前者关系更强。这个比例还没有
+    使用 Wilson 下界或随机碰撞背景校正，后续可以集中在本函数中替换。
 
     最终以相似图的连通分量作为组。缺失维度不算正证据，也不算负证据；共同
     数据不足的股票会保留为单例。连通分量存在链式误合并风险，所以这只是
@@ -96,31 +114,49 @@ def group_relative_clock_vectors(
         raise ValueError("max_clock_gap_us must be non-negative")
     if min_close_snapshots < 1:
         raise ValueError("min_close_snapshots must be at least 1")
+    if not 0 <= min_close_rate <= 1:
+        raise ValueError("min_close_rate must be between 0 and 1")
 
+    # -------------------- 第 1 步：准备股票关系图和证据容器 --------------------
+    # 图中的一个节点代表一只股票。只要两只股票最终满足下方的相似规则，就在
+    # adjacency 中连接一条无向边。即使某只股票没有任何边，它也会作为单例输出。
     ordered_vectors = vectors.sort_index()
     stock_ids = ordered_vectors.index.astype(str).tolist()
     adjacency: dict[str, set[str]] = {stock_id: set() for stock_id in stock_ids}
 
-    # 对每只股票记录它出现过的维度，用集合交集即可得到两只股票共同出现次数。
+    # active_snapshots：股票 -> 它实际出现过的 snapshot 位置集合。
+    # 两只股票的集合取交集，就得到双方“可以进行比较”的共同维度数量。某只股票
+    # 缺失的 snapshot 不会进入交集，所以既不会被视为接近，也不会被视为不接近。
     active_snapshots: dict[str, set[int]] = {stock_id: set() for stock_id in stock_ids}
+
+    # close_counts：(较小 stock_id, 较大 stock_id) -> clock 足够接近的 snapshot 数。
+    # 股票对按 ID 排序后再作为键，保证 (a, b) 和 (b, a) 不会重复计数。
     close_counts: Counter[tuple[str, str]] = Counter()
 
-    # 不枚举全市场所有股票对。每个向量维度内先按相对 clock 排序，再用滑动
-    # 窗口只生成 clock 差不超过阈值的候选对。通常这远少于 O(股票数²)，同时
-    # 仍然直接使用 n 维向量中每一个 snapshot 的坐标。
+    # -------------------- 第 2 步：逐 snapshot 累计接近次数 --------------------
+    # 这里没有先枚举全市场所有股票对。每个 snapshot 内先删除 <NA> 并按相对
+    # clock 排序，然后用滑动窗口只生成 clock 差不超过阈值的候选对。通常候选
+    # 数量远少于 O(股票数²)，同时仍然使用 n 维向量中的每一个 snapshot 坐标。
     for snapshot_position, time_value in enumerate(ordered_vectors.columns):
+        # dropna 的含义是：本 snapshot 未出现的股票不参与本轮比较。
         observed = ordered_vectors[time_value].dropna().sort_values(kind="stable")
         observed_stocks = observed.index.astype(str).tolist()
         observed_clocks = observed.to_numpy(dtype="int64")
 
+        # 先记录每只股票在当前 snapshot 出现过，后面计算共同维度的分母时使用。
         for stock_id in observed_stocks:
             active_snapshots[stock_id].add(snapshot_position)
 
+        # observed_clocks 已经升序排列。window_start 始终指向仍满足
+        # current_clock - previous_clock <= max_clock_gap_us 的最左记录。
+        # 因此 [window_start, current_position) 中的每只股票都与当前股票接近。
         window_start = 0
         for current_position, current_clock in enumerate(observed_clocks):
             while current_clock - observed_clocks[window_start] > max_clock_gap_us:
                 window_start += 1
 
+            # 每个股票对在一个 snapshot 中至多累计一次。这里累计的是跨 snapshot
+            # 重复出现的近时证据，而不是把一次偶然接近直接当成永久同组关系。
             for previous_position in range(window_start, current_position):
                 pair = tuple(
                     sorted(
@@ -132,20 +168,38 @@ def group_relative_clock_vectors(
                 )
                 close_counts[pair] += 1
 
-    # 一次接近只是弱证据。只有重复接近，并且接近次数至少占共同出现机会的一半，
-    # 才建立相似边；不同组偶尔同时推送通常会被其余共同维度稀释。
+    # -------------------- 第 3 步：归一化证据并决定是否建边 --------------------
+    # 只比较 close_count 不公平：800 次接近可能来自 1000 次机会，也可能来自
+    # 100000 次机会。因此用 common_count 作为分母，得到 close_rate。
+    #
+    # 这里只遍历至少接近过一次的股票对；从未接近的股票对自然不会建立边。
     for (first_stock, second_stock), close_count in sorted(close_counts.items()):
         common_count = len(
             active_snapshots[first_stock] & active_snapshots[second_stock]
         )
-        if close_count < min_close_snapshots or 2 * close_count < common_count:
+
+        # close_count > 0 时 common_count 一定大于 0，因为一次“接近”首先要求两只
+        # 股票在同一个 snapshot 中都出现。缺失维度没有进入这个分母。
+        close_rate = close_count / common_count
+
+        # 两道门槛分别控制：
+        # 1. 绝对证据量：避免 1/1 这种比例很高但样本极少的关系；
+        # 2. 归一化比例：让共同维度数量不同的股票对可以放在同一尺度上比较。
+        # 当前规则仍是简单启发式。以后改成 Wilson 下界、背景碰撞校正或其他
+        # 相似度时，主要替换这一小段判断即可。
+        if close_count < min_close_snapshots or close_rate < min_close_rate:
             continue
 
         adjacency[first_stock].add(second_stock)
         adjacency[second_stock].add(first_stock)
 
-    # 用简单的深度优先遍历寻找连通分量。按 stock_id 稳定遍历和排序，使相同
-    # 输入每次产生相同 group_id；group_id 从 1 开始。
+    # -------------------- 第 4 步：把相似图转换成最终固定分组 --------------------
+    # 用简单的深度优先遍历寻找连通分量：如果 a-b、b-c 都有边，即使 a-c 没有
+    # 直接边，三只股票仍会进入同一个组。这允许利用间接同组证据，但也意味着
+    # 一条错误边可能造成链式误合并，是当前 baseline 的明确限制。
+    #
+    # 按 stock_id 稳定遍历和排序，使相同输入每次产生相同 group_id；group_id
+    # 从 1 开始。
     visited: set[str] = set()
     rows: list[tuple[str, int]] = []
     group_id = 0
@@ -260,6 +314,7 @@ def process_csv(
     *,
     max_clock_gap_us: int = DEFAULT_MAX_CLOCK_GAP_US,
     min_close_snapshots: int = DEFAULT_MIN_CLOSE_SNAPSHOTS,
+    min_close_rate: float = DEFAULT_MIN_CLOSE_RATE,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """读取 CSV，依次构造向量、分组并写出三个结果文件。"""
 
@@ -274,6 +329,7 @@ def process_csv(
         vectors,
         max_clock_gap_us=max_clock_gap_us,
         min_close_snapshots=min_close_snapshots,
+        min_close_rate=min_close_rate,
     )
 
     vectors.reset_index().to_csv(vectors_csv, index=False)
@@ -304,6 +360,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MIN_CLOSE_SNAPSHOTS,
         help="建立相似边所需的最少接近 snapshot 数（默认：%(default)s）",
     )
+    parser.add_argument(
+        "--min-close-rate",
+        type=float,
+        default=DEFAULT_MIN_CLOSE_RATE,
+        help="接近次数占共同 snapshot 数的最小比例（默认：%(default)s）",
+    )
     return parser
 
 
@@ -318,6 +380,7 @@ def main(argv: list[str] | None = None) -> int:
         arguments.plot_png,
         max_clock_gap_us=arguments.max_clock_gap_us,
         min_close_snapshots=arguments.min_close_snapshots,
+        min_close_rate=arguments.min_close_rate,
     )
 
     print(f"snapshot 数：{vectors.shape[1]}")
