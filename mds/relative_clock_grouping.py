@@ -12,7 +12,8 @@
 - ``VECTORS.png``：按推断组排序后的相对 clock 向量热图。
 
 这是一版便于观察向量结构的简单 baseline，不是最终分组算法。默认参数是
-探索性启发式，不是已经确认的业务阈值。
+探索性启发式，不是已经确认的业务阈值。默认使用 ``minimize`` 尽量减少组数；
+也可用 ``--grouping-method rate_greedy`` 按匹配率从高到低贪心合并。
 """
 
 from __future__ import annotations
@@ -32,6 +33,10 @@ DEFAULT_MIN_CLOSE_SNAPSHOTS = 2
 DEFAULT_MIN_CLOSE_RATE = 0.5
 DEFAULT_MAX_EXACT_COMPONENT_STOCKS = 60
 DEFAULT_EXACT_SEARCH_NODE_LIMIT = 200_000
+GROUPING_METHOD_MINIMIZE = "minimize"
+GROUPING_METHOD_RATE_GREEDY = "rate_greedy"
+GROUPING_METHODS = (GROUPING_METHOD_MINIMIZE, GROUPING_METHOD_RATE_GREEDY)
+DEFAULT_GROUPING_METHOD = GROUPING_METHOD_MINIMIZE
 
 
 def build_relative_clock_vectors(data: pd.DataFrame) -> pd.DataFrame:
@@ -328,6 +333,145 @@ def _greedy_conflict_clique_lower_bound(conflict_masks: list[int]) -> int:
     return best_size
 
 
+def greedy_group_by_match_rate(
+    match_counts: pd.DataFrame,
+    match_rates: pd.DataFrame,
+    *,
+    min_close_snapshots: int = DEFAULT_MIN_CLOSE_SNAPSHOTS,
+    min_close_rate: float = DEFAULT_MIN_CLOSE_RATE,
+) -> pd.DataFrame:
+    """按匹配率从高到低贪心合并，同时维持组内全配对约束。
+
+    算法从“每只股票各自一组”开始，只保留同时通过匹配次数和匹配率阈值的
+    股票对，并按以下稳定顺序处理：
+
+    1. 匹配率从高到低；
+    2. 匹配率相同时，匹配次数从高到低；
+    3. 两项都相同时，按两个 ``stock_id`` 排序。
+
+    处理一对股票时，如果它们已经在同一组就跳过；否则尝试合并它们当前所在
+    的两个组。只有两个组之间的每一个交叉股票对都通过阈值，才真正合并。因此
+    输出仍保证组内任意成员两两兼容。
+
+    这种方法优先保留证据最强的股票对，但早期合并不会回退，所以不保证使用
+    最少组数。返回结果会在 ``DataFrame.attrs`` 中报告当前上下界和是否碰巧已
+    由上下界相等证明最优，便于与 minimum clique partition 方法直接比较。
+    """
+
+    compatibility_frame = build_compatibility_matrix(
+        match_counts,
+        match_rates,
+        min_close_snapshots=min_close_snapshots,
+        min_close_rate=min_close_rate,
+    )
+    stock_ids = compatibility_frame.index.tolist()
+    stock_count = len(stock_ids)
+    compatibility = compatibility_frame.to_numpy(dtype=bool)
+    compatibility_masks = _boolean_matrix_to_bit_masks(compatibility)
+
+    ordered_counts = match_counts.copy()
+    ordered_counts.index = ordered_counts.index.astype(str)
+    ordered_counts.columns = ordered_counts.columns.astype(str)
+    ordered_counts = ordered_counts.reindex(index=stock_ids, columns=stock_ids)
+    ordered_rates = match_rates.copy()
+    ordered_rates.index = ordered_rates.index.astype(str)
+    ordered_rates.columns = ordered_rates.columns.astype(str)
+    ordered_rates = ordered_rates.reindex(index=stock_ids, columns=stock_ids)
+    count_values = ordered_counts.to_numpy()
+    rate_values = ordered_rates.to_numpy(dtype="float64")
+
+    candidate_pairs: list[tuple[float, int, str, str, int, int]] = []
+    for first_stock in range(stock_count):
+        for second_stock in range(first_stock + 1, stock_count):
+            if not compatibility[first_stock, second_stock]:
+                continue
+
+            # build_compatibility_matrix 已要求两个方向都通过。排序强度也保守地
+            # 取双向较小值；由本脚本生成的证据矩阵本来就是完全对称的。
+            pair_rate = min(
+                rate_values[first_stock, second_stock],
+                rate_values[second_stock, first_stock],
+            )
+            pair_count = int(
+                min(
+                    count_values[first_stock, second_stock],
+                    count_values[second_stock, first_stock],
+                )
+            )
+            candidate_pairs.append(
+                (
+                    -pair_rate,
+                    -pair_count,
+                    stock_ids[first_stock],
+                    stock_ids[second_stock],
+                    first_stock,
+                    second_stock,
+                )
+            )
+
+    candidate_pairs.sort()
+
+    # group_of 记录每只股票当前所属组；group_masks 用一个整数保存组内成员集合。
+    # bit mask 可以快速检查“另一组的所有成员是否都在某股票的兼容集合里”。
+    group_of = list(range(stock_count))
+    group_masks = {stock: 1 << stock for stock in range(stock_count)}
+
+    for _, _, _, _, first_stock, second_stock in candidate_pairs:
+        first_group = group_of[first_stock]
+        second_group = group_of[second_stock]
+        if first_group == second_group:
+            continue
+
+        first_members = group_masks[first_group]
+        second_members = group_masks[second_group]
+        can_merge = all(
+            compatibility_masks[member] & second_members == second_members
+            for member in _vertices_from_mask(first_members)
+        )
+        if not can_merge:
+            continue
+
+        # 总是保留编号较小的内部组 ID，只用于让过程可复现，不影响最终 group_id。
+        kept_group = min(first_group, second_group)
+        removed_group = max(first_group, second_group)
+        removed_members = group_masks[removed_group]
+        group_masks[kept_group] |= removed_members
+        del group_masks[removed_group]
+        for member in _vertices_from_mask(removed_members):
+            group_of[member] = kept_group
+
+    groups = [
+        [stock_ids[member] for member in _vertices_from_mask(member_mask)]
+        for member_mask in group_masks.values()
+    ]
+    groups = [sorted(group) for group in groups]
+    groups.sort(key=lambda group: group[0])
+    rows = [
+        (stock_id, group_id)
+        for group_id, group in enumerate(groups, start=1)
+        for stock_id in group
+    ]
+
+    # 冲突 clique 给出可靠下界。贪心结果若恰好等于下界，虽然算法本身不是精确
+    # 算法，这一个具体输入上的结果仍可被证明为全局最优。
+    group_count_lower_bound = 0
+    for component in _connected_components(compatibility_masks):
+        local_compatibility = compatibility[np.ix_(component, component)]
+        local_conflicts = ~local_compatibility
+        np.fill_diagonal(local_conflicts, False)
+        group_count_lower_bound += _greedy_conflict_clique_lower_bound(
+            _boolean_matrix_to_bit_masks(local_conflicts)
+        )
+
+    result = pd.DataFrame(rows, columns=["stock_id", "group_id"])
+    result.attrs["grouping_method"] = GROUPING_METHOD_RATE_GREEDY
+    result.attrs["optimal_group_count_proven"] = len(groups) == group_count_lower_bound
+    result.attrs["group_count_lower_bound"] = group_count_lower_bound
+    result.attrs["group_count_upper_bound"] = len(groups)
+    result.attrs["exact_search_nodes"] = 0
+    return result
+
+
 def _search_minimum_coloring(
     conflict_masks: list[int],
     initial_colors: list[int],
@@ -534,6 +678,7 @@ def minimize_compatibility_groups(
         for stock_id in group
     ]
     result = pd.DataFrame(rows, columns=["stock_id", "group_id"])
+    result.attrs["grouping_method"] = GROUPING_METHOD_MINIMIZE
     result.attrs["optimal_group_count_proven"] = all_components_proven_optimal
     result.attrs["group_count_lower_bound"] = total_lower_bound
     result.attrs["group_count_upper_bound"] = len(groups)
@@ -547,24 +692,41 @@ def group_relative_clock_vectors(
     max_clock_gap_us: int = DEFAULT_MAX_CLOCK_GAP_US,
     min_close_snapshots: int = DEFAULT_MIN_CLOSE_SNAPSHOTS,
     min_close_rate: float = DEFAULT_MIN_CLOSE_RATE,
+    grouping_method: str = DEFAULT_GROUPING_METHOD,
     max_exact_component_stocks: int = DEFAULT_MAX_EXACT_COMPONENT_STOCKS,
     exact_search_node_limit: int = DEFAULT_EXACT_SEARCH_NODE_LIMIT,
 ) -> pd.DataFrame:
-    """构造两两证据矩阵，并在全配对约束下尽量减少最终分组数。
+    """构造两两证据矩阵，并使用指定方法生成全配对兼容组。
 
     逻辑明确拆成三步，后续可以分别替换：
 
     1. 从相对 ``clock`` 向量计算匹配数和匹配率；
     2. 用两个阈值生成兼容矩阵；
-    3. 将兼容矩阵做最少 clique partition。
+    3. 选择 ``minimize`` 做最少 clique partition，或者选择 ``rate_greedy``
+       按匹配率从高到低贪心合并。
 
-    精确性和规模限制详见 :func:`minimize_compatibility_groups`。
+    两种方法都保证组内任意股票对通过次数和比例阈值；只有 ``minimize`` 会执行
+    精确搜索，``rate_greedy`` 不保证最少组数。
     """
+
+    if grouping_method not in GROUPING_METHODS:
+        raise ValueError(
+            f"grouping_method must be one of {', '.join(GROUPING_METHODS)}"
+        )
 
     match_counts, match_rates = calculate_pairwise_match_matrices(
         vectors,
         max_clock_gap_us=max_clock_gap_us,
     )
+
+    if grouping_method == GROUPING_METHOD_RATE_GREEDY:
+        return greedy_group_by_match_rate(
+            match_counts,
+            match_rates,
+            min_close_snapshots=min_close_snapshots,
+            min_close_rate=min_close_rate,
+        )
+
     compatibility = build_compatibility_matrix(
         match_counts,
         match_rates,
@@ -666,6 +828,7 @@ def process_csv(
     max_clock_gap_us: int = DEFAULT_MAX_CLOCK_GAP_US,
     min_close_snapshots: int = DEFAULT_MIN_CLOSE_SNAPSHOTS,
     min_close_rate: float = DEFAULT_MIN_CLOSE_RATE,
+    grouping_method: str = DEFAULT_GROUPING_METHOD,
     max_exact_component_stocks: int = DEFAULT_MAX_EXACT_COMPONENT_STOCKS,
     exact_search_node_limit: int = DEFAULT_EXACT_SEARCH_NODE_LIMIT,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -683,6 +846,7 @@ def process_csv(
         max_clock_gap_us=max_clock_gap_us,
         min_close_snapshots=min_close_snapshots,
         min_close_rate=min_close_rate,
+        grouping_method=grouping_method,
         max_exact_component_stocks=max_exact_component_stocks,
         exact_search_node_limit=exact_search_node_limit,
     )
@@ -722,16 +886,25 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="接近次数占共同 snapshot 数的最小比例（默认：%(default)s）",
     )
     parser.add_argument(
+        "--grouping-method",
+        choices=GROUPING_METHODS,
+        default=DEFAULT_GROUPING_METHOD,
+        help=(
+            "分组方法：minimize 尽量减少组数；rate_greedy 按匹配率降序贪心合并"
+            "（默认：%(default)s）"
+        ),
+    )
+    parser.add_argument(
         "--max-exact-component-stocks",
         type=int,
         default=DEFAULT_MAX_EXACT_COMPONENT_STOCKS,
-        help="允许精确搜索的最大兼容连通分量股票数（默认：%(default)s）",
+        help="minimize 方法允许精确搜索的最大连通分量股票数（默认：%(default)s）",
     )
     parser.add_argument(
         "--exact-search-node-limit",
         type=int,
         default=DEFAULT_EXACT_SEARCH_NODE_LIMIT,
-        help="每次精确搜索的节点上限；0 表示不限制（默认：%(default)s）",
+        help="minimize 方法每次精确搜索的节点上限；0 表示不限制（默认：%(default)s）",
     )
     return parser
 
@@ -748,6 +921,7 @@ def main(argv: list[str] | None = None) -> int:
         max_clock_gap_us=arguments.max_clock_gap_us,
         min_close_snapshots=arguments.min_close_snapshots,
         min_close_rate=arguments.min_close_rate,
+        grouping_method=arguments.grouping_method,
         max_exact_component_stocks=arguments.max_exact_component_stocks,
         exact_search_node_limit=arguments.exact_search_node_limit,
     )
@@ -755,6 +929,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"snapshot 数：{vectors.shape[1]}")
     print(f"股票数：{vectors.shape[0]}")
     print(f"最终分组数：{groups['group_id'].nunique()}")
+    if groups.attrs["grouping_method"] == GROUPING_METHOD_RATE_GREEDY:
+        print("分组方法：按匹配率降序贪心合并")
+    else:
+        print("分组方法：minimum clique partition")
     if groups.attrs["optimal_group_count_proven"]:
         print("最少分组证明：已证明当前分组数为全局最少")
     else:

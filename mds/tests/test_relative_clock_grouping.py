@@ -12,6 +12,7 @@ from mds.relative_clock_grouping import (
     build_compatibility_matrix,
     build_relative_clock_vectors,
     calculate_pairwise_match_matrices,
+    greedy_group_by_match_rate,
     group_relative_clock_vectors,
     main,
     minimize_compatibility_groups,
@@ -198,21 +199,22 @@ class RelativeClockVectorTest(unittest.TestCase):
 
 
 class MinimumGroupPartitionTest(unittest.TestCase):
-    def test_minimization_beats_stock_id_first_fit_counterexample(self) -> None:
+    def test_minimization_and_rate_greedy_differ_on_counterexample(self) -> None:
         # 通过阈值的兼容边只有 a-c、a-d、b-c。
-        # 旧 stock_id first-fit 会依次得到 {a,c}、{b}、{d}，一共 3 组；
-        # 但最优划分是 {a,d}、{b,c}，只需要 2 组。
+        # a-c 匹配率最高，所以 rate_greedy 会先固定 {a,c}，最终需要 3 组；
+        # minimum clique partition 则找到 {a,d}、{b,c}，只需要 2 组。
         stock_ids = ["a", "b", "c", "d"]
         match_counts = pd.DataFrame(0, index=stock_ids, columns=stock_ids)
         match_rates = pd.DataFrame(0.0, index=stock_ids, columns=stock_ids)
         for stock_id in stock_ids:
             match_counts.loc[stock_id, stock_id] = 3
             match_rates.loc[stock_id, stock_id] = 1.0
-        for first_stock, second_stock in [("a", "c"), ("a", "d"), ("b", "c")]:
+        pair_rates = {("a", "c"): 0.99, ("a", "d"): 0.8, ("b", "c"): 0.8}
+        for (first_stock, second_stock), match_rate in pair_rates.items():
             match_counts.loc[first_stock, second_stock] = 3
             match_counts.loc[second_stock, first_stock] = 3
-            match_rates.loc[first_stock, second_stock] = 1.0
-            match_rates.loc[second_stock, first_stock] = 1.0
+            match_rates.loc[first_stock, second_stock] = match_rate
+            match_rates.loc[second_stock, first_stock] = match_rate
 
         compatibility = build_compatibility_matrix(
             match_counts,
@@ -221,6 +223,12 @@ class MinimumGroupPartitionTest(unittest.TestCase):
             min_close_rate=0.5,
         )
         groups = minimize_compatibility_groups(compatibility)
+        greedy_groups = greedy_group_by_match_rate(
+            match_counts,
+            match_rates,
+            min_close_snapshots=2,
+            min_close_rate=0.5,
+        )
 
         grouped_stocks = {
             frozenset(group["stock_id"])
@@ -230,6 +238,18 @@ class MinimumGroupPartitionTest(unittest.TestCase):
         self.assertTrue(groups.attrs["optimal_group_count_proven"])
         self.assertEqual(groups.attrs["group_count_lower_bound"], 2)
         self.assertEqual(groups.attrs["group_count_upper_bound"], 2)
+
+        greedy_grouped_stocks = {
+            frozenset(group["stock_id"])
+            for _, group in greedy_groups.groupby("group_id", sort=True)
+        }
+        self.assertEqual(
+            greedy_grouped_stocks,
+            {frozenset({"a", "c"}), frozenset({"b"}), frozenset({"d"})},
+        )
+        self.assertFalse(greedy_groups.attrs["optimal_group_count_proven"])
+        self.assertEqual(greedy_groups.attrs["group_count_lower_bound"], 2)
+        self.assertEqual(greedy_groups.attrs["group_count_upper_bound"], 3)
 
     def test_exact_search_and_best_effort_status_are_distinguished(self) -> None:
         # 不兼容图是长度为 5 的奇环：最大冲突 clique 只有 2 个点，但至少需要
@@ -307,6 +327,32 @@ class RelativeClockVisualizationTest(unittest.TestCase):
             self.assertIn("snapshot 数：3", output.getvalue())
             self.assertIn("最终分组数：3", output.getvalue())
             self.assertIn("已证明当前分组数为全局最少", output.getvalue())
+
+    def test_cli_can_select_rate_greedy_grouping(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            input_csv = directory / "market.csv"
+            make_market_data().to_csv(input_csv, index=False)
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                exit_code = main(
+                    [
+                        str(input_csv),
+                        str(directory / "vectors.csv"),
+                        str(directory / "groups.csv"),
+                        str(directory / "vectors.png"),
+                        "--max-clock-gap-us",
+                        "100",
+                        "--min-close-snapshots",
+                        "2",
+                        "--grouping-method",
+                        "rate_greedy",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn("分组方法：按匹配率降序贪心合并", output.getvalue())
 
     def test_plot_function_is_callable_without_grouping_function(self) -> None:
         vectors = build_relative_clock_vectors(make_market_data())
