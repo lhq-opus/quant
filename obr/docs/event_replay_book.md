@@ -8,8 +8,8 @@
 - 14:57 至 15:00：收盘集合竞价。
 
 时段和成交规则来自[《深圳证券交易所交易规则（2026年修订）》](https://docs.static.szse.cn/www/lawrules/rule/trade/current/W020260424690713155663.pdf)
-第 2.3.2、3.4.1 至 3.4.4 条。当前脚本是可读的聚合价位 demo，不恢复订单 ID 或
-同价订单配对，也不宣称替代交易所成交数据。
+第 2.3.2、3.4.1 至 3.4.4 条。当前脚本是可读的聚合价位 demo，保留原订单引用到
+实际挂单价格的小索引以处理撤单，不恢复同价订单 FIFO 或具体成交配对。
 
 ## 运行方式
 
@@ -27,21 +27,27 @@ python3 ./quant/obr/script/replay_event_order_book.py \
 固定表头为：
 
 ```text
-caa,TransactionTime,Side,OrderType,Price,OrderQty,ExecType,TradeQty,TradePrice
+caa,TransactionTime,Side,OrderType,Price,OrderQty,ExecType,TradeQty,TradePrice,ChannelNo,OrderApplSeqNum,AuctionPrice
 ```
 
-- order 行使用 `caa,TransactionTime,Side,OrderType,Price,OrderQty`；
-- 撤单行使用 `caa,TransactionTime,Side,ExecType,TradeQty,TradePrice`；`Side` 和
-  `TradePrice` 由上游从被撤原订单补全；
+- order 行使用 `caa,TransactionTime,Side,OrderType,Price,OrderQty`，并在
+  `ChannelNo,OrderApplSeqNum` 保留自己的频道和 ASN；
+- 撤单行使用 `caa,TransactionTime,Side,ExecType,TradeQty,TradePrice`，并在
+  `ChannelNo,OrderApplSeqNum` 保留被撤原订单的频道和 ASN；`Side` 和 `TradePrice`
+  由上游从原订单补全。撤单实际扣减价格由 replay 的价格索引确定；
+- `AuctionPrice` 来自同一开盘或收盘集合阶段的实际成交 trade，供最终选价并列时使用；
+  连续竞价阶段或集合阶段无实际成交时为空；
 - 必要枚举是 `Side=1/2`、`OrderType=1/2/U`、`ExecType=4`；
 - `TransactionTime` 不足 9 位时左补零，按 `HHMMSSmmm` 理解；阶段判断只读取
   `HHMMSS`。例如 `91500790` 属于 09:15:00，`100407190` 属于 10:04:07；
-- 事件仍按 `caa` 稳定排序，`TransactionTime` 只负责判断交易阶段。
+- 事件仍按 `caa` 稳定排序，`TransactionTime` 只负责判断交易阶段。用户已明确假定
+  不存在 CAA 事件顺序问题，本轮保留这一约定。
 
-`TransactionTime` 由上游按本次约定直接加入 event；replay 不从 `caa` 或原始
-`TransactTime` 猜测、转换这个字段。
+`build_cancel_event_csv.py` 直接读取原始 `TransactTime`，按已确认的 `HHMMSSmmm`
+数字格式左补九位后写入 `TransactionTime`。上游输出和两版 replay 输入完全一致，
+无需手工加列；replay 不从 `caa` 推测交易时间。
 
-本版本按用户约定假设输入是单交易日、完整且合法的交易所事件，因此不增加时间格式、
+本版本按用户约定假设输入是单证券、单交易日、完整且合法的交易所事件，因此不增加时间格式、
 交易时段、枚举和数量的通用校验框架。
 
 ## 三种 OrderType 怎样处理
@@ -69,33 +75,48 @@ caa,TransactionTime,Side,OrderType,Price,OrderQty,ExecType,TradeQty,TradePrice
 识别所有市价申报方式。后续完整实现应保留申报细分字段，或者按逐笔成交消息中的订单
 引用更新状态。
 
-如果类型 `1/U` 的剩余订单后来被撤销，上游必须把它实际挂入的价格写到撤单行
-`TradePrice`。当前聚合 event 已经删除订单 ID，无法在撤单发生时再从原始零价格恢复
-那一张订单。
+每条 order 都用 `(ChannelNo, OrderApplSeqNum)` 记录处理时确定的实际挂单价格。
+例如 `U` 买单原始 `Price=0`，到达时买一是 10 元，那么记录的价格就是 10 元。之后
+该单撤销 30 股时，按原订单引用查到 10 元，再从买盘该档扣除 30 股；不使用撤单行
+保留的原始零价格查盘口。
+
+类型 `1/U` 因相应盘口为空而自动撤销时，记录为没有实际挂单价格。后续对应的
+`ExecType=4` 不再扣减盘口，但仍输出该撤单对应的快照。这个索引只定位价格档，不维护
+每张订单的剩余量，也不参与成交双方配对。
 
 ## 集合竞价阶段
 
 集合竞价不是逐笔撮合。每条 order 到达时只累加到自己的买盘或卖盘价格档，撤单则按
-已补全的 `Side` 选择买盘或卖盘，再从 `TradePrice` 对应档位扣量。阶段结束后才集中
+已补全的 `Side` 选择买盘或卖盘，再按原订单引用找到实际价格档扣量。阶段结束后才集中
 撮合一次。同一价格可能同时存在买卖申报，因此不能根据价格出现在哪一侧推断撤单方向。
 
 成交价按以下顺序选择：
 
-1. 对买卖申报价格的并集逐价计算可成交量：
+1. 对买卖申报价格的并集逐价计算可成交量；若存在 `AuctionPrice`，也将它加入候选，
+   因为实际成交价不一定恰好有原始挂单。每个候选的可成交量为：
    `min(该价及以上买量, 该价及以下卖量)`；
 2. 选择可实现最大成交量，并能让严格高于该价的买单、严格低于该价的卖单全部成交，
    且候选价上的买方或卖方至少有一方全部成交的价格；
-3. 多个价格仍符合时，选择“严格高价买量”和“严格低价卖量”之差最小的价格；
-4. 本 demo 约定执行完前三步后只剩一个候选价，开盘和收盘都直接使用它。
+3. 多个价格仍符合时，选择 `abs(buy_quantity - sell_quantity)` 最小的价格。其中
+   `buy_quantity` 包含该价及以上买量，`sell_quantity` 包含该价及以下卖量，不能排除
+   候选价本身的订单；
+4. 若最终只有一个候选，使用该候选；若仍有多个，使用上游提供的实际 `AuctionPrice`。
 
 深交所完整规则还规定：第三步后若仍有多个候选价，开盘要选择最接近前收盘价的价格，
-盘中或收盘要选择最接近最近成交价的价格。本 demo 根据当前学习目标有意省略最终并列
-分支，因此不需要 `reference_price` 或 `--previous-close`。如果输入确实出现最终并列，
-应在后续完整版中恢复该规则，而不是在 demo 中猜测价格。
+盘中或收盘要选择最接近最近成交价的价格。用户已选择让 demo 利用 trade 中已经发生的
+集合竞价成交价处理最终并列，因此不需要额外的 `reference_price` 或 `--previous-close`。
+最终并列时，输入必须包含对应阶段的真实 `AuctionPrice`，不能默认取最高价或最低价。
+
+例如买 `10.02×100`、卖 `10.00×100 + 10.01×100`，候选 10.00 的买卖量均为 100，
+数量差为 0；候选 10.01 的买量为 100、卖量为 200，数量差为 100，所以选择 10.00。
+这里的数量差需要包含候选价，和第二步“严格价优订单全部成交”的判断是两件事。
 
 选出价格后，买方从最高价向下扣量，卖方从最低价向上扣量。双方扣除相同的最大成交量，
 并且全部按唯一集合竞价价格计算成交额。没有成交的委托继续留在盘口，自动参加后续
 交易阶段。
+
+`ExecType=F` 不作为额外成交事件重放：实际 trade 仅给出集合成交价，数量扣减和成交额
+仍由本次统一撮合计算，避免同一成交既被聚合撮合扣一次、又被真实 trade 扣一次。
 
 深交所在 9:20 至 9:25 和 14:57 至 15:00 不接受竞价撤单。这里重放的是已经被交易所
 接受的合法事件，因此脚本不再重复拒绝这些时段中本就不应出现的撤单。
@@ -111,7 +132,7 @@ caa,TransactionTime,Side,OrderType,Price,OrderQty,ExecType,TradeQty,TradePrice
 类型 `2` 直接把 CSV `Price` 传给这段逻辑；类型 `1` 先取对手方最优价，再把这个价格
 传给同一段逻辑；类型 `U` 不需要撮合，直接在本方最优档增加数量。
 
-这对应深交所规则第 3.4.4 条。内部仍只有“价格 → 聚合数量”，所以能重建价格档、
+这对应深交所规则第 3.4.4 条。成交部分仍只操作“价格 → 聚合数量”，所以能重建价格档、
 成交总量和成交额，但不能推导同价位内具体哪两张订单成交，也不能推导成交笔数。
 
 ## 快照与统计

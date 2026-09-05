@@ -64,23 +64,43 @@ cmake --build /tmp/obr-build --parallel
 用法: /tmp/obr-build/obr_replay_event --event <event.csv> [--output <book.csv>]
 ```
 
-## 4. 准备 event.csv
+## 4. 从 order/trade 生成 event.csv
 
-输入必须是当前约定的 9 列：
+先安装上游脚本需要的 pandas，然后从原始 CSV 生成 event：
+
+```bash
+python3 -m pip install -r ./quant/obr/requirements.txt
+python3 ./quant/obr/script/build_cancel_event_csv.py \
+  --order /绝对路径/order.csv \
+  --trade /绝对路径/trade.csv \
+  --output ./event.csv
+```
+
+已有 event 文件需要重新生成时，给上游脚本加 `--overwrite`。这一覆盖保护是 Python
+脚本的选项，与下一节 C++ replay 的命令行选项不同。
+
+上游输出与两版 replay 输入统一为固定 12 列，无需手工增加交易时间或其他字段：
 
 ```text
-caa,TransactionTime,Side,OrderType,Price,OrderQty,ExecType,TradeQty,TradePrice
+caa,TransactionTime,Side,OrderType,Price,OrderQty,ExecType,TradeQty,TradePrice,ChannelNo,OrderApplSeqNum,AuctionPrice
 ```
 
 - order 行填写 `caa,TransactionTime,Side,OrderType,Price,OrderQty`；
 - 撤单行填写 `caa,TransactionTime,Side,ExecType,TradeQty,TradePrice`；
+- 两类事件都填写 `ChannelNo,OrderApplSeqNum`：order 是自己的频道与 ASN，cancel 是
+  被撤原订单的频道与 ASN。撤单方向来自原订单，实际扣减价格由 replay 的索引取得；
 - `OrderType=2` 使用 `Price`；`1` 按本 demo 解释为对手方最优、剩余转限价；`U` 加入
   本方最优档，后二者不读取 order 行的 `Price`；
 - `ExecType=4` 表示撤单；
-- `TransactionTime` 用于区分开盘集合、连续和收盘集合竞价；
-- 程序会按 `caa` 稳定排序，不要求 CSV 当前已经排好顺序。
+- `TransactionTime` 用于区分开盘集合、连续和收盘集合竞价。原始 `TransactTime`
+  固定为 `HHMMSSmmm` 数字，上游左补九位，例如 `91500790` 变为 `091500790`；
+- `AuctionPrice` 从该开盘或收盘集合阶段实际 `ExecType=F` trade 取得，用于最终候选
+  并列时确定成交价；连续阶段或集合阶段无成交时为空；
+- 程序会按 `caa` 稳定排序，不要求 CSV 当前已经排好顺序。demo 假定不存在 CAA
+  事件顺序问题，继续采用原有排序规则。
 
-第一版假设 CSV 内容合法，并且字段中没有需要引号保护的逗号。
+第一版假设输入为单证券、单交易日的完整合法数据，并且 event 字段中没有需要引号保护
+的逗号。原始 F trade 不生成额外重放事件，因此不会和推导成交重复扣量。
 
 注意：深交所正式申报要用额外字段区分 `OrderType=1` 的多种市价子类型，而当前
 `event.csv` 不含这些字段。这里选择“对手方最优、剩余转限价”只是教学 demo 的输入
@@ -153,8 +173,9 @@ book.csv 总行数 = event.csv 数据行数 + 1 行表头
 simple reconstruction validation passed
 ```
 
-这个验证覆盖合法输入下的开盘集合竞价、连续多档成交、撤单、收盘集合竞价、剩余数量
-入簿以及累计成交量和成交额；它不是畸形输入测试框架。
+这个验证覆盖合法输入下的开盘集合竞价、连续多档成交、动态挂价后的撤单、同价双边
+撤单、空盘口自动撤销、收盘集合竞价、数量差筛选和真实成交价并列处理、剩余数量入簿
+以及累计成交量和成交额；它不是畸形输入测试框架。
 
 ## 8. 修改代码后重新编译
 
@@ -198,7 +219,10 @@ ls -l ./event.csv
 
 先确认输出父目录存在且当前用户有写权限。第一版不会自动创建目录。
 
-### 集合竞价唯一候选价断言失败
+### 集合竞价有多个最终候选价
 
-当前 demo 不使用 reference price，约定集合竞价规则筛选后只有一个候选价。如果输入
-出现最终并列，需要在后续版本补充正式并列规则，而不是在第一版中随意选择高价或低价。
+当前 demo 使用原始 trade 的实际成交价处理最终并列。应把完整的原始 trade 交给上游，
+保留对应开盘或收盘集合阶段的 `ExecType=F` 行，让它生成 `AuctionPrice`。不需要另外
+传入前收盘价，也不要手工挑选最高或最低候选价；实际价可以没有对应的原始挂单。
+
+上游只从 F 行取得价格，不把 F 行加入 event，因此 book 行数仍然只对应 order 和撤单。

@@ -1,357 +1,141 @@
 #!/usr/bin/env python3
-"""由 order 和撤单 trade 生成 event.csv。
+"""用固定结构的深交所 order/trade 生成价格档重放所需的 event.csv。
 
-撤单行本身没有完整的订单方向和价格，因此脚本先找到它引用的原订单，再把原订单的
-Side 和 Price 写入撤单事件，最后按到达时间合并两类事件。
+order 和撤单各生成一条事件；真实成交只提供集合竞价成交价，不生成扣量事件。
+输入约定为单证券、单交易日的完整合法数据，不做列名猜测或其他格式兼容。
 """
 
 import argparse
-import os
-import sys
-import tempfile
 from pathlib import Path
 
-try:
-    import pandas as pd
-except ImportError:
-    print(
-        "error: pandas is required; install quant/obr/requirements.txt",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
+import pandas as pd
 
-
-TIME_COLUMN_CANDIDATES = ("clockAtArrivalTime", "clockAtArrival", "caa")
-
-ORDER_COLUMNS = ["Side", "OrderType", "Price", "OrderQty"]
-TRADE_COLUMNS = ["ExecType", "TradeQty", "TradePrice"]
-EVENT_COLUMNS = ["caa"] + ORDER_COLUMNS + TRADE_COLUMNS
-
-
-class EventCsvError(Exception):
-    """An expected input-contract error shown without a Python traceback."""
+EVENT_COLUMNS = [
+    "caa",
+    "TransactionTime",
+    "Side",
+    "OrderType",
+    "Price",
+    "OrderQty",
+    "ExecType",
+    "TradeQty",
+    "TradePrice",
+    "ChannelNo",
+    "OrderApplSeqNum",
+    "AuctionPrice",
+]
 
 
 def parse_args():
+    """每个脚本可独立运行，只需要指定输入和输出路径。"""
     parser = argparse.ArgumentParser(
-        description=(
-            "Keep orders and ExecType=4 trades, fill cancellation TradePrice from "
-            "the referenced order, sort by arrival time, and write event.csv."
-        )
+        description="合并 order 和撤单 trade，补全原订单引用及集合竞价成交价。"
     )
-    parser.add_argument("--order", required=True, type=Path, help="Input order.csv")
-    parser.add_argument("--trade", required=True, type=Path, help="Input trade.csv")
+    parser.add_argument("--order", required=True, type=Path, help="输入 order.csv")
+    parser.add_argument("--trade", required=True, type=Path, help="输入 trade.csv")
     parser.add_argument(
         "--output",
         type=Path,
         default=Path("event.csv"),
-        help="Output CSV path (default: ./event.csv)",
+        help="输出路径，默认 event.csv",
     )
     parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Replace an existing output, but never either input file",
+        "--overwrite", action="store_true", help="允许覆盖已有输出，但不能覆盖输入文件"
     )
     return parser.parse_args()
 
 
-def validate_header(header, path):
-    if not header:
-        raise EventCsvError("%s: CSV header is empty" % path)
-    if any(column == "" for column in header):
-        raise EventCsvError("%s: CSV header contains an empty column name" % path)
-
-    seen = set()
-    duplicates = []
-    for column in header:
-        if column in seen and column not in duplicates:
-            duplicates.append(column)
-        seen.add(column)
-    if duplicates:
-        raise EventCsvError(
-            "%s: duplicate CSV column name(s): %s" % (path, ", ".join(duplicates))
-        )
-
-
 def read_csv_as_strings(path):
-    """Read every field as text and retain strict header/row validation."""
-    try:
-        # Reading the header as row zero keeps duplicate names visible to us.
-        raw_frame = pd.read_csv(
-            path,
-            header=None,
-            dtype=str,
-            keep_default_na=False,
-            na_filter=False,
-            encoding="utf-8-sig",
-            engine="python",
-            skip_blank_lines=False,
-        )
-    except pd.errors.EmptyDataError:
-        raise EventCsvError("%s: CSV file is empty" % path)
-    except pd.errors.ParserError as error:
-        raise EventCsvError("%s: malformed CSV data: %s" % (path, error))
-    except OSError as error:
-        raise EventCsvError("cannot open %s: %s" % (path, error))
-
-    header = ["" if pd.isna(value) else str(value) for value in raw_frame.iloc[0]]
-    validate_header(header, path)
-
-    frame = raw_frame.iloc[1:].reset_index(drop=True)
-    missing_rows = frame.isna().any(axis=1)
-    if missing_rows.any():
-        row_index = missing_rows[missing_rows].index[0]
-        actual_columns = int(frame.loc[row_index].notna().sum())
-        raise EventCsvError(
-            "%s:%d: expected %d columns, found %d"
-            % (path, row_index + 2, len(header), actual_columns)
-        )
-
-    frame.columns = header
-    return frame
-
-
-def require_columns(frame, required_columns, path):
-    missing = [column for column in required_columns if column not in frame.columns]
-    if missing:
-        raise EventCsvError(
-            "%s: missing required column(s): %s" % (path, ", ".join(missing))
-        )
-
-
-def find_time_column(frame, path):
-    for column in TIME_COLUMN_CANDIDATES:
-        if column in frame.columns:
-            return column
-    raise EventCsvError(
-        "%s: no arrival-time column found; tried %s"
-        % (path, ", ".join(TIME_COLUMN_CANDIDATES))
+    """所有列按字符串读取，保留证券代码、时间前导零和空字段。"""
+    return pd.read_csv(
+        path, dtype=str, keep_default_na=False, na_filter=False, encoding="utf-8-sig"
     )
 
 
-def parse_integer(raw_value, field, path, line_number, minimum):
-    try:
-        value = int(raw_value)
-    except ValueError:
-        raise EventCsvError(
-            "%s:%d column %s: invalid integer %r"
-            % (path, line_number, field, raw_value)
-        )
-    if value < minimum:
-        raise EventCsvError(
-            "%s:%d column %s: value must be at least %d"
-            % (path, line_number, field, minimum)
-        )
-    return value
-
-
-def require_non_empty(raw_value, field, path, line_number):
-    if raw_value == "":
-        raise EventCsvError(
-            "%s:%d column %s: value is empty" % (path, line_number, field)
-        )
-
-
-def build_order_index(order_frame, order_path):
-    """建立“频道和 ASN -> 原订单价格、方向、行号”的索引。"""
-    orders = {}
-    fields = ["ChannelNo", "ApplSeqNum"] + ORDER_COLUMNS
-    for line_number, values in enumerate(
-        order_frame[fields].itertuples(index=False, name=None), start=2
+def fill_cancel_order_fields(order_frame, trade_frame):
+    """按频道和原订单 ASN 查回撤单方向、原始价格和订单引用。"""
+    order_index = {}
+    fields = ["ChannelNo", "ApplSeqNum", "Price", "Side"]
+    for channel, asn, price, side in order_frame[fields].itertuples(
+        index=False, name=None
     ):
-        raw_channel, raw_asn, side, order_type, price, order_qty = values
-        channel = parse_integer(raw_channel, "ChannelNo", order_path, line_number, 1)
-        asn = parse_integer(raw_asn, "ApplSeqNum", order_path, line_number, 1)
-        for field, raw_value in (
-            ("Side", side),
-            ("OrderType", order_type),
-            ("Price", price),
-            ("OrderQty", order_qty),
-        ):
-            require_non_empty(raw_value, field, order_path, line_number)
+        order_index[(int(channel), int(asn))] = (price, side)
 
-        key = (channel, asn)
-        if key in orders:
-            previous_line = orders[key][2]
-            raise EventCsvError(
-                "%s:%d: duplicate order key ChannelNo=%d, ApplSeqNum=%d; "
-                "first seen on line %d"
-                % (order_path, line_number, channel, asn, previous_line)
-            )
-        # 撤单事件既需要原订单价格，也需要原订单方向。行号只用于上面的重复键诊断。
-        orders[key] = (price, side, line_number)
-    return orders
-
-
-def fill_cancel_order_fields(trade_frame, order_index, trade_path):
-    """保留撤单，并用被撤原订单补全 TradePrice 和 Side。"""
-    cancel_frame = trade_frame.loc[trade_frame["ExecType"] == "4"].copy()
-    lookup_fields = ["ChannelNo", "BidApplSeqNum", "OfferApplSeqNum"]
-    resolved_prices = []
-    resolved_sides = []
-
-    for row_index, values in cancel_frame[lookup_fields].iterrows():
-        line_number = int(row_index) + 2
-        require_non_empty(
-            cancel_frame.loc[row_index, "TradeQty"],
-            "TradeQty",
-            trade_path,
-            line_number,
-        )
-        channel = parse_integer(
-            values["ChannelNo"], "ChannelNo", trade_path, line_number, 1
-        )
-        bid_asn = parse_integer(
-            values["BidApplSeqNum"],
-            "BidApplSeqNum",
-            trade_path,
-            line_number,
-            0,
-        )
-        offer_asn = parse_integer(
-            values["OfferApplSeqNum"],
-            "OfferApplSeqNum",
-            trade_path,
-            line_number,
-            0,
-        )
-
-        # 撤单只引用买方或卖方中的一张原订单，0 表示这一侧没有订单引用。
-        if (bid_asn == 0) == (offer_asn == 0):
-            raise EventCsvError(
-                "%s:%d: ExecType=4 requires exactly one non-zero order reference"
-                % (trade_path, line_number)
-            )
-
-        referenced_asn = bid_asn if bid_asn != 0 else offer_asn
-        key = (channel, referenced_asn)
-        if key not in order_index:
-            raise EventCsvError(
-                "%s:%d: referenced order not found: ChannelNo=%d, ApplSeqNum=%d"
-                % (trade_path, line_number, channel, referenced_asn)
-            )
-        # 价格用于定位聚合档位，方向用于在集合竞价的交叉盘口中选择正确一侧。
-        order_price, order_side, _ = order_index[key]
-        resolved_prices.append(order_price)
-        resolved_sides.append(order_side)
-
-    cancel_frame["TradePrice"] = resolved_prices
-    cancel_frame["Side"] = resolved_sides
-    return cancel_frame
-
-
-def parse_arrival_times(values):
-    if (values == "").any():
-        row_index = values[values == ""].index[0]
-        raise EventCsvError("event row %d: caa is empty" % (int(row_index) + 2))
-    try:
-        return pd.to_datetime(values, format="ISO8601", errors="raise", utc=True)
-    except (TypeError, ValueError, OverflowError) as error:
-        raise EventCsvError("cannot parse caa as ISO 8601 timestamp: %s" % error)
-
-
-def build_events(order_frame, cancel_frame, order_time_column, trade_time_column):
-    order_events = order_frame[[order_time_column] + ORDER_COLUMNS].copy()
-    order_events = order_events.rename(columns={order_time_column: "caa"})
-
-    # Side 不再只属于 order。撤单必须携带被撤原订单的方向，重放时才能在买卖同价的
-    # 集合竞价盘口中扣减正确的一侧。
-    trade_events = cancel_frame[[trade_time_column, "Side"] + TRADE_COLUMNS].copy()
-    trade_events = trade_events.rename(columns={trade_time_column: "caa"})
-
-    # 两类事件各自不用的字段补为空字符串，并统一成固定 event.csv 列顺序。
-    order_events = order_events.reindex(columns=EVENT_COLUMNS, fill_value="")
-    trade_events = trade_events.reindex(columns=EVENT_COLUMNS, fill_value="")
-    events = pd.concat([order_events, trade_events], ignore_index=True, sort=False)
-
-    sort_times = parse_arrival_times(events["caa"])
-    events["__sort_time"] = sort_times
-    events = events.sort_values("__sort_time", kind="stable")
-    return events.drop(columns="__sort_time").reset_index(drop=True)
-
-
-def validate_output_path(order_path, trade_path, output_path, overwrite):
-    resolved_output = output_path.resolve()
-    if (
-        resolved_output == order_path.resolve()
-        or resolved_output == trade_path.resolve()
+    # 合法的深市撤单只有一侧引用非零；不要把 trade 自己的 ASN 当成被撤订单 ASN。
+    cancels = trade_frame.loc[trade_frame["ExecType"] == "4"].copy()
+    prices, sides, order_asns = [], [], []
+    fields = ["ChannelNo", "BidApplSeqNum", "OfferApplSeqNum"]
+    for channel, bid_asn, offer_asn in cancels[fields].itertuples(
+        index=False, name=None
     ):
-        raise EventCsvError(
-            "output path would overwrite an input file: %s" % output_path
-        )
-    if output_path.exists() and not overwrite:
-        raise EventCsvError(
-            "output already exists: %s (use --overwrite to replace it)" % output_path
-        )
+        order_asn = bid_asn if int(bid_asn) != 0 else offer_asn
+        price, side = order_index[(int(channel), int(order_asn))]
+        prices.append(price)
+        sides.append(side)
+        order_asns.append(order_asn)
+
+    # TradePrice 保留原始申报价，仅供查看。1/U 的原始 Price 可能是 0，真实挂单价
+    # 必须由重放器在订单到达时计算并记住；撤单靠订单引用查该价格，不靠本列定位。
+    cancels["TradePrice"] = prices
+    cancels["Side"] = sides
+    cancels["OrderApplSeqNum"] = order_asns
+    return cancels
 
 
-def write_csv_atomically(path, frame):
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            newline="",
-            dir=str(path.parent),
-            prefix=".%s." % path.name,
-            suffix=".tmp",
-            delete=False,
-        ) as output_file:
-            temporary_path = Path(output_file.name)
-            frame.to_csv(output_file, index=False, lineterminator="\n")
-            output_file.flush()
-            os.fsync(output_file.fileno())
-        os.replace(str(temporary_path), str(path))
-    except OSError as error:
-        if temporary_path is not None and temporary_path.exists():
-            temporary_path.unlink()
-        raise EventCsvError("cannot write %s: %s" % (path, error))
+def build_events(order_frame, trade_frame):
+    """生成固定十二列；保持 order/cancel 与输出事件的一一对应。"""
+    cancels = fill_cancel_order_fields(order_frame, trade_frame)
+    rename = {"clockAtArrival": "caa", "TransactTime": "TransactionTime"}
+    orders = order_frame.rename(columns={**rename, "ApplSeqNum": "OrderApplSeqNum"})
+    cancels = cancels.rename(columns=rename)
+    events = pd.concat(
+        [
+            orders.reindex(columns=EVENT_COLUMNS, fill_value=""),
+            cancels.reindex(columns=EVENT_COLUMNS, fill_value=""),
+        ],
+        ignore_index=True,
+    )
+
+    # 用户确认原始 TransactTime 固定为 HHMMSSmmm 数字，例如 91500790。
+    # 只左补零成 091500790，不推测 ISO 字符串、时间单位或时区。
+    events["TransactionTime"] = events["TransactionTime"].str.zfill(9)
+    event_times = events["TransactionTime"].str[:6].astype(int)
+    trade_times = trade_frame["TransactTime"].str.zfill(9).str[:6].astype(int)
+
+    # 一次集合竞价的所有真实成交价格相同，开盘、收盘分别取各自的实际价格。
+    # 把价格附在该阶段的事件上，供重放器阶段收尾时消除候选价并列。
+    # 这是读取完整文件的离线处理，不能把它理解为盘中已知的未来价格。
+    for begin, end in ((91500, 92500), (145700, 150000)):
+        auction_trades = trade_frame.loc[
+            (trade_frame["ExecType"] == "F") & trade_times.between(begin, end)
+        ]
+        if not auction_trades.empty:
+            events.loc[event_times.between(begin, end), "AuctionPrice"] = (
+                auction_trades.iloc[0]["TradePrice"]
+            )
+
+    # F 不生成事件，否则重放器自身的价格档撮合和真实成交会重复扣量。
+    # 保持现有 CAA 稳定排序；本 demo 按用户约定不存在同 CAA 的业务顺序问题。
+    return events.sort_values("caa", kind="stable").reset_index(drop=True)
 
 
 def main():
+    """读原始两表、合并事件、写文件；运行失败直接保留原始异常。"""
     args = parse_args()
-    try:
-        validate_output_path(args.order, args.trade, args.output, args.overwrite)
+    output_path = args.output.resolve()
+    # 这两个检查保护用户文件，与输入格式兼容或非法行处理无关。
+    if output_path in (args.order.resolve(), args.trade.resolve()):
+        raise ValueError("输出路径不能与任一输入文件相同")
+    if output_path.exists() and not args.overwrite:
+        raise FileExistsError("输出文件已存在；如需覆盖，请使用 --overwrite")
 
-        order_frame = read_csv_as_strings(args.order)
-        trade_frame = read_csv_as_strings(args.trade)
-        order_time_column = find_time_column(order_frame, args.order)
-        trade_time_column = find_time_column(trade_frame, args.trade)
-
-        require_columns(
-            order_frame,
-            ["ChannelNo", "ApplSeqNum"] + ORDER_COLUMNS,
-            args.order,
-        )
-        require_columns(
-            trade_frame,
-            [
-                "ChannelNo",
-                "ExecType",
-                "TradeQty",
-                "BidApplSeqNum",
-                "OfferApplSeqNum",
-            ],
-            args.trade,
-        )
-
-        order_index = build_order_index(order_frame, args.order)
-        cancel_frame = fill_cancel_order_fields(trade_frame, order_index, args.trade)
-        events = build_events(
-            order_frame, cancel_frame, order_time_column, trade_time_column
-        )
-
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        write_csv_atomically(args.output, events)
-        print(
-            "wrote %d order rows and %d cancellation rows -> %s"
-            % (len(order_frame), len(cancel_frame), args.output)
-        )
-    except (EventCsvError, OSError, UnicodeError) as error:
-        print("error: %s" % error, file=sys.stderr)
-        return 1
-    return 0
+    events = build_events(
+        read_csv_as_strings(args.order), read_csv_as_strings(args.trade)
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    events.to_csv(output_path, index=False, encoding="utf-8")
+    print("已写入 %d 条 order/撤单事件：%s" % (len(events), output_path))
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

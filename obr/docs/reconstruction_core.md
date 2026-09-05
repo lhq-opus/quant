@@ -6,7 +6,7 @@
 
 ```text
 命令行
-  -> 读取固定 9 列 event.csv
+  -> 读取固定 12 列 event.csv
   -> 每行转换成 Event
   -> 按 caa 稳定排序
   -> 重放开盘集合、连续和收盘集合竞价
@@ -46,10 +46,10 @@ cmake --build /tmp/obr-build --parallel
 
 ## CSV 怎样变成 Event
 
-输入固定为以下 9 列：
+输入由 `build_cancel_event_csv.py` 直接生成，固定为以下 12 列：
 
 ```text
-caa,TransactionTime,Side,OrderType,Price,OrderQty,ExecType,TradeQty,TradePrice
+caa,TransactionTime,Side,OrderType,Price,OrderQty,ExecType,TradeQty,TradePrice,ChannelNo,OrderApplSeqNum,AuctionPrice
 ```
 
 `replay_event_main.cpp` 先跳过表头，然后用一个简单循环按逗号拆分每一行。输入约定合法，
@@ -74,9 +74,15 @@ price    = TradePrice
 quantity = TradeQty
 ```
 
-其中 `Side` 和 `TradePrice` 已由上游从原订单补全。这一步把两种 CSV 行归一成同一个
-简单 `Event`，所以 `OrderBook` 不需要知道原始列位置；集合竞价出现买卖同价时，也能
-按 `Side` 撤销正确一侧。
+其中 `Side` 和 `TradePrice` 已由上游从原订单补全，后者仍是原始价格。两类事件还共用
+`ChannelNo,OrderApplSeqNum`：order 填自己的 ASN，cancel 填引用的原订单 ASN。
+`OrderBook` 通过这个引用查到实际挂单价，cancel 的 `price` 不再负责定位档位；集合
+竞价出现买卖同价时，再按 `Side` 选择正确一侧。
+
+`TransactionTime` 由上游把原始 `TransactTime` 按固定的 `HHMMSSmmm` 数字格式左补
+九位得到，不需要用户手工添加。`AuctionPrice` 是该开盘或收盘集合阶段的实际成交价；
+连续阶段以及集合阶段没有实际成交时为空。两种 CSV 行都归一成简单的 `Event`，所以
+`OrderBook` 不需要知道原始列位置。
 
 `order_type` 在连续竞价中决定 `OrderBook` 怎样取得实际限价：
 
@@ -105,11 +111,12 @@ CSV 10.10  <->  内部 101000  <->  输出 10.1000
 
 ## OrderBook 的直接逻辑
 
-内部只有两个主要状态：
+盘口仍用两个有序 map，另加一个用于撤单定位的小索引：
 
 ```text
 bids_: 价格从高到低 -> 聚合买量
 asks_: 价格从低到高 -> 聚合卖量
+原订单价格索引: (频道, 原订单 ASN) -> 实际挂单价格或未挂入盘口
 ```
 
 - 集合竞价 order：只加入本方 map；阶段结束时统一筛选成交价并扣减双方数量；
@@ -117,24 +124,33 @@ asks_: 价格从低到高 -> 聚合卖量
 - 连续竞价类型 `1`：先取对方 `map.begin()` 的价格作为限价，只成交该最优档，剩余
   数量以这个价格进入本方；对手盘为空时自动撤销；
 - 连续竞价类型 `U`：直接加入本方 `map.begin()` 对应的最优档，本方为空时自动撤销；
-- cancel：用上游补好的 `TradePrice` 查找价格档并扣除 `TradeQty`；
+- cancel：按原订单引用取得实际挂单价，用 `Side` 选择买卖盘，然后扣除 `TradeQty`。
+  类型 `1/U` 因空盘口自动撤销时没有挂单价，后续该单的撤单事件不再扣簿；
 - snapshot：直接从两个已经排好序的 map 各取前五个元素。
 
-集合竞价与 Python demo 相同：按最大成交量、较优价格全部成交、成交价一侧全部成交、
-严格高买量与严格低卖量差最小依次筛选。本 demo 不使用 reference price，约定筛选后只剩
-一个候选价。
+原订单价格索引在处理 order、确定实际限价时填写，因此原始 `Price=0` 的 `1/U` 也能
+正确撤单。索引不维护每张订单剩余量，不建立 FIFO，成交仍然只扣聚合价格档。
+
+集合竞价与 Python demo 相同：计算最大成交量，并满足严格较优价格全部成交、成交价
+一侧全部成交的条件；再按包含候选价的 `abs(buy_quantity - sell_quantity)` 最小筛选。
+如果仍有多个候选，使用原始 trade 给出的 `AuctionPrice`；实际成交价也会加入候选集合，
+允许该价没有原始挂单。这里不用 reference price，也不再假定候选一定唯一。
+
+原始 `ExecType=F` 只给集合竞价提供价格，不进入 event 重复扣量。所有集合成交按一个
+统一价格累计成交额，买卖两侧各扣一次成交数量。该阶段最后一条 order/cancel 的快照
+显示结算后状态，每条 event 仍与一条相同 `caa` 的 book 对应。
 
 ## 有意不做的事情
 
 这一版假设输入是单交易日、单标的、完整且合法的数据，因此没有实现：
 
-- 订单 ID、同价 FIFO 或真实成交双方恢复；
+- 同价 FIFO、每张订单剩余量或真实成交双方恢复；
 - 表头兼容、带引号 CSV、非法数字和未知枚举诊断；
 - 重复事件、序列缺口、未知撤单、超量扣减或整数溢出策略；
 - 输出覆盖保护、恢复模式、多标的调度或性能优化。
 
-这些不是被遗忘，而是按当前学习目标推迟。后续工业化迭代可以在已经理解状态变化之后，
-逐项恢复明确的输入契约和错误策略。
+输入也假定不存在 CAA 事件顺序问题，因此继续按 `caa` 稳定排序，不在本轮添加 ASN
+业务排序。后续工业化迭代可以在已经理解状态变化之后，逐项恢复明确的输入契约和错误策略。
 
 ## 验证
 
@@ -143,6 +159,7 @@ asks_: 价格从低到高 -> 聚合卖量
 ```
 
 验证程序只覆盖合法正常流程：开盘集合竞价、连续逐档成交、三种 `OrderType` 的买卖
-方向、最优价为空时自动撤销、盘前撤单、收盘集合竞价、未成交数量结转以及累计成交量
-和成交额。端到端验证还会让 C++ 和 Python 读取同一份临时 `event.csv`，并逐字节比较
-两份 `book.csv`。
+方向、最优价为空时自动撤销及其撤单、动态挂单价撤单、盘前同价双边撤单、收盘集合
+竞价、集合竞价数量差筛选与实际成交价并列处理、未成交数量结转以及累计成交量和成交额。
+端到端验证还会从临时原始 order/trade 生成 event，让 C++ 和 Python 读取同一份
+`event.csv`，并逐字节比较两份 `book.csv`。临时 mock CSV 不纳入提交。

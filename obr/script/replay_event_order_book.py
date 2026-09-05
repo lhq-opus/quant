@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-# event.csv 使用约定好的固定结构，TransactionTime 由上游额外带入。
+# event.csv 使用约定好的固定结构，时间、订单引用和集合成交价由上游带入。
 # 第一版直接使用这份确定的结构，不猜测列名，也不兼容其他表头。
 EVENT_HEADER = [
     "caa",
@@ -19,6 +19,9 @@ EVENT_HEADER = [
     "ExecType",
     "TradeQty",
     "TradePrice",
+    "ChannelNo",
+    "OrderApplSeqNum",
+    "AuctionPrice",
 ]
 
 # 深市股票三个竞价阶段。TransactionTime 左补零后是 HHMMSSmmm，
@@ -84,7 +87,7 @@ def read_events(path):
         encoding="utf-8-sig",
     )
 
-    # 直接选取约定的九列。输入契约保证列名和数据合法，因此这里不再猜测表头、
+    # 直接选取约定的十二列。输入契约保证列名和数据合法，因此这里不再猜测表头、
     # 检查多种格式或捕获并改写 pandas 的异常。
     events = events.loc[:, EVENT_HEADER]
 
@@ -117,6 +120,12 @@ class EventOrderBook:
         self.bids = {}
         self.asks = {}
 
+        # 只记录每张原订单实际使用的价格，方便后续撤单定位价格档。
+        # 键为“频道、原订单 ASN”，避免不同频道的相同 ASN 相互覆盖。
+        # 这里没有保存订单剩余量或同价 FIFO，也不参与具体买卖订单配对。
+        # 价格 0 表示最优价不存在、申报已自动撤销，之后的撤单不再扣减盘口。
+        self.order_prices = {}
+
         # 价格档撮合能够确定成交总量和成交额，但不能确定实际成交消息笔数。
         # 这两个累计值供后续完整 book.csv 的 cvl、cto 字段使用。
         self.cumulative_trade_quantity = 0
@@ -131,6 +140,14 @@ class EventOrderBook:
         """应用一条事件；连续竞价立即撮合，集合竞价只把订单放入盘口。"""
         self.event_trade_quantity = 0
         self.event_turnover = Decimal("0")
+
+        if event.ExecType != "4":
+            order_key = (int(event.ChannelNo), int(event.OrderApplSeqNum))
+            # 限价单直接使用原价；1/U 的实际价格要等到读取到达时的盘口后确定。
+            # 先把 1/U 记为 0，若没有可用最优价，自动撤销分支便保留这个标记。
+            self.order_prices[order_key] = (
+                Decimal(event.Price) if event.OrderType == "2" else Decimal("0")
+            )
 
         if event.ExecType == "4":
             self._apply_cancel(event)
@@ -182,6 +199,8 @@ class EventOrderBook:
 
         # 以对手方最优价作为限价后，只可能吃掉这一价格档。
         # 如果数量还有剩余，_apply_limit_order 会把它留在同一个价格上。
+        order_key = (int(event.ChannelNo), int(event.OrderApplSeqNum))
+        self.order_prices[order_key] = limit_price
         self._apply_limit_order(event.Side, limit_price, int(event.OrderQty))
 
     def _apply_own_best_order(self, event):
@@ -195,6 +214,8 @@ class EventOrderBook:
         # 买方最高价是买一，卖方最低价是卖一。
         # 本 demo 规定 U 的实际挂单价来自当前盘口，因此这里完全不读取 CSV Price。
         best_own_price = max(levels) if event.Side == "1" else min(levels)
+        order_key = (int(event.ChannelNo), int(event.OrderApplSeqNum))
+        self.order_prices[order_key] = best_own_price
         levels[best_own_price] += int(event.OrderQty)
 
     def _apply_limit_order(self, side, limit_price, quantity):
@@ -256,9 +277,9 @@ class EventOrderBook:
         self.cumulative_trade_quantity += trade_quantity
         self.cumulative_turnover += trade_turnover
 
-    def finish_call_auction(self):
+    def finish_call_auction(self, actual_price=None):
         """在开盘或收盘集合竞价结束时，以一个成交价统一撮合。"""
-        auction_price, trade_quantity = self._find_call_auction_result()
+        auction_price, trade_quantity = self._find_call_auction_result(actual_price)
         if auction_price is None:
             return
 
@@ -271,14 +292,17 @@ class EventOrderBook:
         self._reduce_levels(self.asks, ask_prices, trade_quantity)
         self._record_trade(auction_price, trade_quantity)
 
-    def _find_call_auction_result(self):
+    def _find_call_auction_result(self, actual_price=None):
         """根据当前买卖盘口选择集合竞价成交价和最大成交量。"""
-        # 候选价格来自当前买卖申报价格的并集。
+        # 候选价格来自当前买卖申报价格的并集，并补入 trade 的实际集合成交价。
+        # 实际成交价可能位于两个申报价之间，因此不能只遍历已有价格档。
         # 为了让规则一眼可见，demo 对每个价格直接重新求和，不做前缀和优化。
-        prices = sorted(set(self.bids) | set(self.asks))
+        prices = set(self.bids) | set(self.asks)
+        if actual_price is not None and actual_price > 0:
+            prices.add(actual_price)
         candidates = []
 
-        for price in prices:
+        for price in sorted(prices):
             buy_quantity = sum(
                 quantity
                 for bid_price, quantity in self.bids.items()
@@ -323,8 +347,9 @@ class EventOrderBook:
             if not all_buys_at_price_trade and not all_sells_at_price_trade:
                 continue
 
-            # 第二层并列规则比较“严格高价买量”和“严格低价卖量”的差。
-            quantity_difference = abs(better_buy_quantity - better_sell_quantity)
+            # 第二层并列规则中的“以上、以下”包含候选价本身，因此比较全部可参与
+            # 的买量和卖量，不能使用上面仅用于判断价优申报的严格高价量/低价量。
+            quantity_difference = abs(buy_quantity - sell_quantity)
             candidates.append((price, trade_quantity, quantity_difference))
 
         if not candidates:
@@ -336,10 +361,15 @@ class EventOrderBook:
         minimum_difference = min(item[2] for item in candidates)
         candidates = [item for item in candidates if item[2] == minimum_difference]
 
-        # demo 约定：经过上述规则后，合法输入只剩一个候选价。
-        # 因此开盘和收盘都直接使用订单簿算出的这个价格，不再引入参考价。
-        assert len(candidates) == 1
-        auction_price = candidates[0][0]
+        if len(candidates) == 1:
+            return candidates[0][0], maximum_trade_quantity
+
+        # 多个价格仍并列时，用上游从本阶段 ExecType=F 中取得的实际成交价定价。
+        # 真实 trade 只提供统一成交价，不在重放中再次扣量，避免同一成交计算两遍。
+        # 没有实际价格便无法完成这一业务决策，不能悄悄选择最低价或第一项。
+        if actual_price not in {item[0] for item in candidates}:
+            raise ValueError("集合竞价存在并列候选价，需由 AuctionPrice 提供实际成交价")
+        auction_price = actual_price
         return auction_price, maximum_trade_quantity
 
     @staticmethod
@@ -358,7 +388,13 @@ class EventOrderBook:
 
     def _apply_cancel(self, event):
         """根据撤单方向，从对应买盘或卖盘价格档扣减数量。"""
-        price = Decimal(event.TradePrice)
+        order_key = (int(event.ChannelNo), int(event.OrderApplSeqNum))
+        # 上游 TradePrice 只补得出原始 Price；1/U 原价可能为 0，不能用于定位。
+        # 实际挂单价在原订单到达时已经确定，后续盘口最优价变化也不影响这个价格。
+        price = self.order_prices[order_key]
+        if price == 0:
+            # 最优价不存在的申报已经自动撤销，后续撤单通知不需要再改变盘口。
+            return
         quantity = int(event.TradeQty)
 
         # 集合竞价期间订单只累计、不立即撮合，因此同一个价格可以同时存在买卖申报。
@@ -423,7 +459,10 @@ def main():
         # 这样不额外制造 event，输出行数仍与输入行数相同。
         next_session = sessions[index + 1] if index + 1 < len(sessions) else None
         if session in (OPENING_AUCTION, CLOSING_AUCTION) and next_session != session:
-            order_book.finish_call_auction()
+            # 上游将该阶段的真实成交价补到集合事件；无成交时这一列为空。
+            # 该价格仅用于最终并列定价，撮合仍只在这里按聚合价格档执行一次。
+            actual_price = Decimal(event.AuctionPrice) if event.AuctionPrice else None
+            order_book.finish_call_auction(actual_price)
 
         rows.append(order_book.snapshot(event.caa, event_type))
 

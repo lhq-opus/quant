@@ -26,9 +26,13 @@ int main() {
 
   // 这里直接构造正式代码使用的 Event。
   // 价格 101000 的单位是 0.0001 元，所以它表示 10.1000 元。
-  const obr::Event bid_1 = {"09:15", "91500790", obr::EventType::Order, '1', '2', 101000, 100};
-  const obr::Event bid_2 = {"09:16", "91600000", obr::EventType::Order, '1', '2', 100000, 100};
-  const obr::Event ask = {"09:17", "91700000", obr::EventType::Order, '2', '2', 99000, 100};
+  // 最后三列依次是频道、原订单 ASN、真实集合成交价提示（这里唯一候选，不需要提示）。
+  const obr::Event bid_1 = {"09:15", "91500790", obr::EventType::Order, '1', '2', 101000, 100, 1,
+                            1,       0};
+  const obr::Event bid_2 = {"09:16", "91600000", obr::EventType::Order, '1', '2', 100000, 100, 1,
+                            2,       0};
+  const obr::Event ask = {"09:17", "91700000", obr::EventType::Order, '2', '2', 99000, 100, 1,
+                          3,       0};
 
   // 集合竞价期间 apply 只累加价格档。直到显式调用 finish_call_auction，
   // 三个交叉的价格档才会按照集合竞价规则统一成交。
@@ -38,15 +42,16 @@ int main() {
   book.finish_call_auction();
   print_snapshot(book.make_snapshot(ask));
 
-  // 简化 Event 已经把撤单的 TradePrice/TradeQty 归一成 price/quantity。
-  // 当前盘口只剩 10.0000 买量 100，这里撤掉其中 20。
-  const obr::Event cancel = {"09:19", "91900000", obr::EventType::Cancel, '\0', '\0', 100000, 20};
+  // 简化 Event 已经把撤单的 TradeQty 归一成 quantity，Side 明确指定买方。
+  // 当前盘口只剩 10.0000 买量 100，这里引用频道 1、ASN 2 的原买单，撤掉其中 20。
+  const obr::Event cancel = {"09:19", "91900000", obr::EventType::Cancel, '1', '\0', 100000, 20, 1,
+                             2,       0};
   book.apply(cancel, obr::TradingSession::OpeningAuction);
   print_snapshot(book.make_snapshot(cancel));
 
   // 连续竞价卖单 9.9000 低于当前买一 10.0000，所以立即以买一价格成交 30。
-  const obr::Event continuous_ask = {"10:04", "100407190", obr::EventType::Order, '2', '2',
-                                     99000,   30};
+  const obr::Event continuous_ask = {
+      "10:04", "100407190", obr::EventType::Order, '2', '2', 99000, 30, 1, 5, 0};
   book.apply(continuous_ask, obr::TradingSession::ContinuousAuction);
   print_snapshot(book.make_snapshot(continuous_ask));
 

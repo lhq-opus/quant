@@ -361,11 +361,8 @@ def load_events(order_path, trade_path):
                     "%s: duplicate ApplSeqNum %d"
                     % (event["location"], event["asn"])
                 )
-            if event["asn"] != previous_asn + 1:
-                raise DemoError(
-                    "%s: sequence gap, expected ApplSeqNum %d, found %d"
-                    % (event["location"], previous_asn + 1, event["asn"])
-                )
+            # ASN 在整个频道内编号；筛出单证券后，中间序号可能属于其他证券。
+            # 因此这里只拒绝重复 ASN，不把单证券文件中的跳号判成行情丢失。
         previous_asn = event["asn"]
 
     return events

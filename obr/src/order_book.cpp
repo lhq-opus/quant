@@ -1,7 +1,7 @@
 #include "obr/order_book.hpp"
 
 #include <algorithm>
-#include <cassert>
+#include <stdexcept>
 #include <vector>
 
 namespace obr {
@@ -20,11 +20,14 @@ struct AuctionCandidate {
 OrderBook::OrderBook() : cumulative_trade_quantity_(0), cumulative_turnover_(0) {}
 
 void OrderBook::apply(const Event& event, TradingSession session) {
-  // 撤单在三个阶段中的处理方式相同：从已知价格档扣除 TradeQty。
+  // 撤单在三个阶段中的处理方式相同：按原订单引用查回实际价格，再扣除 TradeQty。
   if (event.type == EventType::Cancel) {
     apply_cancel(event);
     return;
   }
+
+  // 先记录“未找到挂单价格”。下面实际定价后再覆盖，自动撤销分支则保持 0。
+  order_prices_[OrderKey(event.channel_no, event.order_appl_seq_num)] = 0;
 
   // 深交所逐笔行情只给出 OrderType=1/2/U，没有给出区分各种市价子类型所需的
   // TimeInForce、MaxPriceLevels 和 MinQty。为了保持当前 demo 简单、结果确定，约定：
@@ -49,6 +52,7 @@ void OrderBook::apply(const Event& event, TradingSession session) {
 }
 
 void OrderBook::add_order(const Event& event) {
+  order_prices_[OrderKey(event.channel_no, event.order_appl_seq_num)] = event.price;
   if (event.side == '1') {
     // map 的 operator[] 在价格不存在时会先放入一个 0，然后再加数量。
     bids_[event.price] += event.quantity;
@@ -82,7 +86,9 @@ void OrderBook::apply_own_best_order(const Event& event) {
     }
 
     // U 的 CSV Price 在本 demo 中不参与定价，订单直接加入到达时的买一档。
-    bids_[bids_.begin()->first] += event.quantity;
+    const Price price = bids_.begin()->first;
+    order_prices_[OrderKey(event.channel_no, event.order_appl_seq_num)] = price;
+    bids_[price] += event.quantity;
     return;
   }
 
@@ -90,10 +96,14 @@ void OrderBook::apply_own_best_order(const Event& event) {
   if (asks_.empty()) {
     return;
   }
-  asks_[asks_.begin()->first] += event.quantity;
+  const Price price = asks_.begin()->first;
+  order_prices_[OrderKey(event.channel_no, event.order_appl_seq_num)] = price;
+  asks_[price] += event.quantity;
 }
 
 void OrderBook::apply_limit_order(const Event& event, Price limit_price) {
+  // 普通限价单使用原始价格，类型 1 使用到达时的对手方最优价；保存的是实际定价。
+  order_prices_[OrderKey(event.channel_no, event.order_appl_seq_num)] = limit_price;
   Quantity remaining_quantity = event.quantity;
 
   if (event.side == '1') {
@@ -147,10 +157,17 @@ void OrderBook::apply_limit_order(const Event& event, Price limit_price) {
 }
 
 void OrderBook::apply_cancel(const Event& event) {
+  // 原始 TradePrice 对 1/U 委托可能为 0，实际挂单价必须来自新增订单时保存的索引。
+  const Price price = order_prices_.at(OrderKey(event.channel_no, event.order_appl_seq_num));
+  if (price == 0) {
+    // 无本方/对手最优价时，新增事件没有入簿；对应自动撤单也没有盘口数量可扣。
+    return;
+  }
+
   // 集合竞价期间同一个价格可以同时存在买卖申报，因此不能用价格推断撤单方向。
   // event.csv 已经从原订单补全 Side：'1' 撤买单，'2' 撤卖单。
   if (event.side == '1') {
-    BidLevels::iterator bid = bids_.find(event.price);
+    BidLevels::iterator bid = bids_.find(price);
     bid->second -= event.quantity;
     if (bid->second == 0) {
       bids_.erase(bid);
@@ -159,7 +176,7 @@ void OrderBook::apply_cancel(const Event& event) {
   }
 
   // 第一版输入保证 Side、价格和数量合法，所以卖方分支直接修改对应卖盘价格档。
-  AskLevels::iterator ask = asks_.find(event.price);
+  AskLevels::iterator ask = asks_.find(price);
   ask->second -= event.quantity;
   if (ask->second == 0) {
     asks_.erase(ask);
@@ -171,8 +188,9 @@ void OrderBook::record_trade(Price price, Quantity quantity) {
   cumulative_turnover_ += price * quantity;
 }
 
-bool OrderBook::find_call_auction_result(Price& auction_price, Quantity& trade_quantity) const {
-  // 候选价格就是当前买卖申报价格的并集。
+bool OrderBook::find_call_auction_result(Price actual_price, Price& auction_price,
+                                         Quantity& trade_quantity) const {
+  // 当前买卖申报价构成候选集。真实集合成交价可能在两个申报价之间，也必须参与筛选。
   std::vector<Price> prices;
   BidLevels::const_iterator bid = bids_.begin();
   for (; bid != bids_.end(); ++bid) {
@@ -181,6 +199,9 @@ bool OrderBook::find_call_auction_result(Price& auction_price, Quantity& trade_q
   AskLevels::const_iterator ask = asks_.begin();
   for (; ask != asks_.end(); ++ask) {
     prices.push_back(ask->first);
+  }
+  if (actual_price > 0) {
+    prices.push_back(actual_price);
   }
 
   std::sort(prices.begin(), prices.end());
@@ -253,9 +274,10 @@ bool OrderBook::find_call_auction_result(Price& auction_price, Quantity& trade_q
     AuctionCandidate candidate;
     candidate.price = *price;
     candidate.trade_quantity = possible_trade;
-    candidate.quantity_difference = better_buy_quantity >= better_sell_quantity
-                                        ? better_buy_quantity - better_sell_quantity
-                                        : better_sell_quantity - better_buy_quantity;
+    // 次级筛选用“买价 >= 候选价”与“卖价 <= 候选价”的累计量之差，包含等价申报。
+    // 上面的严格价优量只用于检查能否全部成交，不能代替这里的累计买卖量。
+    candidate.quantity_difference =
+        buy_quantity >= sell_quantity ? buy_quantity - sell_quantity : sell_quantity - buy_quantity;
     candidates.push_back(candidate);
   }
 
@@ -280,7 +302,7 @@ bool OrderBook::find_call_auction_result(Price& auction_price, Quantity& trade_q
     }
   }
 
-  // 第二轮：如果最大成交量相同，选择严格高买量与严格低卖量差最小者。
+  // 第二轮：如果最大成交量相同，选择包含候选价的累计买卖量之差最小者。
   Quantity minimum_difference = maximum_candidates[0].quantity_difference;
   candidate = maximum_candidates.begin();
   for (; candidate != maximum_candidates.end(); ++candidate) {
@@ -297,17 +319,28 @@ bool OrderBook::find_call_auction_result(Price& auction_price, Quantity& trade_q
     }
   }
 
-  // 当前 demo 不使用 reference price，约定合法输入到这里一定只剩一个价格。
-  assert(final_candidates.size() == 1U);
-  auction_price = final_candidates[0].price;
   trade_quantity = maximum_trade_quantity;
-  return true;
+  if (final_candidates.size() == 1U) {
+    auction_price = final_candidates[0].price;
+    return true;
+  }
+
+  // 本 demo 不另加前收盘价/最近成交价的参考价格规则，直接用上游真实成交价解开并列。
+  // trade 只提供统一价格，不再次扣量，避免与下面的档级撮合重复计算。
+  candidate = final_candidates.begin();
+  for (; candidate != final_candidates.end(); ++candidate) {
+    if (candidate->price == actual_price) {
+      auction_price = actual_price;
+      return true;
+    }
+  }
+  throw std::logic_error("集合竞价候选价并列，但 AuctionPrice 未提供有效的实际成交价");
 }
 
-void OrderBook::finish_call_auction() {
+void OrderBook::finish_call_auction(Price actual_price) {
   Price auction_price = 0;
   Quantity trade_quantity = 0;
-  if (!find_call_auction_result(auction_price, trade_quantity)) {
+  if (!find_call_auction_result(actual_price, auction_price, trade_quantity)) {
     return;
   }
 

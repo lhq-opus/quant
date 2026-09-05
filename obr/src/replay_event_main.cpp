@@ -84,13 +84,19 @@ obr::Price parse_price(const std::string& text) {
 obr::Event parse_event(const std::vector<std::string>& columns) {
   // 固定列位置如下。输入表头已经约定好，所以第一版不再建立“列名 -> 下标”的 map：
   // 0 caa, 1 TransactionTime, 2 Side, 3 OrderType, 4 Price,
-  // 5 OrderQty, 6 ExecType, 7 TradeQty, 8 TradePrice。
+  // 5 OrderQty, 6 ExecType, 7 TradeQty, 8 TradePrice,
+  // 9 ChannelNo, 10 OrderApplSeqNum, 11 AuctionPrice。
   obr::Event event;
   event.caa = columns[0];
   event.transaction_time = columns[1];
+  event.channel_no = std::stoll(columns[9]);
+  event.order_appl_seq_num = std::stoll(columns[10]);
+  // 空 AuctionPrice 表示连续竞价阶段或集合阶段没有真实成交，内部用 0 表示。
+  event.auction_price = columns[11].empty() ? 0 : parse_price(columns[11]);
 
   if (columns[6] == "4") {
     // 撤单行：Side 和 TradePrice 已由上游根据原订单引用补全。
+    // TradePrice 保留原始价格；核心按 ChannelNo/OrderApplSeqNum 查回真正挂单价。
     event.type = obr::EventType::Cancel;
     event.side = columns[2][0];
     event.order_type = '\0';
@@ -239,7 +245,7 @@ int main(int argc, char* argv[]) {
     const bool is_last_event_in_session =
         index + 1U == events.size() || sessions[index + 1U] != sessions[index];
     if (is_call_auction && is_last_event_in_session) {
-      order_book.finish_call_auction();
+      order_book.finish_call_auction(events[index].auction_price);
     }
 
     snapshots.push_back(order_book.make_snapshot(events[index]));
