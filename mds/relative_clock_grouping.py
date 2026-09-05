@@ -219,74 +219,65 @@ def build_compatibility_matrix(
     min_close_snapshots: int = DEFAULT_MIN_CLOSE_SNAPSHOTS,
     min_close_rate: float = DEFAULT_MIN_CLOSE_RATE,
 ) -> pd.DataFrame:
-    """把两张证据矩阵转换成“能否进入同组”的布尔矩阵。"""
+    """把匹配次数、匹配率转换为同组条件。
 
-    if min_close_snapshots < 1:
-        raise ValueError("min_close_snapshots must be at least 1")
-    if not 0 <= min_close_rate <= 1:
-        raise ValueError("min_close_rate must be between 0 and 1")
+    两张矩阵由上一步生成：行列均为同一顺序的字符串 stock_id，数值对称。
+    本函数直接使用这个约定，不再复制矩阵做类型推测和非对称输入兼容。
+    """
 
-    ordered_counts = match_counts.copy()
-    ordered_counts.index = ordered_counts.index.astype(str)
-    ordered_counts.columns = ordered_counts.columns.astype(str)
-    ordered_counts = ordered_counts.sort_index().reindex(columns=ordered_counts.index)
-    ordered_rates = match_rates.copy()
-    ordered_rates.index = ordered_rates.index.astype(str)
-    ordered_rates.columns = ordered_rates.columns.astype(str)
-    ordered_rates = ordered_rates.reindex(
-        index=ordered_counts.index,
-        columns=ordered_counts.columns,
+    compatibility = (match_counts.to_numpy() >= min_close_snapshots) & (
+        match_rates.to_numpy() >= min_close_rate
     )
-
-    compatibility = (ordered_counts.to_numpy() >= min_close_snapshots) & (
-        ordered_rates.to_numpy(dtype="float64") >= min_close_rate
-    )
-
-    # 生成逻辑本来就是对称的；这里取双向交集，使任意外部传入的矩阵也必须在
-    # (i,j) 与 (j,i) 两个方向都通过。对角线固定为 True，因为单例组总是合法。
-    compatibility &= compatibility.T
+    # 两道门槛都通过才允许同组；单只股票无论证据多少都可以独立成组。
     np.fill_diagonal(compatibility, True)
     return pd.DataFrame(
         compatibility,
-        index=ordered_counts.index,
-        columns=ordered_counts.columns,
+        index=match_counts.index,
+        columns=match_counts.columns,
     )
 
 
 def _boolean_matrix_to_bit_masks(matrix: np.ndarray) -> list[int]:
-    """把布尔矩阵每一行压成 Python 整数，便于快速做图集合运算。"""
+    """把每行布尔值存成一个整数，快速表示股票集合。
 
-    if not len(matrix):
-        return []
-    all_vertices = (1 << len(matrix)) - 1
+    例如 [True, False, True] 表示位置 0、2，在二进制中写成 101。
+    1 << i 表示只包含位置 i；a & b 取交集，a | b 取并集。
+    这些位运算在底层一次处理多个成员，避免在搜索中反复逐股票比较。
+    """
+
+    # packbits 把每 8 个布尔值打包成一个字节；不足 8 位的部分自动补 0。
+    # 两处 little 都表示编号小的股票放低位，保证股票位置与二进制位一一对应。
     packed_rows = np.packbits(matrix, axis=1, bitorder="little")
-    return [
-        int.from_bytes(row.tobytes(), byteorder="little") & all_vertices
-        for row in packed_rows
-    ]
+    masks = []
+    for row in packed_rows:
+        masks.append(int.from_bytes(row.tobytes(), byteorder="little"))
+    return masks
 
 
 def _vertices_from_mask(mask: int) -> list[int]:
-    """按编号升序展开 bit mask。"""
+    """把整数集合展开为升序位置列表，例如二进制 101 变为 [0, 2]。"""
 
-    vertices: list[int] = []
+    vertices = []
     while mask:
+        # mask & -mask 只保留最右边的 1，例如 10100 变成 00100。
+        # bit_length() - 1 得到这一位从 0 开始的编号，此例中是 2。
         lowest_bit = mask & -mask
         vertices.append(lowest_bit.bit_length() - 1)
-        mask ^= lowest_bit
+        mask ^= lowest_bit  # 用异或清掉刚处理的这一位。
     return vertices
 
 
 def _connected_components(adjacency_masks: list[int]) -> list[list[int]]:
-    """求兼容图连通分量；不同分量的股票不可能放进同一个 clique。"""
+    """按编号查找图中互相可达的部分；兼容图和冲突图都可使用。"""
 
+    # 例如有 3 个顶点时，(1 << 3) - 1 是二进制 111，即所有顶点尚未访问。
     remaining = (1 << len(adjacency_masks)) - 1
-    components: list[list[int]] = []
+    components = []
 
     while remaining:
         seed = remaining & -remaining
         remaining ^= seed
-        frontier = seed
+        frontier = seed  # 已发现、还没检查邻居的顶点集合。
         component_mask = 0
 
         while frontier:
@@ -295,6 +286,7 @@ def _connected_components(adjacency_masks: list[int]) -> list[list[int]]:
             component_mask |= vertex_bit
             vertex = vertex_bit.bit_length() - 1
 
+            # 邻居与 remaining 取交集，只加入从未发现的顶点，避免重复遍历。
             new_neighbors = adjacency_masks[vertex] & remaining
             remaining ^= new_neighbors
             frontier |= new_neighbors
@@ -304,74 +296,82 @@ def _connected_components(adjacency_masks: list[int]) -> list[list[int]]:
     return components
 
 
+def _select_dsatur_vertex(
+    uncolored: int,
+    neighbor_color_masks: list[int],
+    degrees: list[int],
+) -> int:
+    """选出最受约束的未分组股票，供贪心着色和精确搜索使用。"""
+
+    best_vertex = -1
+    best_priority = (-1, -1, 0)
+    for vertex in _vertices_from_mask(uncolored):
+        # DSATUR 的第一优先级是邻居已占用的颜色种类数，即当前禁用的组数。
+        # bit_count() 数整数中有几个 1。并列时比较冲突度，再优先编号小者。
+        # Python 从左往右比较元组，所以三项自然构成三层排序条件。
+        priority = (
+            neighbor_color_masks[vertex].bit_count(),
+            degrees[vertex],
+            -vertex,
+        )
+        if priority > best_priority:
+            best_priority = priority
+            best_vertex = vertex
+    return best_vertex
+
+
 def _dsatur_greedy_coloring(conflict_masks: list[int]) -> list[int]:
-    """用 DSATUR 贪心给“不兼容图”着色，快速得到分组数上界。"""
+    """在冲突图上快速找一个合法分组，组数作为精确搜索的上界。
+
+    颜色就是组号：有冲突的两只股票不能同色。贪心每次优先安排最受约束
+    的股票，再给它最小可用颜色；这个结果合法，但未必使用最少颜色。
+    """
 
     vertex_count = len(conflict_masks)
-    colors = [-1] * vertex_count
+    colors = [-1] * vertex_count  # -1 表示尚未安排颜色。
     neighbor_color_masks = [0] * vertex_count
     degrees = [neighbors.bit_count() for neighbors in conflict_masks]
     uncolored = (1 << vertex_count) - 1
-    color_count = 0
 
     while uncolored:
-        # DSATUR 优先选择“已看到颜色种类最多”的股票；并列时优先冲突度高、
-        # stock_id 顺序靠前者。这通常比按 stock_id 直接 first-fit 使用更少颜色。
-        vertex = max(
-            _vertices_from_mask(uncolored),
-            key=lambda candidate: (
-                neighbor_color_masks[candidate].bit_count(),
-                degrees[candidate],
-                -candidate,
-            ),
-        )
+        vertex = _select_dsatur_vertex(uncolored, neighbor_color_masks, degrees)
         blocked_colors = neighbor_color_masks[vertex]
 
-        for color in range(color_count):
-            if not blocked_colors & (1 << color):
-                break
-        else:
-            color = color_count
-            color_count += 1
-
+        color = 0
+        while blocked_colors & (1 << color):
+            color += 1
         colors[vertex] = color
         uncolored ^= 1 << vertex
 
-        neighbors = conflict_masks[vertex] & uncolored
-        while neighbors:
-            neighbor_bit = neighbors & -neighbors
-            neighbors ^= neighbor_bit
-            neighbor = neighbor_bit.bit_length() - 1
+        # 给 vertex 安排颜色后，它所有还未着色的冲突邻居都不能再使用此颜色。
+        for neighbor in _vertices_from_mask(conflict_masks[vertex] & uncolored):
             neighbor_color_masks[neighbor] |= 1 << color
 
     return colors
 
 
 def _greedy_conflict_clique_lower_bound(conflict_masks: list[int]) -> int:
-    """在不兼容图中寻找一个 clique，作为最少颜色数的可靠下界。"""
+    """寻找一批两两冲突的股票，其数量是至少需要的组数。"""
 
-    vertex_count = len(conflict_masks)
-    if vertex_count == 0:
+    if not conflict_masks:
         return 0
-
     degrees = [neighbors.bit_count() for neighbors in conflict_masks]
+    # lambda 只定义这里的排序键：冲突度降序，编号升序。
     seed_order = sorted(
-        range(vertex_count), key=lambda vertex: (-degrees[vertex], vertex)
+        range(len(conflict_masks)), key=lambda vertex: (-degrees[vertex], vertex)
     )
     best_size = 1
 
-    # 任意冲突 clique 中的成员都必须使用不同颜色。这里只尝试若干高冲突起点，
-    # 目的是快速得到“至少需要多少组”的下界，而不是在这里再解一次最大 clique。
-    for seed in seed_order[: min(vertex_count, 16)]:
+    # 最多尝试 16 个高冲突起点，只求一个可靠下界，不穷举最大冲突团。
+    for seed in seed_order[:16]:
         clique_size = 1
         candidates = conflict_masks[seed]
-        while candidates:
-            vertex = max(
-                _vertices_from_mask(candidates),
-                key=lambda candidate: (degrees[candidate], -candidate),
-            )
-            clique_size += 1
-            candidates &= conflict_masks[vertex]
+        # 优先级固定，候选只会减少，所以扫描一次已有顺序即可。
+        # 每轮重新展开 candidates 再 max 会重复大量工作，选择结果却相同。
+        for vertex in seed_order:
+            if candidates & (1 << vertex):
+                clique_size += 1
+                candidates &= conflict_masks[vertex]
         best_size = max(best_size, clique_size)
 
     return best_size
@@ -384,22 +384,11 @@ def greedy_group_by_match_rate(
     min_close_snapshots: int = DEFAULT_MIN_CLOSE_SNAPSHOTS,
     min_close_rate: float = DEFAULT_MIN_CLOSE_RATE,
 ) -> pd.DataFrame:
-    """按匹配率从高到低贪心合并，同时维持组内全配对约束。
+    """按匹配率、匹配次数降序合组，并保持组内任意两只股票兼容。
 
-    算法从“每只股票各自一组”开始，只保留同时通过匹配次数和匹配率阈值的
-    股票对，并按以下稳定顺序处理：
-
-    1. 匹配率从高到低；
-    2. 匹配率相同时，匹配次数从高到低；
-    3. 两项都相同时，按两个 ``stock_id`` 排序。
-
-    处理一对股票时，如果它们已经在同一组就跳过；否则尝试合并它们当前所在
-    的两个组。只有两个组之间的每一个交叉股票对都通过阈值，才真正合并。因此
-    输出仍保证组内任意成员两两兼容。
-
-    这种方法优先保留证据最强的股票对，但早期合并不会回退，所以不保证使用
-    最少组数。返回结果会在 ``DataFrame.attrs`` 中报告当前上下界和是否碰巧已
-    由上下界相等证明最优，便于与 minimum clique partition 方法直接比较。
+    每只股票先独立成组，再依次处理达标的股票对。尝试合并的是股票当前
+    所在的两个完整组；不能只凭这一对股票达标就合并。早期选择不回退，
+    所以这个方法优先保留强关系，但不保证组数最少。
     """
 
     compatibility_frame = build_compatibility_matrix(
@@ -408,100 +397,75 @@ def greedy_group_by_match_rate(
         min_close_snapshots=min_close_snapshots,
         min_close_rate=min_close_rate,
     )
-    stock_ids = compatibility_frame.index.tolist()
+    # 排序只为固定并列时的处理次序；两轴均使用同一 stock_id 顺序。
+    stock_ids = sorted(compatibility_frame.index)
+    compatibility = compatibility_frame.loc[stock_ids, stock_ids].to_numpy()
+    count_values = match_counts.loc[stock_ids, stock_ids].to_numpy()
+    rate_values = match_rates.loc[stock_ids, stock_ids].to_numpy()
     stock_count = len(stock_ids)
-    compatibility = compatibility_frame.to_numpy(dtype=bool)
     compatibility_masks = _boolean_matrix_to_bit_masks(compatibility)
 
-    ordered_counts = match_counts.copy()
-    ordered_counts.index = ordered_counts.index.astype(str)
-    ordered_counts.columns = ordered_counts.columns.astype(str)
-    ordered_counts = ordered_counts.reindex(index=stock_ids, columns=stock_ids)
-    ordered_rates = match_rates.copy()
-    ordered_rates.index = ordered_rates.index.astype(str)
-    ordered_rates.columns = ordered_rates.columns.astype(str)
-    ordered_rates = ordered_rates.reindex(index=stock_ids, columns=stock_ids)
-    count_values = ordered_counts.to_numpy()
-    rate_values = ordered_rates.to_numpy(dtype="float64")
-
-    candidate_pairs: list[tuple[float, int, str, str, int, int]] = []
+    candidate_pairs = []
     for first_stock in range(stock_count):
         for second_stock in range(first_stock + 1, stock_count):
-            if not compatibility[first_stock, second_stock]:
-                continue
-
-            # build_compatibility_matrix 已要求两个方向都通过。排序强度也保守地
-            # 取双向较小值；由本脚本生成的证据矩阵本来就是完全对称的。
-            pair_rate = min(
-                rate_values[first_stock, second_stock],
-                rate_values[second_stock, first_stock],
-            )
-            pair_count = int(
-                min(
-                    count_values[first_stock, second_stock],
-                    count_values[second_stock, first_stock],
-                )
-            )
-            candidate_pairs.append(
-                (
-                    -pair_rate,
-                    -pair_count,
-                    stock_ids[first_stock],
-                    stock_ids[second_stock],
+            if compatibility[first_stock, second_stock]:
+                # 元组从左向右排序。取负号把升序变成匹配率、匹配次数降序；
+                # 股票位置已经按 ID 排序，不必在每个候选中再存两份 ID 字符串。
+                candidate_pairs.append((
+                    -rate_values[first_stock, second_stock],
+                    -int(count_values[first_stock, second_stock]),
                     first_stock,
                     second_stock,
-                )
-            )
-
+                ))
     candidate_pairs.sort()
 
-    # group_of 记录每只股票当前所属组；group_masks 用一个整数保存组内成员集合。
-    # bit mask 可以快速检查“另一组的所有成员是否都在某股票的兼容集合里”。
     group_of = list(range(stock_count))
-    group_masks = {stock: 1 << stock for stock in range(stock_count)}
+    group_masks = {}
+    for stock in range(stock_count):
+        group_masks[stock] = 1 << stock
 
-    for _, _, _, _, first_stock, second_stock in candidate_pairs:
+    # allowed_masks[G] 保存“与 G 组所有成员都兼容”的股票集合。
+    # 单例组的集合就是该股票的兼容行；之后只在成功合并时更新交集。
+    allowed_masks = compatibility_masks.copy()
+    for _, _, first_stock, second_stock in candidate_pairs:
         first_group = group_of[first_stock]
         second_group = group_of[second_stock]
         if first_group == second_group:
             continue
 
-        first_members = group_masks[first_group]
         second_members = group_masks[second_group]
-        can_merge = all(
-            compatibility_masks[member] & second_members == second_members
-            for member in _vertices_from_mask(first_members)
-        )
-        if not can_merge:
+        # B 的所有成员都在 allowed[A] 中，等价于 A、B 之间全配对通过。
+        # 整数 & 取集合交集，再与 B 比较，省去每次遍历 A 的所有成员。
+        if (allowed_masks[first_group] & second_members) != second_members:
             continue
 
-        # 总是保留编号较小的内部组 ID，只用于让过程可复现，不影响最终 group_id。
         kept_group = min(first_group, second_group)
         removed_group = max(first_group, second_group)
-        removed_members = group_masks[removed_group]
+        removed_members = group_masks.pop(removed_group)
         group_masks[kept_group] |= removed_members
-        del group_masks[removed_group]
+        # 新组允许的股票必须同时兼容两个旧组；交集不能换成并集。
+        allowed_masks[kept_group] &= allowed_masks[removed_group]
         for member in _vertices_from_mask(removed_members):
             group_of[member] = kept_group
 
-    groups = [
-        [stock_ids[member] for member in _vertices_from_mask(member_mask)]
-        for member_mask in group_masks.values()
-    ]
-    groups = [sorted(group) for group in groups]
+    groups = []
+    for member_mask in group_masks.values():
+        members = []
+        for position in _vertices_from_mask(member_mask):
+            members.append(stock_ids[position])
+        groups.append(members)
     groups.sort(key=lambda group: group[0])
-    rows = [
-        (stock_id, group_id)
-        for group_id, group in enumerate(groups, start=1)
-        for stock_id in group
-    ]
 
-    # 冲突 clique 给出可靠下界。贪心结果若恰好等于下界，虽然算法本身不是精确
-    # 算法，这一个具体输入上的结果仍可被证明为全局最优。
+    rows = []
+    for group_id, members in enumerate(groups, start=1):
+        for stock_id in members:
+            rows.append((stock_id, group_id))
+
+    # 贪心结果恰好达到冲突团下界时，也能证明这次的组数已经最少。
     group_count_lower_bound = 0
     for component in _connected_components(compatibility_masks):
-        local_compatibility = compatibility[np.ix_(component, component)]
-        local_conflicts = ~local_compatibility
+        # np.ix_ 取这些股票两两之间的完整子矩阵，而非只取对应的对角元素。
+        local_conflicts = ~compatibility[np.ix_(component, component)]
         np.fill_diagonal(local_conflicts, False)
         group_count_lower_bound += _greedy_conflict_clique_lower_bound(
             _boolean_matrix_to_bit_masks(local_conflicts)
@@ -523,13 +487,16 @@ def _search_minimum_coloring(
     *,
     search_node_limit: int,
 ) -> tuple[list[int], bool, int]:
-    """用 DSATUR 分支限界搜索更少颜色；返回结果、是否已证明最优、节点数。"""
+    """尝试减少颜色数，返回最好着色、是否证明最优、实际搜索节点数。
+
+    颜色就是组号，冲突边的两端不能同组。每层先选择一只股票，依次尝试
+    可用组，递归安排剩余股票；返回时撤销本次安排，再尝试其他组。
+    """
 
     vertex_count = len(conflict_masks)
     best_colors = initial_colors.copy()
     best_color_count = max(initial_colors, default=-1) + 1
     degrees = [neighbors.bit_count() for neighbors in conflict_masks]
-
     colors = [-1] * vertex_count
     neighbor_color_masks = [0] * vertex_count
     color_sizes = [0] * vertex_count
@@ -537,94 +504,68 @@ def _search_minimum_coloring(
     search_was_cut_off = False
 
     def search(uncolored: int, used_color_count: int) -> None:
-        nonlocal best_colors
-        nonlocal best_color_count
-        nonlocal searched_nodes
-        nonlocal search_was_cut_off
+        # nonlocal 表示修改外层函数保存的“当前最好结果”和预算状态。
+        # 所有递归分支共享这些结果，不能在每层创建同名局部变量。
+        nonlocal best_colors, best_color_count, searched_nodes, search_was_cut_off
 
-        # 已经达到可靠下界时，不可能再找到颜色更少的方案，因而已经证明最优。
         if best_color_count == lower_bound or search_was_cut_off:
+            return
+        # 只搜索能严格改善上界的分支；检查放在叶子前，避免覆盖更好的结果。
+        if used_color_count >= best_color_count:
             return
         if not uncolored:
             best_colors = colors.copy()
             best_color_count = used_color_count
-            return
-        if used_color_count >= best_color_count:
             return
         if search_node_limit and searched_nodes >= search_node_limit:
             search_was_cut_off = True
             return
         searched_nodes += 1
 
-        vertex = max(
-            _vertices_from_mask(uncolored),
-            key=lambda candidate: (
-                neighbor_color_masks[candidate].bit_count(),
-                degrees[candidate],
-                -candidate,
-            ),
-        )
+        vertex = _select_dsatur_vertex(uncolored, neighbor_color_masks, degrees)
         remaining = uncolored ^ (1 << vertex)
         blocked_colors = neighbor_color_masks[vertex]
 
-        # 先尝试已有且成员较多的颜色，通常可以更快找到比当前上界更好的方案。
-        available_colors = [
-            color
-            for color in range(used_color_count)
-            if not blocked_colors & (1 << color)
-        ]
+        available_colors = []
+        for color in range(used_color_count):
+            if not (blocked_colors & (1 << color)):
+                available_colors.append(color)
+        # 优先尝试成员较多的已有组；lambda 的两个排序条件分别是人数降序、组号升序。
         available_colors.sort(key=lambda color: (-color_sizes[color], color))
+        # 所有未用过的组号意义相同，只试下一个编号，省去纯组号置换的重复解。
+        available_colors.append(used_color_count)
 
+        # 已有组和新组共用这段“安排 -> 更新 -> 递归 -> 撤销”，避免两份状态逻辑。
         for color in available_colors:
+            next_color_count = max(used_color_count, color + 1)
+            # 前一分支可能刚降低了上界，所以这里每次都要重新比较。
+            if next_color_count >= best_color_count:
+                continue
+
             colors[vertex] = color
             color_sizes[color] += 1
-            changed_neighbors: list[tuple[int, int]] = []
+            changed_neighbors = []
             color_bit = 1 << color
-            neighbors = conflict_masks[vertex] & remaining
-            while neighbors:
-                neighbor_bit = neighbors & -neighbors
-                neighbors ^= neighbor_bit
-                neighbor = neighbor_bit.bit_length() - 1
+            for neighbor in _vertices_from_mask(conflict_masks[vertex] & remaining):
                 old_mask = neighbor_color_masks[neighbor]
-                if not old_mask & color_bit:
+                if not (old_mask & color_bit):
                     changed_neighbors.append((neighbor, old_mask))
                     neighbor_color_masks[neighbor] = old_mask | color_bit
 
-            search(remaining, used_color_count)
+            search(remaining, next_color_count)
 
+            # 邻居可能原本就因其他股票禁用了此颜色。保存旧值后恢复，不能直接
+            # 把所有邻居的该位清零，否则会丢失进入此分支前已经存在的冲突。
             for neighbor, old_mask in changed_neighbors:
                 neighbor_color_masks[neighbor] = old_mask
             color_sizes[color] -= 1
             colors[vertex] = -1
+
             if best_color_count == lower_bound or search_was_cut_off:
                 return
 
-        # 新颜色的编号固定为 used_color_count，避免枚举只是颜色编号不同的重复解。
-        # 新建后若已经达到当前最优组数，就不可能改进，因此只尝试严格更小的情况。
-        if used_color_count + 1 < best_color_count:
-            color = used_color_count
-            colors[vertex] = color
-            color_sizes[color] = 1
-            changed_neighbors = []
-            color_bit = 1 << color
-            neighbors = conflict_masks[vertex] & remaining
-            while neighbors:
-                neighbor_bit = neighbors & -neighbors
-                neighbors ^= neighbor_bit
-                neighbor = neighbor_bit.bit_length() - 1
-                old_mask = neighbor_color_masks[neighbor]
-                if not old_mask & color_bit:
-                    changed_neighbors.append((neighbor, old_mask))
-                    neighbor_color_masks[neighbor] = old_mask | color_bit
-
-            search(remaining, used_color_count + 1)
-
-            for neighbor, old_mask in changed_neighbors:
-                neighbor_color_masks[neighbor] = old_mask
-            color_sizes[color] = 0
-            colors[vertex] = -1
-
     search((1 << vertex_count) - 1, 0)
+    # 达到下界，或穷尽所有可能改善的分支，才能证明最优；预算耗尽不算证明。
     is_optimal = best_color_count == lower_bound or not search_was_cut_off
     return best_colors, is_optimal, searched_nodes
 
@@ -635,95 +576,92 @@ def minimize_compatibility_groups(
     max_exact_component_stocks: int = DEFAULT_MAX_EXACT_COMPONENT_STOCKS,
     exact_search_node_limit: int = DEFAULT_EXACT_SEARCH_NODE_LIMIT,
 ) -> pd.DataFrame:
-    """把兼容矩阵划分成尽量少的全配对兼容组。
+    """求尽量少的全配对兼容组，并报告上下界及最优性。
 
-    在兼容图中，每个合法组必须是 clique。把不兼容关系取补图后，问题等价于
-    “用尽量少的颜色给冲突图着色”，一般情形属于 NP-hard 问题。
+    输入是本版生成的对称布尔矩阵，两轴使用相同的字符串 stock_id。
+    每个合法组在兼容图中是 clique，即成员两两相连；在冲突图中则是一个
+    颜色，即成员之间没有冲突。最少分组因此等价于冲突图的最少着色。
 
-    本函数先用 DSATUR 得到较好的上界，再用冲突 clique 得到可靠下界：若二者
-    相等就已证明最优；否则仅对不超过 ``max_exact_component_stocks`` 的兼容图
-    连通分量做分支限界精确搜索。搜索节点达到 ``exact_search_node_limit`` 后
-    返回当前最好结果，并通过 DataFrame.attrs 明确标记尚未证明最优。将节点上限
-    设为 0 可取消搜索节点限制，但 NP-hard 输入可能运行很久。
+    先拆兼容分量，再在各自内部拆冲突分量。精确搜索的股票数限制和节点
+    预算都作用于最终的每个冲突分量。超过限制时保留合法解及可靠下界，
+    不把“当前找到的最好解”当成已经证明最少。节点预算 0 表示不限制。
     """
 
-    if max_exact_component_stocks < 0:
-        raise ValueError("max_exact_component_stocks must be non-negative")
-    if exact_search_node_limit < 0:
-        raise ValueError("exact_search_node_limit must be non-negative")
-
-    ordered = compatibility_matrix.copy()
-    ordered.index = ordered.index.astype(str)
-    ordered.columns = ordered.columns.astype(str)
-    ordered = ordered.sort_index()
-    if set(ordered.index) != set(ordered.columns):
-        raise ValueError("compatibility matrix must use the same row and column labels")
-    ordered = ordered.reindex(columns=ordered.index)
-    if ordered.isna().any().any():
-        raise ValueError("compatibility matrix must not contain missing values")
-
-    compatibility = ordered.to_numpy(dtype=bool, copy=True)
-    if not np.array_equal(compatibility, compatibility.T):
-        raise ValueError("compatibility matrix must be symmetric")
-    np.fill_diagonal(compatibility, True)
-
+    # 排序使并列选择和最终组号可复现；输入合法，不再做类型/标签/对称性校验。
+    ordered = compatibility_matrix.sort_index().sort_index(axis=1)
     stock_ids = ordered.index.tolist()
+    compatibility = ordered.to_numpy(dtype=bool, copy=True)
+    np.fill_diagonal(compatibility, True)
     compatibility_masks = _boolean_matrix_to_bit_masks(compatibility)
-    components = _connected_components(compatibility_masks)
 
-    groups: list[list[str]] = []
+    groups = []
     total_lower_bound = 0
-    all_components_proven_optimal = True
     total_searched_nodes = 0
 
-    # 不同兼容连通分量之间没有任何兼容边，所以一个合法组不可能跨分量；分别
-    # 求解再相加不会损失全局最优性，也能把多数实际问题缩成更小的子问题。
-    for component in components:
-        local_compatibility = compatibility[np.ix_(component, component)]
-        local_conflicts = ~local_compatibility
+    # 不同兼容分量之间没有兼容边，股票不能跨分量同组：组数应相加。
+    for component in _connected_components(compatibility_masks):
+        # np.ix_(rows, columns) 取行列的所有组合，得到分量内部的完整子矩阵。
+        # ~ 对布尔值取反，把“兼容”变成“冲突”；股票与自己永远没有冲突。
+        local_conflicts = ~compatibility[np.ix_(component, component)]
         np.fill_diagonal(local_conflicts, False)
         conflict_masks = _boolean_matrix_to_bit_masks(local_conflicts)
+        component_colors = [-1] * len(component)
+        component_lower_bound = 0
 
-        colors = _dsatur_greedy_coloring(conflict_masks)
-        color_count = max(colors, default=-1) + 1
-        lower_bound = _greedy_conflict_clique_lower_bound(conflict_masks)
-        component_is_optimal = color_count == lower_bound
+        # 不同冲突分量之间没有冲突，可以复用同一批颜色：组数取最大值。
+        # 例如两个各需 3 组的独立冲突问题，合起来仍然只需 3 组，而不是 6 组。
+        for conflict_component in _connected_components(conflict_masks):
+            sub_conflicts = local_conflicts[np.ix_(
+                conflict_component, conflict_component
+            )]
+            sub_masks = _boolean_matrix_to_bit_masks(sub_conflicts)
+            colors = _dsatur_greedy_coloring(sub_masks)
+            color_count = max(colors) + 1
+            lower_bound = _greedy_conflict_clique_lower_bound(sub_masks)
+            is_optimal = color_count == lower_bound
 
-        if not component_is_optimal and len(component) <= max_exact_component_stocks:
-            colors, component_is_optimal, searched_nodes = _search_minimum_coloring(
-                conflict_masks,
-                colors,
-                lower_bound,
-                search_node_limit=exact_search_node_limit,
-            )
-            color_count = max(colors, default=-1) + 1
-            total_searched_nodes += searched_nodes
+            if not is_optimal and len(conflict_component) <= max_exact_component_stocks:
+                colors, is_optimal, searched_nodes = _search_minimum_coloring(
+                    sub_masks,
+                    colors,
+                    lower_bound,
+                    search_node_limit=exact_search_node_limit,
+                )
+                color_count = max(colors) + 1
+                total_searched_nodes += searched_nodes
 
-        if component_is_optimal:
-            # 搜索穷尽或上下界相遇后，真实下界就是已经得到的最优组数。
-            lower_bound = color_count
-        else:
-            all_components_proven_optimal = False
-        total_lower_bound += lower_bound
+            if is_optimal:
+                lower_bound = color_count
+            component_lower_bound = max(component_lower_bound, lower_bound)
 
-        groups_by_color: dict[int, list[str]] = {}
-        for local_vertex, color in enumerate(colors):
-            global_vertex = component[local_vertex]
-            groups_by_color.setdefault(color, []).append(stock_ids[global_vertex])
+            # 子问题颜色从 0 开始，不加偏移：跨冲突分量的同色成员可以安全合组。
+            for sub_position, color in enumerate(colors):
+                local_position = conflict_component[sub_position]
+                component_colors[local_position] = color
+
+        total_lower_bound += component_lower_bound
+        groups_by_color = {}
+        for local_position, color in enumerate(component_colors):
+            if color not in groups_by_color:
+                groups_by_color[color] = []
+            global_position = component[local_position]
+            groups_by_color[color].append(stock_ids[global_position])
         groups.extend(groups_by_color.values())
 
-    # 颜色编号只是求解器内部符号。最终按每组最小 stock_id 稳定排序、重新编号，
-    # 使同一输入的 CSV 输出可复现。
-    groups = [sorted(group) for group in groups]
+    # 内部颜色仅用于求解。对成员及各组排序，再从 1 编号，保证 CSV 易读且稳定。
+    for group in groups:
+        group.sort()
     groups.sort(key=lambda group: group[0])
-    rows = [
-        (stock_id, group_id)
-        for group_id, group in enumerate(groups, start=1)
-        for stock_id in group
-    ]
+    rows = []
+    for group_id, members in enumerate(groups, start=1):
+        for stock_id in members:
+            rows.append((stock_id, group_id))
+
     result = pd.DataFrame(rows, columns=["stock_id", "group_id"])
-    result.attrs["grouping_method"] = GROUPING_METHOD_MINIMIZE
-    result.attrs["optimal_group_count_proven"] = all_components_proven_optimal
+    result.attrs["grouping_method"] = "minimize"
+    # 用最终上下界判断即可，不要求每个冲突子问题都独立完成证明。
+    # 例如一个子问题已证需 3 组，另一个只知需 2–3 组，复用颜色后整体仍已证为 3。
+    result.attrs["optimal_group_count_proven"] = total_lower_bound == len(groups)
     result.attrs["group_count_lower_bound"] = total_lower_bound
     result.attrs["group_count_upper_bound"] = len(groups)
     result.attrs["exact_search_nodes"] = total_searched_nodes
@@ -1001,13 +939,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--max-exact-component-stocks",
         type=int,
         default=DEFAULT_MAX_EXACT_COMPONENT_STOCKS,
-        help="minimize 方法允许精确搜索的最大连通分量股票数（默认：%(default)s）",
+        help="minimize 方法允许精确搜索的最大冲突分量股票数（默认：%(default)s）",
     )
     parser.add_argument(
         "--exact-search-node-limit",
         type=int,
         default=DEFAULT_EXACT_SEARCH_NODE_LIMIT,
-        help="minimize 方法每次精确搜索的节点上限；0 表示不限制（默认：%(default)s）",
+        help="minimize 方法每个冲突分量的搜索节点上限；0 表示不限制（默认：%(default)s）",
     )
     parser.add_argument(
         "--match-counts-csv",
