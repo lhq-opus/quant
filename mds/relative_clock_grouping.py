@@ -410,12 +410,14 @@ def greedy_group_by_match_rate(
         for second_stock in range(first_stock + 1, stock_count):
             if compatibility[first_stock, second_stock]:
                 # 元组从左向右排序。取负号把升序变成匹配率、匹配次数降序；
-                # 股票位置已经按 ID 排序，不必在每个候选中再存两份 ID 字符串。
+                # 前四项保留原排序规则；最后两项保存真实 stock_id，方便调试。
                 candidate_pairs.append((
                     -rate_values[first_stock, second_stock],
                     -int(count_values[first_stock, second_stock]),
                     first_stock,
                     second_stock,
+                    stock_ids[first_stock],
+                    stock_ids[second_stock],
                 ))
     candidate_pairs.sort()
 
@@ -427,7 +429,10 @@ def greedy_group_by_match_rate(
     # allowed_masks[G] 保存“与 G 组所有成员都兼容”的股票集合。
     # 单例组的集合就是该股票的兼容行；之后只在成功合并时更新交集。
     allowed_masks = compatibility_masks.copy()
-    for _, _, first_stock, second_stock in candidate_pairs:
+    # 两个 stock_id 只用于调试查看；矩阵和位集合仍通过原位置索引访问。
+    for (
+        _, _, first_stock, second_stock, first_stock_id, second_stock_id
+    ) in candidate_pairs:
         first_group = group_of[first_stock]
         second_group = group_of[second_stock]
         if first_group == second_group:
