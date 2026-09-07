@@ -269,6 +269,8 @@ class RunAllLessonsTest(unittest.TestCase):
         self.assertIn("local_group_id 只是记录级候选时间簇", output.getvalue())
         self.assertIn("跨 chunk 保留完整 snapshot", output.getvalue())
         self.assertIn("第五课：创建、合并与追加 CSV", output.getvalue())
+        self.assertIn("第六课：Bokeh 与 MDS 可交互可视化", output.getvalue())
+        self.assertIn("相对 clock 向量、关系矩阵", output.getvalue())
 
 
 if __name__ == "__main__":

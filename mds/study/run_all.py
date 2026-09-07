@@ -1,9 +1,10 @@
-"""依次运行 MDS pandas 教程的全部课程。"""
+"""依次运行 MDS pandas 与 Bokeh 教程的全部课程。"""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 
+from .bokeh_06_mds_visualization import run_temporary_example as lesson_06_main
 from .pandas_01_io_selection import main as lesson_01_main
 from .pandas_02_snapshot_groupby import main as lesson_02_main
 from .pandas_03_aggregate_merge import main as lesson_03_main
@@ -16,6 +17,7 @@ LESSONS: tuple[tuple[str, Callable[[], int]], ...] = (
     ("第三课：聚合、配对与 merge", lesson_03_main),
     ("第四课：时间切片与大文件", lesson_04_main),
     ("第五课：创建、合并与追加 CSV", lesson_05_main),
+    ("第六课：Bokeh 与 MDS 可交互可视化", lesson_06_main),
 )
 
 
