@@ -45,7 +45,7 @@ enum class TradingSession {
 //
 // cancel 的 Side 由上游从原订单补全；order_type 对撤单无意义，填成 '\0'。
 // 两类事件都保存 ChannelNo 与原订单的 ASN，用于撤单时查回实际挂单价。
-// cancel.price 仍保留原始 TradePrice，但类型 1/U 可能动态定价，不能用它定位盘口。
+// cancel.price 仍保留原始 TradePrice，但 U 可能动态定价，类型 1 不留挂单，不能据此扣量。
 // auction_price 来自当前集合阶段真实成交的 TradePrice；连续阶段或无成交时为 0。
 struct Event {
   std::string caa;

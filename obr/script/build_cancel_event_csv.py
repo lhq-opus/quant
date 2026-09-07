@@ -74,8 +74,8 @@ def fill_cancel_order_fields(order_frame, trade_frame):
         sides.append(side)
         order_asns.append(order_asn)
 
-    # TradePrice 保留原始申报价，仅供查看。1/U 的原始 Price 可能是 0，真实挂单价
-    # 必须由重放器在订单到达时计算并记住；撤单靠订单引用查该价格，不靠本列定位。
+    # TradePrice 保留原始申报价，仅供查看。类型 1 不留挂单，U 的实际价由重放器记住；
+    # 撤单靠订单引用判断是否入簿并查回价格，不靠本列可能为 0 的原始价格定位。
     cancels["TradePrice"] = prices
     cancels["Side"] = sides
     cancels["OrderApplSeqNum"] = order_asns

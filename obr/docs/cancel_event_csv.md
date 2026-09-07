@@ -58,10 +58,10 @@ caa,TransactionTime,Side,OrderType,Price,OrderQty,ExecType,TradeQty,TradePrice,C
 - `AuctionPrice` 的含义是该集合阶段的实际成交价，填写规则见上文；
 - 对当前行不适用的业务列为空。所有 CSV 都通过 pandas 读写，字段先按字符串保留。
 
-`TradePrice` 在撤单行中仍保存原订单的原始价格。对于 `OrderType=1/U`，这个价格可能
-为 0，也不一定是订单真正挂入盘口的价格。replay 会在处理 order 时记录
-`(ChannelNo, OrderApplSeqNum) -> 实际挂单价格`，后续撤单按该引用查价；上游无需自己
-再做一次盘口重放。
+`TradePrice` 在撤单行中仍保存原订单的原始价格。类型 `1` 按 IOC 处理、不留下挂单；
+类型 `U` 的原始价格可能为 0，不一定是实际挂单价。replay 会在处理 order 时记录
+`(ChannelNo, OrderApplSeqNum) -> 实际挂单价格或 0`，后续撤单按引用查价。0 表示
+该单未留下挂单，对应撤单通知不再扣量；上游无需自己再做一次盘口重放。
 
 当前输入范围是单证券、单交易日、完整且合法的数据，订单索引的唯一性由这个约定保证。
 脚本不做表头推测、未知枚举恢复或通用异常包装。输出覆盖保护仍然保留，以免误覆盖输入。

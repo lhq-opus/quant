@@ -37,9 +37,8 @@ private:
   typedef std::pair<std::int64_t, std::int64_t> OrderKey;
 
   void add_order(const Event& event);
-  void apply_opponent_best_order(const Event& event);
   void apply_own_best_order(const Event& event);
-  void apply_limit_order(const Event& event, Price limit_price);
+  void apply_continuous_order(const Event& event);
   void apply_cancel(const Event& event);
   void record_trade(Price price, Quantity quantity);
 
@@ -50,7 +49,7 @@ private:
   BidLevels bids_;
   AskLevels asks_;
   // 单证券、单交易日内以频道和原订单 ASN 为键。只记定价，不跟踪每张订单的成交量。
-  // 0 表示 1/U 因缺少最优价格自动撤销，之后的撤单消息无需再次扣减盘口。
+  // 0 表示类型 1 不留下挂单，或 U 因无本方最优价自动撤销；后续撤单无需再扣盘口。
   std::map<OrderKey, Price> order_prices_;
   Quantity cumulative_trade_quantity_;
   Turnover cumulative_turnover_;

@@ -123,7 +123,7 @@ class EventOrderBook:
         # 只记录每张原订单实际使用的价格，方便后续撤单定位价格档。
         # 键为“频道、原订单 ASN”，避免不同频道的相同 ASN 相互覆盖。
         # 这里没有保存订单剩余量或同价 FIFO，也不参与具体买卖订单配对。
-        # 价格 0 表示最优价不存在、申报已自动撤销，之后的撤单不再扣减盘口。
+        # 价格 0 表示类型 1 不留挂单，或 U 无本方最优价，之后的撤单不再扣减盘口。
         self.order_prices = {}
 
         # 价格档撮合能够确定成交总量和成交额，但不能确定实际成交消息笔数。
@@ -143,8 +143,8 @@ class EventOrderBook:
 
         if event.ExecType != "4":
             order_key = (int(event.ChannelNo), int(event.OrderApplSeqNum))
-            # 限价单直接使用原价；1/U 的实际价格要等到读取到达时的盘口后确定。
-            # 先把 1/U 记为 0，若没有可用最优价，自动撤销分支便保留这个标记。
+            # 限价单使用原价；类型 1 不留下挂单，始终记为 0。
+            # U 先记为 0，存在本方最优价时再填写实际价格，否则自动撤销。
             self.order_prices[order_key] = (
                 Decimal(event.Price) if event.OrderType == "2" else Decimal("0")
             )
@@ -155,20 +155,14 @@ class EventOrderBook:
         elif session == CONTINUOUS_AUCTION:
             # 深交所逐笔行情只给出 OrderType=1/2/U，没有给出区分各种市价
             # 子类型所需的其他申报字段。为了保持这个 demo 简单、结果确定，约定：
-            #   1 = 对手方最优，未成交部分按该价格转成限价单；
+            #   1 = 即时成交剩余撤销：逐档消耗对手盘，不限五档，未成交部分不入簿；
             #   2 = 普通限价单；
             #   U = 本方最优，直接加入本方当前最优档。
-            if event.OrderType == "1":
-                self._apply_opponent_best_order(event)
-            elif event.OrderType == "U":
+            if event.OrderType == "U":
                 self._apply_own_best_order(event)
             else:
-                # 输入保证 OrderType 只有 1、2、U，所以最后一个分支就是 2。
-                self._apply_limit_order(
-                    event.Side,
-                    Decimal(event.Price),
-                    int(event.OrderQty),
-                )
+                # 输入保证 OrderType 只有 1、2、U，市价单和限价单共用逐档成交逻辑。
+                self._apply_continuous_order(event)
             event_type = "order"
         else:
             # 市价申报只用于连续竞价，因此合法的集合竞价 order 是限价单。
@@ -183,25 +177,6 @@ class EventOrderBook:
         quantity = int(event.OrderQty)
         levels = self.bids if event.Side == "1" else self.asks
         levels[price] = levels.get(price, 0) + quantity
-
-    def _apply_opponent_best_order(self, event):
-        """把类型 1 按本 demo 的“对手方最优、剩余转限价”约定处理。"""
-        if event.Side == "1":
-            # 买单用到达时的卖一作为限价。没有卖盘时，交易所自动撤销申报。
-            if not self.asks:
-                return
-            limit_price = min(self.asks)
-        else:
-            # 卖单与之对称：使用到达时的买一；没有买盘时自动撤销。
-            if not self.bids:
-                return
-            limit_price = max(self.bids)
-
-        # 以对手方最优价作为限价后，只可能吃掉这一价格档。
-        # 如果数量还有剩余，_apply_limit_order 会把它留在同一个价格上。
-        order_key = (int(event.ChannelNo), int(event.OrderApplSeqNum))
-        self.order_prices[order_key] = limit_price
-        self._apply_limit_order(event.Side, limit_price, int(event.OrderQty))
 
     def _apply_own_best_order(self, event):
         """把类型 U 委托加入本方到达时的最优价格档。"""
@@ -218,15 +193,19 @@ class EventOrderBook:
         self.order_prices[order_key] = best_own_price
         levels[best_own_price] += int(event.OrderQty)
 
-    def _apply_limit_order(self, side, limit_price, quantity):
-        """按价格优先逐档成交，再把未成交数量加入指定限价。"""
-        remaining_quantity = quantity
+    def _apply_continuous_order(self, event):
+        """市价单逐档成交、余量撤销；限价单检查价格边界、余量入簿。"""
+        is_limit_order = event.OrderType == "2"
+        # 市价单不读取 CSV Price。这里的 0 只是占位，不用它限制成交价或挂单。
+        limit_price = Decimal(event.Price) if is_limit_order else Decimal("0")
+        remaining_quantity = int(event.OrderQty)
 
-        if side == "1":
-            # 买单从最低卖价开始成交。只要卖一不高于买入限价，就继续看下一卖价。
+        if event.Side == "1":
+            # 删除吃空的卖一后，min(asks) 就是原卖二，下一轮继续成交。
+            # 市价买单不受原卖一价格限制；只有限价买单遇到更高卖价时停止。
             while remaining_quantity > 0 and self.asks:
                 best_ask_price = min(self.asks)
-                if best_ask_price > limit_price:
+                if is_limit_order and best_ask_price > limit_price:
                     break
 
                 traded_quantity = min(
@@ -240,17 +219,17 @@ class EventOrderBook:
                 if self.asks[best_ask_price] == 0:
                     del self.asks[best_ask_price]
 
-            # 买单仍有剩余，说明剩余数量无法继续成交，应进入买盘的委托价格档。
-            if remaining_quantity > 0:
+            # 只有限价单把剩余量挂入买盘。市价单未成交部分直接撤销，无需再改盘口。
+            if is_limit_order and remaining_quantity > 0:
                 self.bids[limit_price] = (
                     self.bids.get(limit_price, 0) + remaining_quantity
                 )
             return
 
-        # 卖单与买单完全对称：从最高买价开始成交，再依次查看买二、买三。
+        # 市价卖单从买一继续吃买二、买三；限价卖单遇到低于限价的买价时停止。
         while remaining_quantity > 0 and self.bids:
             best_bid_price = max(self.bids)
-            if best_bid_price < limit_price:
+            if is_limit_order and best_bid_price < limit_price:
                 break
 
             traded_quantity = min(
@@ -264,8 +243,8 @@ class EventOrderBook:
             if self.bids[best_bid_price] == 0:
                 del self.bids[best_bid_price]
 
-        # 卖单仍有剩余时，把剩余数量加入卖盘的委托价格档。
-        if remaining_quantity > 0:
+        # 与买方对称：限价余量入簿，市价余量撤销；对手盘一开始为空也适用。
+        if is_limit_order and remaining_quantity > 0:
             self.asks[limit_price] = self.asks.get(limit_price, 0) + remaining_quantity
 
     def _record_trade(self, trade_price, trade_quantity):
@@ -389,11 +368,11 @@ class EventOrderBook:
     def _apply_cancel(self, event):
         """根据撤单方向，从对应买盘或卖盘价格档扣减数量。"""
         order_key = (int(event.ChannelNo), int(event.OrderApplSeqNum))
-        # 上游 TradePrice 只补得出原始 Price；1/U 原价可能为 0，不能用于定位。
+        # U 的原始 TradePrice 可能为 0，不能定位实际价格档；类型 1 则不留下挂单。
         # 实际挂单价在原订单到达时已经确定，后续盘口最优价变化也不影响这个价格。
         price = self.order_prices[order_key]
         if price == 0:
-            # 最优价不存在的申报已经自动撤销，后续撤单通知不需要再改变盘口。
+            # 市价单余量已撤销，或 U 因无本方最优价未入簿，对应撤单通知不能再扣一次。
             return
         quantity = int(event.TradeQty)
 

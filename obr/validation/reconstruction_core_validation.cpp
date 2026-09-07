@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -142,106 +143,153 @@ void validate_multi_level_continuous_trade() {
          "multi-level cumulative turnover should be 704.0000");
 }
 
-void validate_buy_opponent_and_own_best_orders() {
+void validate_market_order_sweeps_levels(char side) {
   obr::OrderBook book;
 
-  // 先放入 10.1000 的卖一。随后类型 1 买单的 CSV Price 故意填 0，证明实际限价
-  // 来自到达时的对手方最优价，而不是原始 Price。
-  const obr::Event ask = make_order("10:00", "100000000", '2', '2', 101000, 30, 1);
-  const obr::Event opponent_best_buy = make_order("10:01", "100100000", '1', '1', 0, 50, 2);
-  book.apply(ask, obr::TradingSession::ContinuousAuction);
-  book.apply(opponent_best_buy, obr::TradingSession::ContinuousAuction);
+  // 买单：卖一 10.00×100、卖二 10.01×200，市价买 150 后应留下 10.01×150。
+  // 卖单：买一 10.00×100、买二 9.99×200，市价卖 150 后应留下 9.99×150。
+  const char opponent_side = side == '1' ? '2' : '1';
+  const obr::Price second_price = side == '1' ? 100100 : 99900;
+  const obr::Event first = make_order("10:00", "100000000", opponent_side, '2', 100000, 100, 1);
+  const obr::Event second =
+      make_order("10:01", "100100000", opponent_side, '2', second_price, 200, 2);
+  const obr::Event market = make_order("10:02", "100200000", side, '1', 0, 150, 3);
+  book.apply(first, obr::TradingSession::ContinuousAuction);
+  book.apply(second, obr::TradingSession::ContinuousAuction);
+  book.apply(market, obr::TradingSession::ContinuousAuction);
 
-  obr::Snapshot snapshot = book.make_snapshot(opponent_best_buy);
-  expect(snapshot.asks.empty(), "type 1 buy should consume the opponent best ask");
-  expect(snapshot.bids.size() == 1U, "type 1 buy remainder should enter the bid book");
-  expect(snapshot.bids[0].price == 101000,
-         "type 1 buy remainder should use the former best ask price");
-  expect(snapshot.bids[0].quantity == 20, "type 1 buy remainder should be 20");
-
-  // U 买单同样故意填 Price=0；它不主动成交，只加入当前买一 10.1000。
-  const obr::Event own_best_buy = make_order("10:02", "100200000", '1', 'U', 0, 15, 3);
-  book.apply(own_best_buy, obr::TradingSession::ContinuousAuction);
-  snapshot = book.make_snapshot(own_best_buy);
-  expect(snapshot.bids[0].price == 101000, "U buy should use the current best bid price");
-  expect(snapshot.bids[0].quantity == 35, "U buy should join the current best bid level");
-
-  // 上游保留 Price=0 时，两种撤单仍应查回实际价格 10.1000，分别扣掉自己的剩余量。
-  const obr::Event cancel_own = make_cancel("10:03", "100300000", own_best_buy, 15);
-  const obr::Event cancel_opponent = make_cancel("10:04", "100400000", opponent_best_buy, 20);
-  book.apply(cancel_own, obr::TradingSession::ContinuousAuction);
-  snapshot = book.make_snapshot(cancel_own);
-  expect(snapshot.bids[0].quantity == 20, "U buy cancel should use its actual bid price");
-  book.apply(cancel_opponent, obr::TradingSession::ContinuousAuction);
-  expect(book.make_snapshot(cancel_opponent).bids.empty(),
-         "type 1 buy cancel should remove its repriced remainder");
-  expect(book.cumulative_trade_quantity() == 30, "type 1 buy should trade 30");
-  expect(book.cumulative_turnover() == 3030000, "type 1 buy turnover should be 303.0000");
+  const obr::Snapshot snapshot = book.make_snapshot(market);
+  const std::vector<obr::PriceLevel>& opposite = side == '1' ? snapshot.asks : snapshot.bids;
+  const std::vector<obr::PriceLevel>& own = side == '1' ? snapshot.bids : snapshot.asks;
+  expect(own.empty(), "market order must not leave a resting order");
+  expect(opposite.size() == 1U, "market order should consume the first level");
+  expect(opposite[0].price == second_price && opposite[0].quantity == 150,
+         "market order should continue trading 50 at the second level");
+  expect(book.cumulative_trade_quantity() == 150, "market order should trade 150");
+  expect(book.cumulative_turnover() == (side == '1' ? 15005000 : 14995000),
+         "each market fill should use its opposing level price");
 }
 
-void validate_sell_opponent_and_own_best_orders() {
+void validate_market_order_cancels_remainder(char side) {
   obr::OrderBook book;
 
-  // 卖方逻辑与买方对称：类型 1 卖单使用到达时的买一 10.0000，只成交该档，
-  // 剩余 10 股转成 10.0000 的卖单。
-  const obr::Event bid = make_order("10:00", "100000000", '1', '2', 100000, 40, 1);
-  const obr::Event opponent_best_sell = make_order("10:01", "100100000", '2', '1', 0, 50, 2);
-  book.apply(bid, obr::TradingSession::ContinuousAuction);
-  book.apply(opponent_best_sell, obr::TradingSession::ContinuousAuction);
+  // 对手方两档合计只有 70，市价单 100 成交后，剩余 30 应直接撤销。
+  const char opponent_side = side == '1' ? '2' : '1';
+  const obr::Price own_price = side == '1' ? 99000 : 101000;
+  const obr::Price second_price = side == '1' ? 100100 : 99900;
+  const obr::Event own_limit = make_order("10:00", "100000000", side, '2', own_price, 70, 1);
+  const obr::Event first = make_order("10:01", "100100000", opponent_side, '2', 100000, 30, 2);
+  const obr::Event second =
+      make_order("10:02", "100200000", opponent_side, '2', second_price, 40, 3);
+  const obr::Event market = make_order("10:03", "100300000", side, '1', 0, 100, 4);
+  book.apply(own_limit, obr::TradingSession::ContinuousAuction);
+  book.apply(first, obr::TradingSession::ContinuousAuction);
+  book.apply(second, obr::TradingSession::ContinuousAuction);
+  book.apply(market, obr::TradingSession::ContinuousAuction);
 
-  obr::Snapshot snapshot = book.make_snapshot(opponent_best_sell);
-  expect(snapshot.bids.empty(), "type 1 sell should consume the opponent best bid");
-  expect(snapshot.asks.size() == 1U, "type 1 sell remainder should enter the ask book");
-  expect(snapshot.asks[0].price == 100000,
-         "type 1 sell remainder should use the former best bid price");
-  expect(snapshot.asks[0].quantity == 10, "type 1 sell remainder should be 10");
+  const obr::Snapshot snapshot = book.make_snapshot(market);
+  const std::vector<obr::PriceLevel>& opposite = side == '1' ? snapshot.asks : snapshot.bids;
+  const std::vector<obr::PriceLevel>& own = side == '1' ? snapshot.bids : snapshot.asks;
+  expect(opposite.empty(), "market order should consume all available opposite quantity");
+  expect(own.size() == 1U && own[0].price == own_price && own[0].quantity == 70,
+         "market remainder must not change the own-side book");
 
-  const obr::Event own_best_sell = make_order("10:02", "100200000", '2', 'U', 0, 15, 3);
-  book.apply(own_best_sell, obr::TradingSession::ContinuousAuction);
-  snapshot = book.make_snapshot(own_best_sell);
-  expect(snapshot.asks[0].price == 100000, "U sell should use the current best ask price");
-  expect(snapshot.asks[0].quantity == 25, "U sell should join the current best ask level");
-
-  const obr::Event cancel_own = make_cancel("10:03", "100300000", own_best_sell, 15);
-  const obr::Event cancel_opponent = make_cancel("10:04", "100400000", opponent_best_sell, 10);
-  book.apply(cancel_own, obr::TradingSession::ContinuousAuction);
-  snapshot = book.make_snapshot(cancel_own);
-  expect(snapshot.asks[0].quantity == 10, "U sell cancel should use its actual ask price");
-  book.apply(cancel_opponent, obr::TradingSession::ContinuousAuction);
-  expect(book.make_snapshot(cancel_opponent).asks.empty(),
-         "type 1 sell cancel should remove its repriced remainder");
-  expect(book.cumulative_trade_quantity() == 40, "type 1 sell should trade 40");
-  expect(book.cumulative_turnover() == 4000000, "type 1 sell turnover should be 400.0000");
+  // 随后另一张订单挂在最后成交价。原市价单的撤单通知不能误扣这张新订单。
+  const obr::Event later = make_order("10:04", "100400000", side, '2', second_price, 60, 5);
+  const obr::Event cancel = make_cancel("10:05", "100500000", market, 30);
+  book.apply(later, obr::TradingSession::ContinuousAuction);
+  book.apply(cancel, obr::TradingSession::ContinuousAuction);
+  const obr::Snapshot after_cancel = book.make_snapshot(cancel);
+  const std::vector<obr::PriceLevel>& remaining =
+      side == '1' ? after_cancel.bids : after_cancel.asks;
+  expect(remaining.size() == 2U && remaining[0].price == second_price &&
+             remaining[0].quantity == 60 && remaining[1].price == own_price &&
+             remaining[1].quantity == 70,
+         "IOC cancel notification must not reduce other resting orders");
+  expect(book.cumulative_trade_quantity() == 70, "IOC remainder cancel must not add trades");
+  expect(book.cumulative_turnover() == (side == '1' ? 7004000 : 6996000),
+         "IOC remainder cancel must not change turnover");
 }
 
-void validate_best_price_orders_with_empty_book() {
+void validate_market_order_beyond_five_levels(char side) {
   obr::OrderBook book;
 
-  // 对手方最优没有对手盘、本方最优没有本方盘口时，都没有可采用的价格，申报自动撤销。
-  const obr::Event opponent_best_buy = make_order("10:00", "100000000", '1', '1', 0, 10, 1);
+  // 五档只是输出深度。放入七档、每档 10 股，市价单 65 必须成交到第七档。
+  const char opponent_side = side == '1' ? '2' : '1';
+  const obr::Price price_step = side == '1' ? 100 : -100;
+  for (int level = 0; level < 7; ++level) {
+    const obr::Event order = make_order("10:00", "100000000", opponent_side, '2',
+                                        100000 + level * price_step, 10, level + 1);
+    book.apply(order, obr::TradingSession::ContinuousAuction);
+  }
+  const obr::Event market = make_order("10:01", "100100000", side, '1', 0, 65, 8);
+  book.apply(market, obr::TradingSession::ContinuousAuction);
+  const obr::Snapshot snapshot = book.make_snapshot(market);
+  const std::vector<obr::PriceLevel>& opposite = side == '1' ? snapshot.asks : snapshot.bids;
+  expect(opposite.size() == 1U && opposite[0].price == 100000 + 6 * price_step &&
+             opposite[0].quantity == 5,
+         "market order should reach the seventh level and leave 5");
+  expect(book.cumulative_trade_quantity() == 65, "market matching must not stop at five levels");
+  expect(book.cumulative_turnover() == (side == '1' ? 6518000 : 6482000),
+         "deep market fills should use every consumed price");
+}
+
+void validate_own_best_order_and_cancel(char side) {
+  obr::OrderBook book;
+
+  // U 的 Price=0，实际加入 10.00。之后本方最优价变化，撤单仍应扣原来的 10.00。
+  const obr::Event limit = make_order("10:00", "100000000", side, '2', 100000, 40, 1);
+  const obr::Event own_best = make_order("10:01", "100100000", side, 'U', 0, 15, 2);
+  const obr::Price better_price = side == '1' ? 100100 : 99900;
+  const obr::Event better = make_order("10:02", "100200000", side, '2', better_price, 20, 3);
+  book.apply(limit, obr::TradingSession::ContinuousAuction);
+  book.apply(own_best, obr::TradingSession::ContinuousAuction);
+  book.apply(better, obr::TradingSession::ContinuousAuction);
+
+  const obr::Snapshot before_cancel = book.make_snapshot(better);
+  const std::vector<obr::PriceLevel>& before =
+      side == '1' ? before_cancel.bids : before_cancel.asks;
+  expect(before.size() == 2U && before[1].price == 100000 && before[1].quantity == 55,
+         "U order should join the best price at its arrival");
+  const obr::Event cancel = make_cancel("10:03", "100300000", own_best, 15);
+  book.apply(cancel, obr::TradingSession::ContinuousAuction);
+  const obr::Snapshot after_cancel = book.make_snapshot(cancel);
+  const std::vector<obr::PriceLevel>& after = side == '1' ? after_cancel.bids : after_cancel.asks;
+  expect(after.size() == 2U && after[0].price == better_price && after[0].quantity == 20 &&
+             after[1].price == 100000 && after[1].quantity == 40,
+         "U cancel should use its original assigned price, not the new best price");
+  expect(book.cumulative_trade_quantity() == 0 && book.cumulative_turnover() == 0,
+         "own-best additions and cancellations must not generate trades");
+}
+
+void validate_market_and_own_best_with_empty_book() {
+  obr::OrderBook book;
+
+  // 市价单没有对手盘时全部撤销；U 没有本方最优价时也自动撤销。
+  const obr::Event market_buy = make_order("10:00", "100000000", '1', '1', 0, 10, 1);
   const obr::Event own_best_buy = make_order("10:01", "100100000", '1', 'U', 0, 10, 2);
-  const obr::Event opponent_best_sell = make_order("10:02", "100200000", '2', '1', 0, 10, 3);
+  const obr::Event market_sell = make_order("10:02", "100200000", '2', '1', 0, 10, 3);
   const obr::Event own_best_sell = make_order("10:03", "100300000", '2', 'U', 0, 10, 4);
-  book.apply(opponent_best_buy, obr::TradingSession::ContinuousAuction);
+  book.apply(market_buy, obr::TradingSession::ContinuousAuction);
   book.apply(own_best_buy, obr::TradingSession::ContinuousAuction);
-  book.apply(opponent_best_sell, obr::TradingSession::ContinuousAuction);
+  book.apply(market_sell, obr::TradingSession::ContinuousAuction);
   book.apply(own_best_sell, obr::TradingSession::ContinuousAuction);
 
   // 自动撤销的新增事件没有入簿，后续对应撤单消息也不应访问价格 0 的盘口。
-  book.apply(make_cancel("10:04", "100400000", opponent_best_buy, 10),
+  book.apply(make_cancel("10:04", "100400000", market_buy, 10),
              obr::TradingSession::ContinuousAuction);
   book.apply(make_cancel("10:05", "100500000", own_best_buy, 10),
              obr::TradingSession::ContinuousAuction);
-  book.apply(make_cancel("10:06", "100600000", opponent_best_sell, 10),
+  book.apply(make_cancel("10:06", "100600000", market_sell, 10),
              obr::TradingSession::ContinuousAuction);
   book.apply(make_cancel("10:07", "100700000", own_best_sell, 10),
              obr::TradingSession::ContinuousAuction);
 
   const obr::Snapshot snapshot = book.make_snapshot(own_best_sell);
-  expect(snapshot.bids.empty(), "empty-book best-price orders should leave no bids");
-  expect(snapshot.asks.empty(), "empty-book best-price orders should leave no asks");
+  expect(snapshot.bids.empty(), "empty-book market and U orders should leave no bids");
+  expect(snapshot.asks.empty(), "empty-book market and U orders should leave no asks");
   expect(book.cumulative_trade_quantity() == 0,
-         "empty-book best-price orders should produce no trades");
+         "empty-book market and U orders should produce no trades");
 }
 
 void validate_call_auction_inclusive_difference() {
@@ -293,9 +341,15 @@ int main() {
   validate_cancel();
   validate_cancel_side_with_crossed_price();
   validate_multi_level_continuous_trade();
-  validate_buy_opponent_and_own_best_orders();
-  validate_sell_opponent_and_own_best_orders();
-  validate_best_price_orders_with_empty_book();
+  validate_market_order_sweeps_levels('1');
+  validate_market_order_sweeps_levels('2');
+  validate_market_order_cancels_remainder('1');
+  validate_market_order_cancels_remainder('2');
+  validate_market_order_beyond_five_levels('1');
+  validate_market_order_beyond_five_levels('2');
+  validate_own_best_order_and_cancel('1');
+  validate_own_best_order_and_cancel('2');
+  validate_market_and_own_best_with_empty_book();
   validate_call_auction_inclusive_difference();
   validate_call_auction_actual_price(100100, 100000);
   validate_call_auction_actual_price(100100, 100100);

@@ -26,23 +26,21 @@ void OrderBook::apply(const Event& event, TradingSession session) {
     return;
   }
 
-  // 先记录“未找到挂单价格”。下面实际定价后再覆盖，自动撤销分支则保持 0。
+  // 0 表示不留在盘口：市价单始终保持 0，限价单和有本方最优价的 U 单再填写价格。
   order_prices_[OrderKey(event.channel_no, event.order_appl_seq_num)] = 0;
 
   // 深交所逐笔行情只给出 OrderType=1/2/U，没有给出区分各种市价子类型所需的
   // TimeInForce、MaxPriceLevels 和 MinQty。为了保持当前 demo 简单、结果确定，约定：
-  //   1 = 对手方最优，未成交部分按该价格转成限价单；
+  //   1 = 即时成交剩余撤销：逐档消耗对手盘，不限五档，未成交部分不入簿；
   //   2 = 普通限价单；
   //   U = 本方最优，直接加入本方当前最优档。
   // 市价申报只用于连续竞价，因此合法的集合竞价 order 仍然都是限价单。
   if (session == TradingSession::ContinuousAuction) {
-    if (event.order_type == '1') {
-      apply_opponent_best_order(event);
-    } else if (event.order_type == 'U') {
+    if (event.order_type == 'U') {
       apply_own_best_order(event);
     } else {
-      // 输入保证 OrderType 只有 1、2、U，所以最后一个分支就是 2。
-      apply_limit_order(event, event.price);
+      // 输入保证 OrderType 只有 1、2、U，市价单和限价单共用逐档成交逻辑。
+      apply_continuous_order(event);
     }
     return;
   }
@@ -59,23 +57,6 @@ void OrderBook::add_order(const Event& event) {
   } else {
     asks_[event.price] += event.quantity;
   }
-}
-
-void OrderBook::apply_opponent_best_order(const Event& event) {
-  if (event.side == '1') {
-    // 买单使用到达时的卖一作为限价。没有卖盘时，没有对手方最优价，申报自动撤销。
-    if (asks_.empty()) {
-      return;
-    }
-    apply_limit_order(event, asks_.begin()->first);
-    return;
-  }
-
-  // 卖单与之对称：使用到达时的买一；没有买盘时自动撤销。
-  if (bids_.empty()) {
-    return;
-  }
-  apply_limit_order(event, bids_.begin()->first);
 }
 
 void OrderBook::apply_own_best_order(const Event& event) {
@@ -101,17 +82,22 @@ void OrderBook::apply_own_best_order(const Event& event) {
   asks_[price] += event.quantity;
 }
 
-void OrderBook::apply_limit_order(const Event& event, Price limit_price) {
-  // 普通限价单使用原始价格，类型 1 使用到达时的对手方最优价；保存的是实际定价。
-  order_prices_[OrderKey(event.channel_no, event.order_appl_seq_num)] = limit_price;
+void OrderBook::apply_continuous_order(const Event& event) {
+  // 类型 1 与 2 只有两处不同：是否检查价格边界，以及未成交数量是否入簿。
+  // 市价单的 CSV Price 不参与撮合，也没有实际挂单价；索引保留 apply() 设置的 0。
+  const bool is_limit_order = event.order_type == '2';
+  if (is_limit_order) {
+    order_prices_[OrderKey(event.channel_no, event.order_appl_seq_num)] = event.price;
+  }
   Quantity remaining_quantity = event.quantity;
 
   if (event.side == '1') {
     // asks_ 默认按价格升序，因此 begin() 就是当前卖一。
-    // 买单只要还有数量，并且卖一不高于买入限价，就继续逐档成交。
+    // 吃空当前卖一并删除后，原卖二就变成新的 begin()，下一轮会继续成交。
+    // 市价买单不受原卖一价格限制；只有限价买单遇到更高卖价时停止。
     while (remaining_quantity > 0 && !asks_.empty()) {
       AskLevels::iterator best_ask = asks_.begin();
-      if (best_ask->first > limit_price) {
+      if (is_limit_order && best_ask->first > event.price) {
         break;
       }
 
@@ -125,18 +111,18 @@ void OrderBook::apply_limit_order(const Event& event, Price limit_price) {
       }
     }
 
-    // 对手盘已经不能继续成交时，买单剩余数量进入自己的限价档。
-    if (remaining_quantity > 0) {
-      bids_[limit_price] += remaining_quantity;
+    // 只有限价单把剩余量挂入买盘。市价单未成交部分直接撤销，无需再改盘口。
+    if (is_limit_order && remaining_quantity > 0) {
+      bids_[event.price] += remaining_quantity;
     }
     return;
   }
 
   // bids_ 使用降序比较器，因此 begin() 就是当前买一。
-  // 卖单从最高买价开始，只要买一不低于卖出限价，就继续逐档成交。
+  // 市价卖单从买一继续吃买二、买三；限价卖单遇到低于限价的买价时停止。
   while (remaining_quantity > 0 && !bids_.empty()) {
     BidLevels::iterator best_bid = bids_.begin();
-    if (best_bid->first < limit_price) {
+    if (is_limit_order && best_bid->first < event.price) {
       break;
     }
 
@@ -150,17 +136,17 @@ void OrderBook::apply_limit_order(const Event& event, Price limit_price) {
     }
   }
 
-  // 卖单没有完全成交时，剩余数量进入自己的限价档。
-  if (remaining_quantity > 0) {
-    asks_[limit_price] += remaining_quantity;
+  // 与买方对称：限价余量入簿，市价余量撤销；对手盘一开始为空也适用。
+  if (is_limit_order && remaining_quantity > 0) {
+    asks_[event.price] += remaining_quantity;
   }
 }
 
 void OrderBook::apply_cancel(const Event& event) {
-  // 原始 TradePrice 对 1/U 委托可能为 0，实际挂单价必须来自新增订单时保存的索引。
+  // U 的原始 TradePrice 可能为 0，不能定位实际价格档；类型 1 则根本不留下挂单。
   const Price price = order_prices_.at(OrderKey(event.channel_no, event.order_appl_seq_num));
   if (price == 0) {
-    // 无本方/对手最优价时，新增事件没有入簿；对应自动撤单也没有盘口数量可扣。
+    // 市价单余量已撤销，或 U 因无本方最优价未入簿，对应撤单通知不能再扣一次。
     return;
   }
 
