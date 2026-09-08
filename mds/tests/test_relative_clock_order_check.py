@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import contextlib
 import io
 import tempfile
@@ -9,6 +10,7 @@ from pathlib import Path
 import pandas as pd
 
 from mds.relative_clock_order_check import (
+    build_pairwise_sign_consistency,
     check_relative_clock_order,
     main,
     read_relative_clock_vectors,
@@ -97,6 +99,46 @@ class RelativeClockOrderCheckTest(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertTrue(details.empty)
+
+    def test_all_unordered_pairs_are_returned_as_a_dict(self) -> None:
+        vectors = pd.DataFrame(
+            {
+                "t1": [0, 10, 5, pd.NA],
+                "t2": [0, 20, -1, pd.NA],
+                "t3": [pd.NA, pd.NA, pd.NA, 30],
+            },
+            index=pd.Index(["a", "b", "c", "d"], name="stock_id"),
+            dtype="Int64",
+        )
+
+        result = build_pairwise_sign_consistency(vectors)
+
+        # 四只股票共有 4 * 3 / 2 = 6 个无序股票对，每对只出现一次。
+        self.assertEqual(
+            result,
+            {
+                "a_b": True,  # a - b 为 -10、-20：全部为负。
+                "a_c": False,  # a - c 为 -5、1：出现正负反转。
+                "a_d": None,  # a、d 没有共同 snapshot。
+                "b_c": True,  # b - c 为 5、21：全部为正。
+                "b_d": None,
+                "c_d": None,
+            },
+        )
+
+    def test_cli_without_stock_ids_prints_pairwise_dict(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            vectors_csv = Path(temporary_directory) / "vectors.csv"
+            make_vectors().to_csv(vectors_csv)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                exit_code = main([str(vectors_csv)])
+
+        pair_results = ast.literal_eval(output.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertIs(pair_results["000001_000002"], True)
+        self.assertIs(pair_results["000001_600000"], True)
+        self.assertEqual(len(pair_results), 6)
 
     def test_cli_prints_direction_counts_and_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
