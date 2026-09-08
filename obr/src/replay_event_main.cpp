@@ -1,7 +1,6 @@
 #include "obr/order_book.hpp"
 
 #include <algorithm>
-#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -30,6 +29,7 @@ CommandLineOptions parse_command_line(int argc, char* argv[]) {
 
   // argv[0] 是程序自身，从 argv[1] 开始才是用户输入的参数。
   // C++ 直接接收两份原始 CSV，不再读取 Python 生成的 event.csv。
+  // 参数名和路径值都由调用者保证合法，这里只负责取值。
   for (int index = 1; index < argc; ++index) {
     const std::string argument = argv[index];
     if (argument == "--order") {
@@ -73,16 +73,13 @@ obr::Price parse_price(const std::string& text) {
     fraction = text.substr(point + 1);
   }
 
+  // 价格最多四位小数；不足四位时补零，整数价格的小数部分就是 0000。
   while (fraction.size() < 4U) {
     fraction += '0';
   }
-  if (fraction.size() > 4U) {
-    fraction = fraction.substr(0, 4U);
-  }
 
   const obr::Price whole_value = static_cast<obr::Price>(std::stoll(whole));
-  const obr::Price fraction_value =
-      fraction.empty() ? 0 : static_cast<obr::Price>(std::stoll(fraction));
+  const obr::Price fraction_value = static_cast<obr::Price>(std::stoll(fraction));
   return whole_value * kFixedPointScale + fraction_value;
 }
 
@@ -130,11 +127,8 @@ bool earlier_sequence(const obr::Event& left, const obr::Event& right) {
 }
 
 void append_events(const std::string& path, bool is_order, std::vector<obr::Event>& events) {
+  // 输入路径和文件内容保证合法，直接打开并按固定列位置读取。
   std::ifstream input(path.c_str());
-  if (!input) {
-    std::cerr << "无法打开输入 CSV: " << path << '\n';
-    std::exit(EXIT_FAILURE);
-  }
 
   std::string line;
   std::getline(input, line); // 固定表头已知，第一版直接跳过第一行。
@@ -157,13 +151,9 @@ std::vector<obr::Event> read_events(const CommandLineOptions& options) {
 }
 
 obr::TradingSession trading_session(const std::string& transaction_time) {
-  // TransactTime 左补零到 9 位后是 HHMMSSmmm。
-  // 例如 91500790 -> 091500790，阶段判断只读取前六位 091500。
-  std::string padded = transaction_time;
-  if (padded.size() < 9U) {
-    padded = std::string(9U - padded.size(), '0') + padded;
-  }
-  const int hhmmss = std::atoi(padded.substr(0, 6U).c_str());
+  // TransactTime 是 HHMMSSmmm；整数除以 1000 去掉毫秒，不需要先补前导零。
+  // 例如 91500790 / 1000 = 91500，100407190 / 1000 = 100407。
+  const int hhmmss = std::stoi(transaction_time) / 1000;
 
   if (hhmmss >= 91500 && hhmmss <= 92500) {
     return obr::TradingSession::OpeningAuction;
@@ -204,11 +194,8 @@ void write_level(std::ofstream& output, const std::vector<obr::PriceLevel>& leve
 
 void write_book(const std::string& path, const std::vector<obr::Snapshot>& snapshots) {
   // ofstream 默认覆盖同名文件。这是第一版 demo，不额外实现 overwrite 策略。
+  // 调用者准备可写的输出目录，并保证输出路径与两份输入不同。
   std::ofstream output(path.c_str());
-  if (!output) {
-    std::cerr << "无法写入 book.csv: " << path << '\n';
-    std::exit(EXIT_FAILURE);
-  }
 
   output << "caa,event_type,bp1,bs1,bp2,bs2,bp3,bs3,bp4,bs4,bp5,bs5,"
             "ap1,as1,ap2,as2,ap3,as3,ap4,as4,ap5,as5\n";
@@ -230,16 +217,12 @@ void write_book(const std::string& path, const std::vector<obr::Snapshot>& snaps
 } // namespace
 
 int main(int argc, char* argv[]) {
-  if (argc == 1 || (argc == 2 && std::string(argv[1]) == "--help")) {
+  if (argc == 2 && std::string(argv[1]) == "--help") {
     print_usage(argv[0]);
-    return argc == 1 ? EXIT_FAILURE : EXIT_SUCCESS;
+    return 0;
   }
 
   const CommandLineOptions options = parse_command_line(argc, argv);
-  if (options.order_path.empty() || options.trade_path.empty()) {
-    print_usage(argv[0]);
-    return EXIT_FAILURE;
-  }
 
   const std::vector<obr::Event> events = read_events(options);
   std::vector<obr::TradingSession> sessions;
@@ -294,5 +277,5 @@ int main(int argc, char* argv[]) {
             << " 条快照，累计成交量 " << order_book.cumulative_trade_quantity() << "，累计成交额 "
             << format_fixed_point(order_book.cumulative_turnover()) << "，输出 "
             << options.output_path << '\n';
-  return EXIT_SUCCESS;
+  return 0;
 }

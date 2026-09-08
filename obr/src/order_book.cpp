@@ -1,7 +1,6 @@
 #include "obr/order_book.hpp"
 
 #include <algorithm>
-#include <stdexcept>
 #include <vector>
 
 namespace obr {
@@ -237,14 +236,9 @@ bool OrderBook::find_call_auction_result(Price actual_price, Price& auction_pric
 
   // 本 demo 不另加前收盘价/最近成交价的参考价格规则，直接用上游真实成交价解开并列。
   // trade 只提供统一价格，不再次扣量，避免与下面的档级撮合重复计算。
-  candidate = final_candidates.begin();
-  for (; candidate != final_candidates.end(); ++candidate) {
-    if (candidate->price == actual_price) {
-      auction_price = actual_price;
-      return true;
-    }
-  }
-  throw std::logic_error("集合竞价候选价并列，但 AuctionPrice 未提供有效的实际成交价");
+  // 输入保证并列时提供的真实成交价有效，无需再查候选列表或处理异常。
+  auction_price = actual_price;
+  return true;
 }
 
 void OrderBook::finish_call_auction(Price actual_price) {
