@@ -14,12 +14,14 @@ namespace {
 const obr::Price kFixedPointScale = 10000;
 
 struct CommandLineOptions {
-  std::string event_path;
+  std::string order_path;
+  std::string trade_path;
   std::string output_path;
 };
 
 void print_usage(const char* program) {
-  std::cout << "用法: " << program << " --event <event.csv> [--output <book.csv>]\n";
+  std::cout << "用法: " << program
+            << " --order <order.csv> --trade <trade.csv> [--output <book.csv>]\n";
 }
 
 CommandLineOptions parse_command_line(int argc, char* argv[]) {
@@ -27,12 +29,15 @@ CommandLineOptions parse_command_line(int argc, char* argv[]) {
   options.output_path = "book.csv";
 
   // argv[0] 是程序自身，从 argv[1] 开始才是用户输入的参数。
-  // 这里保留和 Python replay 相似的 --event、--output 写法，但不引入命令行库。
+  // C++ 直接接收两份原始 CSV，不再读取 Python 生成的 event.csv。
   for (int index = 1; index < argc; ++index) {
     const std::string argument = argv[index];
-    if (argument == "--event") {
+    if (argument == "--order") {
       ++index;
-      options.event_path = argv[index];
+      options.order_path = argv[index];
+    } else if (argument == "--trade") {
+      ++index;
+      options.trade_path = argv[index];
     } else if (argument == "--output") {
       ++index;
       options.output_path = argv[index];
@@ -81,64 +86,78 @@ obr::Price parse_price(const std::string& text) {
   return whole_value * kFixedPointScale + fraction_value;
 }
 
-obr::Event parse_event(const std::vector<std::string>& columns) {
-  // 固定列位置如下。输入表头已经约定好，所以第一版不再建立“列名 -> 下标”的 map：
-  // 0 caa, 1 TransactionTime, 2 Side, 3 OrderType, 4 Price,
-  // 5 OrderQty, 6 ExecType, 7 TradeQty, 8 TradePrice,
-  // 9 ChannelNo, 10 OrderApplSeqNum, 11 AuctionPrice。
-  obr::Event event;
+obr::Event parse_event(const std::vector<std::string>& columns, bool is_order) {
+  // 两份原始表的公共列位置相同：0 clockAtArrival、1 sequenceNo、5 TransactTime、
+  // 6 ChannelNo、7 ApplSeqNum。只读取算法需要的列，不猜测其他供应商字段的含义。
+  // {} 让无关数字字段从 0 开始，字符从 '\0' 开始，不需要写一长串占位参数。
+  obr::Event event = {};
   event.caa = columns[0];
-  event.transaction_time = columns[1];
-  event.channel_no = std::stoll(columns[9]);
-  event.order_appl_seq_num = std::stoll(columns[10]);
-  // 空 AuctionPrice 表示连续竞价阶段或集合阶段没有真实成交，内部用 0 表示。
-  event.auction_price = columns[11].empty() ? 0 : parse_price(columns[11]);
+  event.sequence_no = std::stoll(columns[1]);
+  event.transaction_time = columns[5];
+  event.channel_no = std::stoll(columns[6]);
 
-  if (columns[6] == "4") {
-    // 撤单行：Side 和 TradePrice 已由上游根据原订单引用补全。
-    // TradePrice 保留原始价格；核心按 ChannelNo/OrderApplSeqNum 查回真正挂单价。
-    event.type = obr::EventType::Cancel;
-    event.side = columns[2][0];
-    event.order_type = '\0';
-    event.price = parse_price(columns[8]);
-    event.quantity = static_cast<obr::Quantity>(std::stoll(columns[7]));
-  } else {
-    // order 行：直接读取 Side、OrderType、Price 和 OrderQty。
-    // OrderType 的 1、2、U 分支在 OrderBook::apply 中处理；CSV 层只负责保存原始值。
+  if (is_order) {
+    // order 独有列：11 Side、12 OrderType、14 Price、15 OrderQty。
+    // 市价原始 Price 可以为空或为 0；这里保存原值含义，不用成交价替填。
     event.type = obr::EventType::Order;
-    event.side = columns[2][0];
-    event.order_type = columns[3][0];
-    event.price = parse_price(columns[4]);
-    event.quantity = static_cast<obr::Quantity>(std::stoll(columns[5]));
+    event.side = columns[11][0];
+    event.order_type = columns[12][0];
+    event.price = columns[14].empty() ? 0 : parse_price(columns[14]);
+    event.quantity = std::stoll(columns[15]);
+    event.order_appl_seq_num = std::stoll(columns[7]);
+  } else {
+    // trade 独有列：11 ExecType、14 TradePrice、15 TradeQty、
+    // 17 BidApplSeqNum、18 OfferApplSeqNum。F 和 4 都进入事件流，不再过滤 F。
+    event.quantity = std::stoll(columns[15]);
+    event.bid_appl_seq_num = std::stoll(columns[17]);
+    event.offer_appl_seq_num = std::stoll(columns[18]);
+    if (columns[11] == "4") {
+      event.type = obr::EventType::Cancel;
+      // 合法撤单恰好一侧引用非零；trade 自己的 ApplSeqNum 不是被撤订单的编号。
+      event.order_appl_seq_num =
+          event.bid_appl_seq_num != 0 ? event.bid_appl_seq_num : event.offer_appl_seq_num;
+    } else {
+      event.type = obr::EventType::Trade;
+      event.price = parse_price(columns[14]);
+    }
   }
   return event;
 }
 
-bool earlier_caa(const obr::Event& left, const obr::Event& right) { return left.caa < right.caa; }
+bool earlier_sequence(const obr::Event& left, const obr::Event& right) {
+  // 比较整数，而不是字符串：sequenceNo=2 必须排在 sequenceNo=10 前。
+  return left.sequence_no < right.sequence_no;
+}
 
-std::vector<obr::Event> read_events(const std::string& path) {
+void append_events(const std::string& path, bool is_order, std::vector<obr::Event>& events) {
   std::ifstream input(path.c_str());
   if (!input) {
-    std::cerr << "无法打开 event.csv: " << path << '\n';
+    std::cerr << "无法打开输入 CSV: " << path << '\n';
     std::exit(EXIT_FAILURE);
   }
 
   std::string line;
   std::getline(input, line); // 固定表头已知，第一版直接跳过第一行。
 
-  std::vector<obr::Event> events;
   while (std::getline(input, line)) {
     const std::vector<std::string> columns = split_csv_line(line);
-    events.push_back(parse_event(columns));
+    events.push_back(parse_event(columns, is_order));
   }
+}
 
-  // stable_sort 与 pandas 的 stable 排序对应：caa 相同时保留 CSV 原有先后顺序。
-  std::stable_sort(events.begin(), events.end(), earlier_caa);
+std::vector<obr::Event> read_events(const CommandLineOptions& options) {
+  std::vector<obr::Event> events;
+  append_events(options.order_path, true, events);
+  append_events(options.trade_path, false, events);
+
+  // 先合并全部行，再按 sequenceNo 排序，不按 caa 排序，也不合并相同 caa 的订单。
+  // stable_sort 在 sequenceNo 相同时保留装入顺序：各表原始行序，order 在 trade 前。
+  std::stable_sort(events.begin(), events.end(), earlier_sequence);
   return events;
 }
 
 obr::TradingSession trading_session(const std::string& transaction_time) {
-  // TransactionTime 左补零到 9 位后是 HHMMSSmmm。
+  // TransactTime 左补零到 9 位后是 HHMMSSmmm。
   // 例如 91500790 -> 091500790，阶段判断只读取前六位 091500。
   std::string padded = transaction_time;
   if (padded.size() < 9U) {
@@ -217,12 +236,12 @@ int main(int argc, char* argv[]) {
   }
 
   const CommandLineOptions options = parse_command_line(argc, argv);
-  if (options.event_path.empty()) {
+  if (options.order_path.empty() || options.trade_path.empty()) {
     print_usage(argv[0]);
     return EXIT_FAILURE;
   }
 
-  const std::vector<obr::Event> events = read_events(options.event_path);
+  const std::vector<obr::Event> events = read_events(options);
   std::vector<obr::TradingSession> sessions;
   sessions.reserve(events.size());
 
@@ -235,25 +254,44 @@ int main(int argc, char* argv[]) {
   std::vector<obr::Snapshot> snapshots;
   snapshots.reserve(events.size());
 
+  // pending_index 指向尚未输出快照的 order/cancel。events.size() 表示还没有区间。
+  // 这里只记起点，不提前复制盘口：后面到达的真实成交还要更新这条快照的状态。
+  std::size_t pending_index = events.size();
+  obr::Price auction_price = 0;
   for (std::size_t index = 0; index < events.size(); ++index) {
+    if (events[index].type != obr::EventType::Trade) {
+      // 新区间左边界到达时，先输出上一区间，再处理当前 order/cancel。
+      // 这样当前订单和它后面的成交不会被错误地计入上一条 snapshot。
+      if (pending_index != events.size()) {
+        snapshots.push_back(order_book.make_snapshot(events[pending_index]));
+      }
+      pending_index = index;
+    }
+
     order_book.apply(events[index], sessions[index]);
 
-    // 集合竞价最后一条输入完成后统一撮合，然后才生成这一条的快照。
-    // 因此输出行数仍然与输入 Event 行数完全相同，不创建虚构的成交 Event。
+    // 集合竞价保留原算法：积累申报，在阶段末统一定价、扣量。
+    // 真实集合 F 提供并列时使用的实际成交价，但 apply 不再对它单独扣量。
     const bool is_call_auction = sessions[index] == obr::TradingSession::OpeningAuction ||
                                  sessions[index] == obr::TradingSession::ClosingAuction;
+    if (is_call_auction && events[index].type == obr::EventType::Trade) {
+      auction_price = events[index].price;
+    }
     const bool is_last_event_in_session =
         index + 1U == events.size() || sessions[index + 1U] != sessions[index];
     if (is_call_auction && is_last_event_in_session) {
-      order_book.finish_call_auction(events[index].auction_price);
+      order_book.finish_call_auction(auction_price);
+      auction_price = 0; // 开盘价不能作为收盘集合竞价的实际价提示。
     }
-
-    snapshots.push_back(order_book.make_snapshot(events[index]));
+  }
+  // EOF 后没有下一条 order/cancel 帮我们收尾，最后一条必须在此补出。
+  if (pending_index != events.size()) {
+    snapshots.push_back(order_book.make_snapshot(events[pending_index]));
   }
 
   write_book(options.output_path, snapshots);
-  std::cout << "已重放 " << snapshots.size() << " 条事件，推导成交量 "
-            << order_book.cumulative_trade_quantity() << "，推导成交额 "
+  std::cout << "已重放 " << events.size() << " 条事件，输出 " << snapshots.size()
+            << " 条快照，累计成交量 " << order_book.cumulative_trade_quantity() << "，累计成交额 "
             << format_fixed_point(order_book.cumulative_turnover()) << "，输出 "
             << options.output_path << '\n';
   return EXIT_SUCCESS;

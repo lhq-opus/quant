@@ -1,19 +1,19 @@
 # OBR 订单簿重建
 
-C++11 价格档级订单簿重放：Python 上游从原始 `order.csv`、`trade.csv` 生成固定
-12 列 `event.csv`，C++ 读取 event 并输出简化五档 `book.csv`。
+C++11 订单簿重建：直接读取原始 `order.csv`、`trade.csv`，按 `sequenceNo` 合并排序，
+连续阶段由真实成交更新盘口，输出简化五档 `book.csv`，不需要 Python 预处理。
 
 ## 编译与执行
 
 从 [C++ 编译执行指南](docs/build_and_run.md) 开始。文档包含从 quant 根目录操作的
 完整命令、参数解释、无数据验证、原始 CSV 重放，以及 Debug/Release/Sanitizer 构建。
-已有 event 时不需要运行 Python 上游。
+每条 order/撤单对应一条快照，快照包含下一条 order/撤单之前的成交，CAA 保留起点原值。
 
 ## 其他说明
 
-- [原始 order/trade 到 event 的转换](docs/cancel_event_csv.md)
-- [订单簿重放规则与当前 demo 边界](docs/event_replay_book.md)
-- [C++ 核心代码结构](docs/reconstruction_core.md)
+- [C++ 事件处理、快照区间与代码结构](docs/reconstruction_core.md)
+- [独立 Python 工具：生成 event](docs/cancel_event_csv.md)
+- [独立 Python 工具：order 驱动的重放](docs/event_replay_book.md)
 - [逐行对比 OBR 输出与答案](docs/compare_book_csv.md)
 - [C++ 语法学习程序](study/README.md)
 

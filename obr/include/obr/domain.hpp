@@ -16,48 +16,37 @@ typedef std::int64_t Price;
 typedef std::int64_t Quantity;
 typedef std::int64_t Turnover;
 
-// event.csv 里只有两类需要 replay 的事件：order 和 ExecType=4 的撤单。
+// 两份原始 CSV 合并后保留三类事件。成交会改簿，但不会单独产生快照行。
 enum class EventType {
   Order,
+  Trade,
   Cancel,
 };
 
-// TransactionTime 决定当前事件属于哪个交易阶段。
+// 原始 TransactTime 决定当前事件属于哪个交易阶段。
 enum class TradingSession {
   OpeningAuction,
   ContinuousAuction,
   ClosingAuction,
 };
 
-// CSV 的 order 行和 cancel 行最终都转换成这个简单 Event。
-//
-// order：
-//   side       <- Side
-//   order_type <- OrderType（1=市价、2=限价、U=本方最优）
-//   price      <- Price（只有类型 2 直接把它当成限价使用）
-//   quantity   <- OrderQty
-//
-// cancel：
-//   type       <- ExecType=4
-//   side       <- Side
-//   price      <- TradePrice
-//   quantity   <- TradeQty
-//
-// cancel 的 Side 由上游从原订单补全；order_type 对撤单无意义，填成 '\0'。
-// 两类事件都保存 ChannelNo 与原订单的 ASN，用于撤单时查回实际挂单价。
-// cancel.price 仍保留原始 TradePrice，但 U 可能动态定价，类型 1 不留挂单，不能据此扣量。
-// auction_price 来自当前集合阶段真实成交的 TradePrice；连续阶段或无成交时为 0。
+// CSV 的列位置只在读取代码中出现，订单簿只接收归一化后的 Event。
+// order 的 price/quantity 来自 Price/OrderQty；成交来自 TradePrice/TradeQty。
+// 撤单只需 TradeQty 与原订单引用，不需要 Python 预先补全 Side 或 TradePrice。
+// 对当前事件无意义的数字和字符字段保持零值，输入保证业务引用合法。
 struct Event {
   std::string caa;
   std::string transaction_time;
+  std::int64_t sequence_no; // sequenceNo：合并后的事件排序键，不用于定位原订单。
   EventType type;
   char side;
   char order_type;
   Price price;
   Quantity quantity;
   std::int64_t channel_no;
-  std::int64_t order_appl_seq_num;
-  Price auction_price;
+  std::int64_t order_appl_seq_num; // order 自己的 ASN，或 cancel 引用的原订单 ASN。
+  std::int64_t bid_appl_seq_num;   // 成交引用的买单 ASN，不是成交消息自己的 ASN。
+  std::int64_t offer_appl_seq_num; // 成交引用的卖单 ASN，与买方引用处于同一频道。
 };
 
 // 一个 PriceLevel 就是一档“价格 + 聚合数量”。
@@ -66,7 +55,8 @@ struct PriceLevel {
   Quantity quantity;
 };
 
-// 每处理完一条 Event，就从全深度订单簿中截取买卖各五档形成 Snapshot。
+// order/cancel 开启一个快照区间。区间内的成交处理完毕后，才提取五档。
+// caa 和 event_type 始终来自区间起点，不能被后续 Trade 的元数据覆盖。
 struct Snapshot {
   std::string caa;
   EventType event_type;

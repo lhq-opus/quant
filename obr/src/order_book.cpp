@@ -20,150 +20,74 @@ struct AuctionCandidate {
 OrderBook::OrderBook() : cumulative_trade_quantity_(0), cumulative_turnover_(0) {}
 
 void OrderBook::apply(const Event& event, TradingSession session) {
-  // 撤单在三个阶段中的处理方式相同：按原订单引用查回实际价格，再扣除 TradeQty。
-  if (event.type == EventType::Cancel) {
-    apply_cancel(event);
-    return;
+  if (event.type == EventType::Order) {
+    // 即使限价买单高于卖一，也只加本方数量，等待真实 F 指出成交双方与数量。
+    add_order(event);
+  } else if (event.type == EventType::Cancel) {
+    // 撤单不需要自己携带价格和方向，两者都从原订单索引取得。
+    reduce_order(OrderKey(event.channel_no, event.order_appl_seq_num), event.quantity);
+  } else if (session == TradingSession::ContinuousAuction) {
+    apply_trade(event);
   }
-
-  // 0 表示不留在盘口：市价单始终保持 0，限价单和有本方最优价的 U 单再填写价格。
-  order_prices_[OrderKey(event.channel_no, event.order_appl_seq_num)] = 0;
-
-  // 深交所逐笔行情只给出 OrderType=1/2/U，没有给出区分各种市价子类型所需的
-  // TimeInForce、MaxPriceLevels 和 MinQty。为了保持当前 demo 简单、结果确定，约定：
-  //   1 = 即时成交剩余撤销：逐档消耗对手盘，不限五档，未成交部分不入簿；
-  //   2 = 普通限价单；
-  //   U = 本方最优，直接加入本方当前最优档。
-  // 市价申报只用于连续竞价，因此合法的集合竞价 order 仍然都是限价单。
-  if (session == TradingSession::ContinuousAuction) {
-    if (event.order_type == 'U') {
-      apply_own_best_order(event);
-    } else {
-      // 输入保证 OrderType 只有 1、2、U，市价单和限价单共用逐档成交逻辑。
-      apply_continuous_order(event);
-    }
-    return;
-  }
-
-  // 开盘和收盘集合竞价期间不逐笔撮合，只把订单累加到本方价格档。
-  add_order(event);
+  // 集合竞价 F 不在这里扣量。原有阶段末统一定价/扣量逻辑保持不变，不能扣两遍。
 }
 
 void OrderBook::add_order(const Event& event) {
-  order_prices_[OrderKey(event.channel_no, event.order_appl_seq_num)] = event.price;
+  OrderInfo order = {event.side, event.price};
+  if (event.order_type == '1') {
+    // 类型 1 暂沿用“不挂本方价档”的约定，但不再自行撮合或推断余量撤销。
+    // 非零 Price 的供应商挂价语义尚未确认，不能仅凭是否填价改成限价处理。
+    order.price = 0;
+  } else if (event.order_type == 'U') {
+    // U 只在到达时取一次本方最优价。以后即使最优档变化，成交/撤单仍找这个价格。
+    // 本方为空时不存在可用挂价，记为 0；这是业务分支，不是非法输入检查。
+    if (event.side == '1') {
+      order.price = bids_.empty() ? 0 : bids_.begin()->first;
+    } else {
+      order.price = asks_.empty() ? 0 : asks_.begin()->first;
+    }
+  }
+  orders_[OrderKey(event.channel_no, event.order_appl_seq_num)] = order;
+  if (order.price == 0) {
+    return;
+  }
   if (event.side == '1') {
-    // map 的 operator[] 在价格不存在时会先放入一个 0，然后再加数量。
-    bids_[event.price] += event.quantity;
+    // operator[] 在价格不存在时创建数量为 0 的档，再累加完整 OrderQty。
+    bids_[order.price] += event.quantity;
   } else {
-    asks_[event.price] += event.quantity;
+    asks_[order.price] += event.quantity;
   }
 }
 
-void OrderBook::apply_own_best_order(const Event& event) {
-  if (event.side == '1') {
-    // 买方最高价就是买一。若本方盘口为空，则不存在本方最优价，申报自动撤销。
-    if (bids_.empty()) {
-      return;
-    }
+void OrderBook::apply_trade(const Event& event) {
+  // 真实 trade 已经告诉我们成交双方，不再猜哪张单先成交、是否继续吃第二档。
+  // 两侧原订单可以挂在不同价格；必须各找原挂价，不能都从 TradePrice 这一档扣量。
+  reduce_order(OrderKey(event.channel_no, event.bid_appl_seq_num), event.quantity);
+  reduce_order(OrderKey(event.channel_no, event.offer_appl_seq_num), event.quantity);
 
-    // U 的 CSV Price 在本 demo 中不参与定价，订单直接加入到达时的买一档。
-    const Price price = bids_.begin()->first;
-    order_prices_[OrderKey(event.channel_no, event.order_appl_seq_num)] = price;
-    bids_[price] += event.quantity;
-    return;
-  }
-
-  // 卖方最低价就是卖一，处理方式与买方完全对称。
-  if (asks_.empty()) {
-    return;
-  }
-  const Price price = asks_.begin()->first;
-  order_prices_[OrderKey(event.channel_no, event.order_appl_seq_num)] = price;
-  asks_[price] += event.quantity;
+  // 买卖各扣一份数量，但这是同一笔成交，成交量和金额只累计一次。
+  record_trade(event.price, event.quantity);
 }
 
-void OrderBook::apply_continuous_order(const Event& event) {
-  // 类型 1 与 2 只有两处不同：是否检查价格边界，以及未成交数量是否入簿。
-  // 市价单的 CSV Price 不参与撮合，也没有实际挂单价；索引保留 apply() 设置的 0。
-  const bool is_limit_order = event.order_type == '2';
-  if (is_limit_order) {
-    order_prices_[OrderKey(event.channel_no, event.order_appl_seq_num)] = event.price;
-  }
-  Quantity remaining_quantity = event.quantity;
-
-  if (event.side == '1') {
-    // asks_ 默认按价格升序，因此 begin() 就是当前卖一。
-    // 吃空当前卖一并删除后，原卖二就变成新的 begin()，下一轮会继续成交。
-    // 市价买单不受原卖一价格限制；只有限价买单遇到更高卖价时停止。
-    while (remaining_quantity > 0 && !asks_.empty()) {
-      AskLevels::iterator best_ask = asks_.begin();
-      if (is_limit_order && best_ask->first > event.price) {
-        break;
-      }
-
-      const Quantity traded_quantity = std::min(remaining_quantity, best_ask->second);
-      record_trade(best_ask->first, traded_quantity);
-
-      remaining_quantity -= traded_quantity;
-      best_ask->second -= traded_quantity;
-      if (best_ask->second == 0) {
-        asks_.erase(best_ask);
-      }
-    }
-
-    // 只有限价单把剩余量挂入买盘。市价单未成交部分直接撤销，无需再改盘口。
-    if (is_limit_order && remaining_quantity > 0) {
-      bids_[event.price] += remaining_quantity;
-    }
+void OrderBook::reduce_order(const OrderKey& key, Quantity quantity) {
+  const OrderInfo& order = orders_.find(key)->second;
+  if (order.price == 0) {
+    // 未挂入价格档的订单没有可见数量可扣，但 apply_trade 仍会处理另一侧与成交统计。
     return;
   }
 
-  // bids_ 使用降序比较器，因此 begin() 就是当前买一。
-  // 市价卖单从买一继续吃买二、买三；限价卖单遇到低于限价的买价时停止。
-  while (remaining_quantity > 0 && !bids_.empty()) {
-    BidLevels::iterator best_bid = bids_.begin();
-    if (is_limit_order && best_bid->first < event.price) {
-      break;
-    }
-
-    const Quantity traded_quantity = std::min(remaining_quantity, best_bid->second);
-    record_trade(best_bid->first, traded_quantity);
-
-    remaining_quantity -= traded_quantity;
-    best_bid->second -= traded_quantity;
-    if (best_bid->second == 0) {
-      bids_.erase(best_bid);
-    }
-  }
-
-  // 与买方对称：限价余量入簿，市价余量撤销；对手盘一开始为空也适用。
-  if (is_limit_order && remaining_quantity > 0) {
-    asks_[event.price] += remaining_quantity;
-  }
-}
-
-void OrderBook::apply_cancel(const Event& event) {
-  // U 的原始 TradePrice 可能为 0，不能定位实际价格档；类型 1 则根本不留下挂单。
-  const Price price = order_prices_.at(OrderKey(event.channel_no, event.order_appl_seq_num));
-  if (price == 0) {
-    // 市价单余量已撤销，或 U 因无本方最优价未入簿，对应撤单通知不能再扣一次。
-    return;
-  }
-
-  // 集合竞价期间同一个价格可以同时存在买卖申报，因此不能用价格推断撤单方向。
-  // event.csv 已经从原订单补全 Side：'1' 撤买单，'2' 撤卖单。
-  if (event.side == '1') {
-    BidLevels::iterator bid = bids_.find(price);
-    bid->second -= event.quantity;
+  // 相同价格可能同时存在买卖档，方向来自原订单，而不是看哪一侧恰好存在这个价格。
+  if (order.side == '1') {
+    BidLevels::iterator bid = bids_.find(order.price);
+    bid->second -= quantity;
     if (bid->second == 0) {
       bids_.erase(bid);
     }
     return;
   }
 
-  // 第一版输入保证 Side、价格和数量合法，所以卖方分支直接修改对应卖盘价格档。
-  AskLevels::iterator ask = asks_.find(price);
-  ask->second -= event.quantity;
+  AskLevels::iterator ask = asks_.find(order.price);
+  ask->second -= quantity;
   if (ask->second == 0) {
     asks_.erase(ask);
   }

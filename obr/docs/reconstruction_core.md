@@ -1,168 +1,137 @@
-# C++11 第一版 event.csv 重放
+# C++ 订单簿：真实成交驱动的重放
 
-## 这一版解决什么问题
+当前 C++ 直接读取 `order.csv` 和 `trade.csv`，不需要 Python 生成 event。
+使用 C++11、标准库、定点整数和三个直接的 map，不实现输入兼容层或错误恢复框架。
 
-这一版把 Python `replay_event_order_book.py` 的主要数据流用基础 C++11 重写一遍：
+## 1. 从哪里开始读
 
-```text
-命令行
-  -> 读取固定 12 列 event.csv
-  -> 每行转换成 Event
-  -> 按 caa 稳定排序
-  -> 重放开盘集合、连续和收盘集合竞价
-  -> 每条 Event 生成一条五档 Snapshot
-  -> 写 book.csv
-```
+- `include/obr/domain.hpp`：价格、数量、三种 Event、Snapshot。
+- `src/replay_event_main.cpp`：命令行、CSV、事件合并排序、交易阶段、快照区间、输出。
+- `include/obr/order_book.hpp`、`src/order_book.cpp`：订单索引、价格档与状态变化。
 
-目标是让初学者可以顺着代码看到 CSV 字符串怎样一步步变成订单簿，而不是第一版就搭建
-完整的生产框架。代码只使用 C++11 及更早的基础语法和标准库。
+建议先看 `parse_event()`，再看 `OrderBook::apply()`，最后看 main 的
+`pending_index` 循环。详细运行命令见 [编译执行指南](build_and_run.md)。
 
-## 三个文件的职责
+## 2. 两份 CSV 怎样合并
 
-- `include/obr/domain.hpp`：定义基础整数别名、`Event`、`TradingSession`、
-  `PriceLevel` 和 `Snapshot`；
-- `include/obr/order_book.hpp` 与 `src/order_book.cpp`：用两个 `std::map` 保存买卖
-  聚合价格档，实现集合竞价、连续竞价、撤单和五档快照；
-- `src/replay_event_main.cpp`：解析命令行、拆分 CSV、转换 Event、判断交易阶段、排序，
-  最后写出 CSV。
+输入使用项目约定的原始表头和列顺序。共同读取：
 
-这三层只是为了不把文件读写和订单簿状态混在同一个函数里，不是抽象框架。
+| 原始列 | Event 字段 | 用途 |
+| --- | --- | --- |
+| clockAtArrival | caa | 原样保留，作为 order/cancel 快照标签 |
+| sequenceNo | sequence_no | 转为64位整数，作为事件排序键 |
+| TransactTime | transaction_time | HHMMSSmmm，判断交易阶段 |
+| ChannelNo | channel_no | 原订单引用的频道作用域 |
 
-## 构建和运行
+order 转成 `EventType::Order`，读取 `Side,OrderType,Price,OrderQty,ApplSeqNum`。
+trade 中 `ExecType=F` 转成 `Trade`，`ExecType=4` 转成 `Cancel`，两者都保留。
 
-在 `quant/obr` 目录执行：
+成交读取 `TradePrice,TradeQty,BidApplSeqNum,OfferApplSeqNum`。撤单使用
+`TradeQty` 和两个引用中非零的那个，不用预先补全方向和撤单价格。trade 自己的
+`ApplSeqNum` 不是被成交或被撤订单的编号。
 
-```bash
-cmake -S . -B /tmp/obr-build -DCMAKE_BUILD_TYPE=Debug
-cmake --build /tmp/obr-build --parallel
+两份表先装进同一个 `vector<Event>`，再用 `stable_sort` 按整数 `sequenceNo`
+排序。不会按 CAA 排序，不会按同一个 CAA 合并，不会过滤正常成交。
+相同 sequenceNo 保留装入顺序：各表原始行序，order 在 trade 前。这个并列规则是
+本次离线程序的确定性约定，不代表交易所额外提供了优先级信息。
 
-/tmp/obr-build/obr_replay_event \
-  --event /path/to/event.csv \
-  --output /path/to/book.csv
-```
-
-`--output` 可以省略，默认覆盖当前目录下的 `book.csv`。第一版没有 `--overwrite`、路径
-冲突检查或自动创建父目录。
-
-## CSV 怎样变成 Event
-
-输入由 `build_cancel_event_csv.py` 直接生成，固定为以下 12 列：
+## 3. 三个 map 就够了
 
 ```text
-caa,TransactionTime,Side,OrderType,Price,OrderQty,ExecType,TradeQty,TradePrice,ChannelNo,OrderApplSeqNum,AuctionPrice
+orders_: (ChannelNo, 原订单 ApplSeqNum) -> {方向, 实际挂价}
+bids_:   价格从高到低 -> 聚合买量
+asks_:   价格从低到高 -> 聚合卖量
 ```
 
-`replay_event_main.cpp` 先跳过表头，然后用一个简单循环按逗号拆分每一行。输入约定合法，
-字段中没有逗号和引号，因此这里不引入第三方 CSV 库，也不实现 RFC CSV 转义规则。
+订单索引负责“找到在哪一侧、哪一档”，价格档负责“这一档现在有多少”。
+价格以0.0001元为单位保存在64位整数中。例如10.10元存成101000，写出10.1000。
 
-order 行转换为：
+这一版不另存每张订单的剩余量，不建立 FIFO。真实 trade 已经给出成交双方，
+合法输入也保证不会超量；我们只需要把对应价格档的聚合量更新正确。
+
+## 4. 连续阶段：order 不再产生推导成交
+
+### order
+
+- `OrderType=2`：以原始 Price 增加本方完整 OrderQty。
+- `OrderType=U`：在到达时取本方最优价，记住该价并增加数量；本方为空时不挂档。
+- `OrderType=1`：本次暂时沿用“只登记引用、不挂入本方价格档”的约定。
+  非零 Price 是否代表供应商给出的有效挂价尚未确认，不能凭是否填价猜测市价子类型。
+
+order 不修改对手盘，也不自行增加成交量。即使买价高于卖价，也先保留临时交叉状态，
+由后续真实成交修正。类型1不会自行推断成交档数、成交量或自动撤单。
+
+### 正常成交 F
+
+`apply_trade()` 做三步：
+
+1. 用 `(ChannelNo, BidApplSeqNum)` 找买单，以它原来的挂价扣除 TradeQty。
+2. 用 `(ChannelNo, OfferApplSeqNum)` 找卖单，以它原来的挂价扣除 TradeQty。
+3. 成交量累计一次 TradeQty，成交额累计一次 TradePrice × TradeQty。
+
+例如买单挂10.20元、卖单挂10.00元，真实成交50股、成交价10.00元：
+买盘10.20档减50，卖盘10.00档减50，成交额加500元。不能把买盘也从10.00档扣量。
+
+未挂价的市价单在本方没有价格档可扣，但仍要扣对手单并记录成交。
+代码不会把成交价反填为该市价单的挂价，因为成交价不等于剩余量的申报价。
+
+### 撤单 4
+
+用非零引用查原订单的方向和挂价，再扣除 TradeQty。撤单只改一侧，不增加成交统计。
+U 单即使到撤单时本方最优价已经变化，仍扣到它到达时记住的原挂价。
+
+以上扣量共用 `reduce_order()`，档位数量变为0就删除。输出只取五档，但内部维护全深度。
+
+## 5. 快照为什么要晚一点输出
+
+这里区分“内部状态变化”和“新增一行 snapshot”：F 会改变内部簿，但只有
+order/cancel 开启新快照。CAA 来自起点事件，不来自区间里最后一笔成交。
 
 ```text
-EventType::Order
-side       = Side
-order_type = OrderType
-price      = Price
-quantity   = OrderQty
+sequenceNo:    10          11        12          13          14
+事件:         order A     trade     trade       cancel B    trade
+快照区间:     [ A 的区间                       )[ B 的区间直到 EOF ]
+输出 caa:      A.caa                             B.caa
 ```
 
-`ExecType=4` 的撤单行转换为：
+处理到 cancel B 之前才输出 A，所以 A 的状态包含11、12两笔成交，但不包含B的撤量。
+处理完B和14的成交，EOF 时输出B。没有成交的区间也输出一行，不能把相邻order合并掉。
 
-```text
-EventType::Cancel
-side     = Side
-price    = TradePrice
-quantity = TradeQty
-```
+`pending_index` 保存当前起点在 events 中的下标。每遇到下一条 order/cancel，
+先从当前簿提取上一条快照，再应用当前事件。文件结尾补出尚未输出的最后一条。
+无需缓存每笔成交或反复修改已经输出的快照。
 
-其中 `Side` 和 `TradePrice` 已由上游从原订单补全，后者仍是原始价格。两类事件还共用
-`ChannelNo,OrderApplSeqNum`：order 填自己的 ASN，cancel 填引用的原订单 ASN。
-`OrderBook` 通过这个引用查到实际挂单价，cancel 的 `price` 不再负责定位档位；集合
-竞价出现买卖同价时，再按 `Side` 选择正确一侧。
+区间严格按 sequenceNo 排好的事件顺序划分，CAA只是标签。即使两个起点CAA相同，
+仍有两行；CAA与sequenceNo不一致时也不回到按CAA排序。
+这是一种离线的“区间完成状态”，不是起点CAA那一瞬间的实时盘口。
 
-`TransactionTime` 由上游把原始 `TransactTime` 按固定的 `HHMMSSmmm` 数字格式左补
-九位得到，不需要用户手工添加。`AuctionPrice` 是该开盘或收盘集合阶段的实际成交价；
-连续阶段以及集合阶段没有实际成交时为空。两种 CSV 行都归一成简单的 `Event`，所以
-`OrderBook` 不需要知道原始列位置。
+输出行数 = order行数 + ExecType=4的trade行数。
+每行使用原有22列、四位小数价格、空档留空，不新增成交行或虚构CAA。
 
-`order_type` 在连续竞价中决定撮合方式和余量去向：
+## 6. 集合竞价保持原逻辑
 
-- `2` 直接使用 `event.price`；
-- `1` 按当前 demo 的 IOC 约定逐档消耗对手盘、不限五档，未成交量直接撤销；
-- `U` 忽略 `event.price`，直接加入本方最优档。
+开盘仍先累计order、应用撤单，阶段结束时统一筛选价格并扣量：
 
-深交所行情里的 `OrderType=1` 只说明它属于市价订单。正式申报还需要
-`TimeInForce / MaxPriceLevels / MinQty` 才能区分不同市价子类型，而当前 event 没有
-这些字段。因此这里的 `1=即时成交剩余撤销` 是为现有输入选择的教学约定，不是
-完整交易所枚举映射。两份官方字段定义可分别查看
-[Binary 行情接口](https://www.szse.cn/marketServices/technicalservice/interface/P020250328368568358456.pdf)
-和 [STEP 交易接口](https://investor.szse.cn/marketServices/technicalservice/interface/P020250328368240326574.pdf)。
+1. 最大可成交量，同时满足更优价全部成交、成交价至少一侧全部成交；
+2. 同量候选按包含等价申报的买卖累计量差最小筛选；
+3. 仍并列时采用该阶段真实成交价；真实价也加入候选集，可位于两个申报价之间。
 
-## 为什么价格仍使用整数
+不新增 reference_price。真实集合竞价F只提供实际成交价，不额外扣一次数量。
+该阶段最后一条order/cancel的快照仍显示统一结算后的盘口，保持原先的盘前结果。
+收盘沿用同一套集合逻辑，开盘和收盘的实际价提示分别重置。
 
-代码没有复杂的强类型，但也没有使用 `double`。`Price` 是普通 `std::int64_t`，单位为
-0.0001 元：
+连续阶段的真实F与集合阶段的统一成交各自只累计一次，不能双计。
 
-```text
-CSV 10.10  <->  内部 101000  <->  输出 10.1000
-```
+## 7. 当前边界与验证
 
-`parse_price()` 在输入边界拆开整数和小数部分，`format_fixed_point()` 在输出边界恢复四位小数。
-成交额内部同样保留四位小数单位。
+仍限定单证券、单交易日、完整合法输入。引用订单应在按sequenceNo回放时已经出现。
+TransactTime采用HHMMSSmmm数字，字段内不含逗号或引号；不添加其他CSV格式兼容。
+价格最多四位小数、整数不溢出，输出目录由使用者准备，输出不得与输入同路径。
 
-## OrderBook 的直接逻辑
+不做重复/缺口检测、非法输入恢复、每单余量校验、多标的调度、生产级保护。
+市价非零Price和余量挂价语义仍需数据源说明，不能声称覆盖全部市价子类型。
+Python工具本轮未修改算法，不再与C++保持相同的连续成交模型。
 
-盘口仍用两个有序 map，另加一个用于撤单定位的小索引：
-
-```text
-bids_: 价格从高到低 -> 聚合买量
-asks_: 价格从低到高 -> 聚合卖量
-原订单价格索引: (频道, 原订单 ASN) -> 实际挂单价格或未挂入盘口
-```
-
-- 集合竞价 order：只加入本方 map；阶段结束时统一筛选成交价并扣减双方数量；
-- 连续竞价类型 `2`：从对方 `map.begin()` 开始逐档成交，剩余量以 CSV 限价进入本方；
-- 连续竞价类型 `1`：同样从对方 `map.begin()` 开始逐档成交，但不检查限价；
-  当前档吃空并删除后，下一轮继续吃新的最优档，未成交数量直接撤销、不进入本方；
-- 连续竞价类型 `U`：直接加入本方 `map.begin()` 对应的最优档，本方为空时自动撤销；
-- cancel：按原订单引用取得实际挂单价，用 `Side` 选择买卖盘，然后扣除 `TradeQty`。
-  类型 `1` 始终不留挂单、`U` 在本方为空时不入簿，后续该单的撤单事件不再扣簿；
-- snapshot：直接从两个已经排好序的 map 各取前五个元素。
-
-`apply_continuous_order()` 让类型 `1/2` 共用循环，只有价格边界和余量入簿这两处判断
-需要区分类型。类型 `1` 不记录挂单价格，保留 0；类型 `2` 记录 CSV 限价，类型 `U`
-记录到达时的本方最优价。因此即使上游撤单的原始价格是 0，也能按订单引用正确处理。
-索引不维护每张订单剩余量，不建立 FIFO，成交仍然只扣聚合价格档。
-
-集合竞价与 Python demo 相同：计算最大成交量，并满足严格较优价格全部成交、成交价
-一侧全部成交的条件；再按包含候选价的 `abs(buy_quantity - sell_quantity)` 最小筛选。
-如果仍有多个候选，使用原始 trade 给出的 `AuctionPrice`；实际成交价也会加入候选集合，
-允许该价没有原始挂单。这里不用 reference price，也不再假定候选一定唯一。
-
-原始 `ExecType=F` 只给集合竞价提供价格，不进入 event 重复扣量。所有集合成交按一个
-统一价格累计成交额，买卖两侧各扣一次成交数量。该阶段最后一条 order/cancel 的快照
-显示结算后状态，每条 event 仍与一条相同 `caa` 的 book 对应。
-
-## 有意不做的事情
-
-这一版假设输入是单交易日、单标的、完整且合法的数据，因此没有实现：
-
-- 同价 FIFO、每张订单剩余量或真实成交双方恢复；
-- 表头兼容、带引号 CSV、非法数字和未知枚举诊断；
-- 重复事件、序列缺口、未知撤单、超量扣减或整数溢出策略；
-- 输出覆盖保护、恢复模式、多标的调度或性能优化。
-
-输入也假定不存在 CAA 事件顺序问题，因此继续按 `caa` 稳定排序，不在本轮添加 ASN
-业务排序。后续工业化迭代可以在已经理解状态变化之后，逐项恢复明确的输入契约和错误策略。
-
-## 验证
-
-```bash
-/tmp/obr-build/obr_validate_reconstruction_core
-```
-
-验证程序覆盖合法输入的正常和边界流程：三种 `OrderType` 的买卖方向、市价跨档和超过
-五档、市价余量不入簿及自动撤单不误扣其他订单、空盘口、U 在最优价变化后按原实际价
-撤单；以及开盘/收盘集合竞价、盘前同价双边撤单、集合竞价数量差筛选与实际成交价
-并列处理、限价未成交数量结转、累计成交量和成交额。
-端到端验证还会从临时原始 order/trade 生成 event，让 C++ 和 Python 读取同一份
-`event.csv`，并逐字节比较两份 `book.csv`。临时 mock CSV 不纳入提交。
+运行现有 `obr_validate_reconstruction_core` 验证核心；端到端验收用临时pandas数据
+核对乱序合并、双边扣量、延迟成交、CAA区间、首尾、深档晋升和集合竞价回归。
+不提交mock CSV，也不新增单元测试框架。

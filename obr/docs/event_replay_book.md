@@ -1,5 +1,8 @@
 # 开盘集合、连续和收盘集合竞价重放
 
+本页描述独立 Python 脚本。C++ 已直接读取原始 order/trade，并由真实成交更新连续盘口，
+其当前规则见 [C++ 核心说明](reconstruction_core.md)，不使用本页的 event 输入流程。
+
 `replay_event_order_book.py` 读取带有 `TransactionTime` 的 `event.csv`，按该字段区分
 交易阶段，在聚合价格档层面重放深市股票的一天：
 
