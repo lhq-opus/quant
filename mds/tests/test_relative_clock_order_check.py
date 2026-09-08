@@ -51,17 +51,41 @@ class RelativeClockOrderCheckTest(unittest.TestCase):
         self.assertEqual(details["snapshot"].tolist(), ["t1", "t2"])
         self.assertEqual(details["difference_a_minus_b"].tolist(), [20, 10])
 
-    def test_zero_or_negative_difference_fails_strict_comparison(self) -> None:
+    def test_all_negative_is_also_consistent(self) -> None:
+        result, details = check_relative_clock_order(
+            make_vectors(),
+            "000001",
+            "000002",
+        )
+
+        # 反向相减后，t1、t2 的差值分别是 -20 和 -10。虽然不大于 0，
+        # 但它们全都严格小于 0，因此两只股票的先后顺序仍然一致。
+        self.assertIs(result, True)
+        self.assertEqual(details["difference_a_minus_b"].tolist(), [-20, -10])
+        self.assertTrue(details["is_strictly_negative"].all())
+
+    def test_positive_and_negative_differences_are_inconsistent(self) -> None:
         vectors = pd.DataFrame(
-            {"t1": [20, 0], "t2": [10, 10], "t3": [5, 8]},
+            {"t1": [20, 0], "t2": [5, 8]},
             index=pd.Index(["a", "b"], name="stock_id"),
         )
         result, details = check_relative_clock_order(vectors, "a", "b")
 
         self.assertIs(result, False)
-        failed = details.loc[~details["is_strictly_positive"]]
-        self.assertEqual(failed["snapshot"].tolist(), ["t2", "t3"])
-        self.assertEqual(failed["difference_a_minus_b"].tolist(), [0, -3])
+        self.assertEqual(details["difference_a_minus_b"].tolist(), [20, -3])
+
+    def test_zero_breaks_otherwise_consistent_sign(self) -> None:
+        vectors = pd.DataFrame(
+            {"t1": [20, 0], "t2": [10, 10], "t3": [5, 0]},
+            index=pd.Index(["a", "b"], name="stock_id"),
+        )
+        result, details = check_relative_clock_order(vectors, "a", "b")
+
+        # 差值是 20、0、5。0 既不大于 0 也不小于 0，所以不能算同号。
+        self.assertIs(result, False)
+        zero_row = details.loc[details["difference_a_minus_b"].eq(0)].iloc[0]
+        self.assertFalse(zero_row["is_strictly_positive"])
+        self.assertFalse(zero_row["is_strictly_negative"])
 
     def test_no_common_snapshot_returns_insufficient_evidence(self) -> None:
         vectors = pd.DataFrame(
@@ -80,12 +104,12 @@ class RelativeClockOrderCheckTest(unittest.TestCase):
             make_vectors().to_csv(vectors_csv)
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
-                exit_code = main([str(vectors_csv), "000002", "000001"])
+                exit_code = main([str(vectors_csv), "000001", "000002"])
 
         self.assertEqual(exit_code, 0)
-        self.assertIn("比较方向：000002 - 000001", output.getvalue())
+        self.assertIn("比较方向：000001 - 000002", output.getvalue())
         self.assertIn("共同 snapshot 数：2", output.getvalue())
-        self.assertIn("判断结果：是", output.getvalue())
+        self.assertIn("符号一致为负", output.getvalue())
 
 
 if __name__ == "__main__":

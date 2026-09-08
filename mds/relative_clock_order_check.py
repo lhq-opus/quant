@@ -1,4 +1,4 @@
-"""检查两只股票的 relative_clock 是否始终保持严格先后顺序。
+"""检查两只股票的 relative_clock 是否始终保持一致的严格先后顺序。
 
 本脚本读取 ``build_relative_clock_vectors`` 保存的宽表 CSV。CSV 格式示例：
 
@@ -12,15 +12,16 @@
 
 上面的参数顺序表示检查：
 
-    relative_clock(000002) - relative_clock(000001) > 0
+    relative_clock(000002) - relative_clock(000001)
 
-是否在两只股票共同出现的每个 snapshot 中都成立。
+是否在两只股票共同出现的每个 snapshot 中始终同号。
 
 缺失值的处理规则：
 
 - 某个 snapshot 只有一只股票出现时，该维度没有可比较的差值，直接跳过；
 - 如果两只股票没有任何共同 snapshot，结果是“证据不足”，不是 True；
-- 差值必须严格大于 0，等于 0 或小于 0 都会使最终判断为 False。
+- 全部差值严格大于 0，或者全部差值严格小于 0，判断都为 True；
+- 如果差值中出现 0，或者正数和负数同时出现，判断为 False。
 """
 
 from __future__ import annotations
@@ -55,13 +56,13 @@ def check_relative_clock_order(
     stock_a: str,
     stock_b: str,
 ) -> tuple[bool | None, pd.DataFrame]:
-    """检查 ``stock_a - stock_b`` 是否在全部共同 snapshot 中严格大于 0。
+    """检查 ``stock_a - stock_b`` 在全部共同 snapshot 中是否严格同号。
 
     返回值由两部分组成：
 
     1. 判断结果：
-       - ``True``：每个共同 snapshot 的差值都大于 0；
-       - ``False``：至少有一个共同 snapshot 的差值小于或等于 0；
+       - ``True``：差值全部大于 0，或者全部小于 0；
+       - ``False``：差值出现 0，或者正数和负数同时出现；
        - ``None``：没有任何共同 snapshot，无法判断。
     2. 逐 snapshot 明细，只保留两只股票都有值的共同 snapshot。
 
@@ -82,10 +83,14 @@ def check_relative_clock_order(
         common_snapshots["relative_clock_a"] - common_snapshots["relative_clock_b"]
     )
 
-    # gt(0) 就是逐行执行严格的“> 0”。差值等于 0 时结果也为 False。
+    # 分别记录每个差值是否严格大于 0、是否严格小于 0。差值等于 0 时，
+    # 两个布尔值都会是 False，所以 0 不会被误判为任意一种符号。
     common_snapshots["is_strictly_positive"] = common_snapshots[
         "difference_a_minus_b"
     ].gt(0)
+    common_snapshots["is_strictly_negative"] = common_snapshots[
+        "difference_a_minus_b"
+    ].lt(0)
     details = common_snapshots.reset_index()
 
     # Python/pandas 对空序列调用 all() 会得到 True，但在业务上，“没有共同
@@ -93,8 +98,16 @@ def check_relative_clock_order(
     if details.empty:
         return None, details
 
+    # 符号一致有且只有两种情况：
+    #
+    # 1. 每个差值都严格大于 0，即 stock_a 的 relative_clock 始终更大；
+    # 2. 每个差值都严格小于 0，即 stock_a 的 relative_clock 始终更小。
+    #
+    # 这里用 or 连接两个“全部满足”条件。正负号混合时两个 all() 都为
+    # False；只要存在 0，对应那一侧的 all() 也会为 False。
     all_positive = bool(details["is_strictly_positive"].all())
-    return all_positive, details
+    all_negative = bool(details["is_strictly_negative"].all())
+    return all_positive or all_negative, details
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -103,7 +116,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "检查 stock_a - stock_b 的 relative_clock 差值是否在全部共同 "
-            "snapshot 中严格大于 0。"
+            "snapshot 中严格同号（全部大于 0 或全部小于 0）。"
         )
     )
     parser.add_argument("vectors_csv", type=Path, help="相对 clock 向量 CSV")
@@ -137,14 +150,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     minimum_difference = details["difference_a_minus_b"].min()
+    maximum_difference = details["difference_a_minus_b"].max()
+    positive_count = int(details["is_strictly_positive"].sum())
+    negative_count = int(details["is_strictly_negative"].sum())
+    zero_count = common_snapshot_count - positive_count - negative_count
     print(f"共同 snapshot 中的最小差值：{minimum_difference:g}")
+    print(f"共同 snapshot 中的最大差值：{maximum_difference:g}")
+    print(
+        f"差值符号计数：正数 {positive_count}，负数 {negative_count}，零 {zero_count}"
+    )
 
     if result:
-        print("判断结果：是；全部共同 snapshot 的差值都严格大于 0。")
+        if positive_count == common_snapshot_count:
+            print("判断结果：是；全部共同 snapshot 的差值都大于 0，符号一致为正。")
+        else:
+            print("判断结果：是；全部共同 snapshot 的差值都小于 0，符号一致为负。")
         return 0
 
-    failed = details.loc[
-        ~details["is_strictly_positive"],
+    displayed_details = details.loc[
+        :,
         [
             "snapshot",
             "relative_clock_a",
@@ -152,12 +176,17 @@ def main(argv: list[str] | None = None) -> int:
             "difference_a_minus_b",
         ],
     ]
-    print("判断结果：否；至少一个共同 snapshot 的差值小于或等于 0。")
-    print(f"不满足条件的 snapshot 数：{len(failed)}")
-    print(f"前 {min(len(failed), FAILED_SNAPSHOT_DISPLAY_LIMIT)} 条明细：")
-    print(failed.head(FAILED_SNAPSHOT_DISPLAY_LIMIT).to_string(index=False))
-    if len(failed) > FAILED_SNAPSHOT_DISPLAY_LIMIT:
-        print(f"其余 {len(failed) - FAILED_SNAPSHOT_DISPLAY_LIMIT} 条未在终端展开。")
+    print("判断结果：否；差值出现 0，或者正数和负数同时出现。")
+    print(
+        f"前 {min(len(displayed_details), FAILED_SNAPSHOT_DISPLAY_LIMIT)} 条共同 "
+        "snapshot 明细："
+    )
+    print(displayed_details.head(FAILED_SNAPSHOT_DISPLAY_LIMIT).to_string(index=False))
+    if len(displayed_details) > FAILED_SNAPSHOT_DISPLAY_LIMIT:
+        print(
+            f"其余 {len(displayed_details) - FAILED_SNAPSHOT_DISPLAY_LIMIT} 条"
+            "未在终端展开。"
+        )
     return 0
 
 
