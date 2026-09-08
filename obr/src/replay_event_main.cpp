@@ -16,11 +16,13 @@ struct CommandLineOptions {
   std::string order_path;
   std::string trade_path;
   std::string output_path;
+  std::string events_output_path;
 };
 
 void print_usage(const char* program) {
   std::cout << "用法: " << program
-            << " --order <order.csv> --trade <trade.csv> [--output <book.csv>]\n";
+            << " --order <order.csv> --trade <trade.csv> [--output <book.csv>]"
+            << " [--events-output <events.csv>]\n";
 }
 
 CommandLineOptions parse_command_line(int argc, char* argv[]) {
@@ -41,6 +43,9 @@ CommandLineOptions parse_command_line(int argc, char* argv[]) {
     } else if (argument == "--output") {
       ++index;
       options.output_path = argv[index];
+    } else if (argument == "--events-output") {
+      ++index;
+      options.events_output_path = argv[index];
     }
   }
   return options;
@@ -167,7 +172,10 @@ obr::TradingSession trading_session(const std::string& transaction_time) {
 }
 
 const char* event_type_text(obr::EventType type) {
-  return type == obr::EventType::Cancel ? "cancel" : "order";
+  if (type == obr::EventType::Order) {
+    return "order";
+  }
+  return type == obr::EventType::Trade ? "trade" : "cancel";
 }
 
 std::string format_fixed_point(obr::Price value) {
@@ -177,6 +185,35 @@ std::string format_fixed_point(obr::Price value) {
   output << value / kFixedPointScale << '.' << std::setw(4) << std::setfill('0')
          << value % kFixedPointScale;
   return output.str();
+}
+
+void write_events(const std::string& path, const std::vector<obr::Event>& events) {
+  // 验证旁路只读取已经解析、合并和排序的 events，不修改事件，也不接触订单簿。
+  // 输出包括真实成交，行序与随后重放完全相同；它不是旧版 Python event.csv 的结构。
+  std::ofstream output(path.c_str());
+  output << "caa,transaction_time,sequence_no,event_type,side,order_type,price,quantity,"
+            "channel_no,order_appl_seq_num,bid_appl_seq_num,offer_appl_seq_num\n";
+
+  std::vector<obr::Event>::const_iterator event = events.begin();
+  for (; event != events.end(); ++event) {
+    output << event->caa << ',' << event->transaction_time << ',' << event->sequence_no << ','
+           << event_type_text(event->type) << ',';
+
+    // 成交和撤单没有解析 Side/OrderType，内部保留 '\0'；CSV 写空字段，不写 NUL 字节。
+    if (event->side != '\0') {
+      output << event->side;
+    }
+    output << ',';
+    if (event->order_type != '\0') {
+      output << event->order_type;
+    }
+
+    // 价格恢复为四位小数；无关数字字段的 0 如实保留。这里不会把 U 单实际挂价、
+    // 原订单方向或价格反填进事件，因此可以直接核对解析结果，而不是重放后的状态。
+    output << ',' << format_fixed_point(event->price) << ',' << event->quantity << ','
+           << event->channel_no << ',' << event->order_appl_seq_num << ','
+           << event->bid_appl_seq_num << ',' << event->offer_appl_seq_num << '\n';
+  }
 }
 
 void write_level(std::ofstream& output, const std::vector<obr::PriceLevel>& levels,
@@ -225,6 +262,10 @@ int main(int argc, char* argv[]) {
   const CommandLineOptions options = parse_command_line(argc, argv);
 
   const std::vector<obr::Event> events = read_events(options);
+  // 只有显式指定路径才启用导出；不指定时没有额外 CSV，不改变原有重放流程。
+  if (!options.events_output_path.empty()) {
+    write_events(options.events_output_path, events);
+  }
   std::vector<obr::TradingSession> sessions;
   sessions.reserve(events.size());
 

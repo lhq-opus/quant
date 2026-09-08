@@ -48,7 +48,7 @@ CMakeLists.txt已指定C++11和严格警告，不需要在命令里再次选择�
 帮助格式：
 
 ```text
-用法: .../obr_replay_event --order <order.csv> --trade <trade.csv> [--output <book.csv>]
+用法: .../obr_replay_event --order <order.csv> --trade <trade.csv> [--output <book.csv>] [--events-output <events.csv>]
 ```
 
 验证成功时打印 `simple reconstruction validation passed`。
@@ -98,6 +98,34 @@ TransactTime为HHMMSSmmm数字，例如91500790、100407190。
 - 输出会覆盖同名文件，没有 `--overwrite` 参数。
 - 省略 `--output` 时写到当前目录的book.csv。建议始终明确指定输出路径，
   避免在quant根目录生成文件。
+
+### 可选：导出解析后的 events 用于验证
+
+在原命令上增加 `--events-output`，即可在重放前导出已解析、合并并按 sequenceNo
+排序的完整事件流；不指定时不生成这个文件，原有重放行为不变：
+
+```bash
+"$OBR_RUN_DIR/build-debug/obr_replay_event" \
+  --order "$OBR_ORDER_CSV" --trade "$OBR_TRADE_CSV" \
+  --output "$OBR_RUN_DIR/output/book.csv" \
+  --events-output "$OBR_RUN_DIR/output/events.csv"
+```
+
+此文件仅用于旁路验证，不参与订单簿计算，也不是旧 Python event.csv 的输入结构：
+
+```text
+caa,transaction_time,sequence_no,event_type,side,order_type,price,quantity,channel_no,order_appl_seq_num,bid_appl_seq_num,offer_appl_seq_num
+```
+
+- 每个 Event 一行，包含全部 order、trade、cancel，包括集合竞价的 F；行数等于
+  两份原始 CSV 数据行数之和，顺序与实际重放一致，不等于 book 的快照行数；
+- 列对应当前 `Event` 字段，`event_type` 写为 `order/trade/cancel`；价格恢复成四位
+  小数，例如内部100001输出10.0001，其他数值以整数写出；
+- `side/order_type` 未解析时为空，不输出内部的 NUL 字符；无关数字字段的0如实写出。
+  F 的 `order_appl_seq_num` 为0，买卖引用在后两列，不是F消息自己的ASN；
+- 保留解析后的值，不回填成交/撤单方向、U实际挂价或其他重放结果。例如撤单的
+  `price` 是初始化值0.0000，不能当作原订单价格；原始市价Price为空时也归一成0；
+- 导出父目录须已存在，文件会覆盖同名输出；路径必须与两份原始输入以及book不同。
 
 ## 5. 查看输出与快照含义
 
