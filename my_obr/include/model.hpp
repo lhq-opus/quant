@@ -1,6 +1,7 @@
 #ifndef MY_OBR_MODEL_HPP
 #define MY_OBR_MODEL_HPP
 
+#include <cstddef>
 #include <stdint.h>
 #include <string>
 #include <vector>
@@ -20,6 +21,10 @@ enum class MarketOrderType { TradeAtBest, CancelAfterFiveLevel, TradeWithSlippag
 struct Event {
   std::string caa;
   std::string transaction_time;
+  std::string security_id;
+  std::string secid;
+  std::string source_path;
+  std::size_t source_line;
   int64_t sequence_no;
   int64_t channel_no;
   EventType type;
@@ -45,6 +50,10 @@ struct TradeInfo {
 struct OrderInfo {
   int64_t price;
   char side;
+  // Original quantity minus source F/4 events, not simulated level fills.
+  int64_t remaining_quantity;
+  // Simulated unpriced remainder awaiting a source cancellation; never a level.
+  int64_t pending_cancel_quantity;
 };
 
 struct PriceLevel {

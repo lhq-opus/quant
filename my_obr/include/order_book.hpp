@@ -5,10 +5,12 @@
 
 #include <functional>
 #include <map>
+#include <utility>
 #include <vector>
 
-// Declares the existing exploratory implementation. Input validation and safe
-// handling of missing orders/levels are not provided by these declarations.
+// Price levels still follow the experimental matching rules. Source executions
+// validate order remainders without applying the same fills to levels again.
+// An invalid event throws std::exception and leaves the prior book state intact.
 class OrderBook {
 public:
   OrderBook();
@@ -22,8 +24,10 @@ private:
   // begin() selects the highest bid and lowest ask respectively.
   typedef std::map<int64_t, int64_t, std::greater<int64_t>> BidLevels;
   typedef std::map<int64_t, int64_t> AskLevels;
-  typedef std::map<int64_t, OrderInfo> OrderPriceMap;
-  typedef std::map<int64_t, std::vector<TradeInfo>> OrderTradeMap;
+  // One trading day per instance. Channel scopes every source order reference.
+  typedef std::pair<int64_t, int64_t> OrderKey;
+  typedef std::map<OrderKey, OrderInfo> OrderPriceMap;
+  typedef std::map<OrderKey, std::vector<TradeInfo>> OrderTradeMap;
 
   void apply_market_order(Event& event);
   void apply_BBO_order(Event& event);
