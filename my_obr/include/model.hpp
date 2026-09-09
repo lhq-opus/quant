@@ -26,6 +26,8 @@ struct Event {
   std::string source_path;
   std::size_t source_line;
   int64_t sequence_no;
+  // This message's ApplSeqNum, distinct from a referenced original order.
+  int64_t appl_seq_num;
   int64_t channel_no;
   EventType type;
   TradingSession trading_session;
@@ -71,6 +73,16 @@ struct AuctionCandidate {
 // make_snapshot supplies five levels on each side, padding missing levels with 0.
 struct Snapshot {
   std::string caa;
+  std::string secid;
+  int64_t sequence_no;
+  int64_t appl_seq_num;
+  std::string transaction_time;
+  // Source F statistics through this snapshot's replay position.
+  int64_t trade_count;
+  int64_t cumulative_trade_quantity;
+  int64_t cumulative_turnover;
+  int64_t last_trade_price;
+  int64_t opening_price;
   EventType event_type;
   TradingSession trading_session;
   std::vector<PriceLevel> bids;

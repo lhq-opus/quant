@@ -9,7 +9,8 @@
 #include <vector>
 
 // Price levels still follow the experimental matching rules. Source executions
-// validate order remainders without applying the same fills to levels again.
+// validate order remainders and update output statistics without applying the
+// same fills to levels again. Output statistics count only processed source F.
 // An invalid event throws std::exception and leaves the prior book state intact.
 class OrderBook {
 public:
@@ -42,8 +43,15 @@ private:
   AskLevels asks;
   OrderPriceMap order_price;
   OrderTradeMap order_trade_map;
+  // Simulated matching totals retained for the existing experiment.
   int64_t cumulative_trade_quantity_num;
   int64_t cumulative_turnover_num;
+  // Independent source F totals exported in book.csv; zero before the first F.
+  int64_t source_trade_count;
+  int64_t source_trade_quantity;
+  int64_t source_turnover;
+  int64_t last_trade_price;
+  int64_t opening_price;
 };
 
 #endif

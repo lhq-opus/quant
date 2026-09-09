@@ -6,7 +6,9 @@
 #include <stdexcept>
 #include <vector>
 
-OrderBook::OrderBook() : cumulative_trade_quantity_num(0), cumulative_turnover_num(0) {}
+OrderBook::OrderBook()
+    : cumulative_trade_quantity_num(0), cumulative_turnover_num(0), source_trade_count(0),
+      source_trade_quantity(0), source_turnover(0), last_trade_price(0), opening_price(0) {}
 
 void OrderBook::build_trade_map(Event& event) {
   if (event.type == EventType::Order) {
@@ -67,8 +69,8 @@ void OrderBook::apply(Event& event, TradingSession session) {
     throw std::invalid_argument("quantity must be positive and channel must be nonnegative");
   }
 
-  // Source F events only validate order remainders. The experimental order
-  // matching has already changed price levels and simulated trade statistics.
+  // Source F events validate remainders and update the exported statistics.
+  // Experimental matching has already changed levels and its separate totals.
   if (event.type == EventType::Trade) {
     if (event.bid_appl_seq_num <= 0 || event.offer_appl_seq_num <= 0 || event.price <= 0) {
       throw std::invalid_argument("trade requires two positive order references and a price");
@@ -93,9 +95,20 @@ void OrderBook::apply(Event& event, TradingSession session) {
             ask_order->second.remaining_quantity - ask_order->second.pending_cancel_quantity) {
       throw std::runtime_error("trade would consume quantity reserved for a pending cancellation");
     }
-    // All checks precede the two non-throwing updates.
+    const int64_t next_count = checked_add(source_trade_count, 1);
+    const int64_t next_quantity = checked_add(source_trade_quantity, event.quantity);
+    const int64_t trade_amount = checked_multiply(event.price, event.quantity);
+    const int64_t next_turnover = checked_add(source_turnover, trade_amount);
+    // Validate all arithmetic before changing either order or any statistic.
     bid_order->second.remaining_quantity -= event.quantity;
     ask_order->second.remaining_quantity -= event.quantity;
+    source_trade_count = next_count;
+    source_trade_quantity = next_quantity;
+    source_turnover = next_turnover;
+    last_trade_price = event.price;
+    if (opening_price == 0) {
+      opening_price = event.price;
+    }
     return;
   }
   if (!event.need_handle) {
@@ -685,8 +698,17 @@ void OrderBook::finish_call_auction() {
 }
 
 Snapshot OrderBook::make_snapshot(Event& event) {
-  Snapshot snapshot;
+  Snapshot snapshot = {};
   snapshot.caa = event.caa;
+  snapshot.secid = event.secid;
+  snapshot.sequence_no = event.sequence_no;
+  snapshot.appl_seq_num = event.appl_seq_num;
+  snapshot.transaction_time = event.transaction_time;
+  snapshot.trade_count = source_trade_count;
+  snapshot.cumulative_trade_quantity = source_trade_quantity;
+  snapshot.cumulative_turnover = source_turnover;
+  snapshot.last_trade_price = last_trade_price;
+  snapshot.opening_price = opening_price;
   snapshot.event_type = event.type;
 
   BidLevels::iterator bid = bids.begin();

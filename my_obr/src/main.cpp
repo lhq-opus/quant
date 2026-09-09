@@ -209,7 +209,7 @@ Event parse_event(std::vector<std::string> columns, bool is_order) {
   event.sequence_no = parse_integer(1, "sequenceNo", 0);
   event.transaction_time = columns[5];
   event.channel_no = parse_integer(6, "ChannelNo", 0);
-  const int64_t application_sequence = parse_integer(7, "ApplSeqNum", 1);
+  event.appl_seq_num = parse_integer(7, "ApplSeqNum", 1);
   event.security_id = columns[8];
   event.secid = columns[9];
   event.trading_session = get_trading_session(event.transaction_time);
@@ -227,7 +227,7 @@ Event parse_event(std::vector<std::string> columns, bool is_order) {
     event.order_type = columns[12][0];
     // Prices remain integer multiples of 0.0001, as in the existing experiment.
     event.price = parse_integer(14, "Price", event.order_type == '2' ? 1 : 0);
-    event.order_appl_seq_num = application_sequence;
+    event.order_appl_seq_num = event.appl_seq_num;
     event.need_handle = true;
   } else {
     if (columns[11] != "4" && columns[11] != "F") {
@@ -386,14 +386,21 @@ void write_book(const std::string& path, const std::vector<Snapshot>& snapshots)
   if (!output) {
     throw std::runtime_error("cannot open book output: " + path);
   }
-  output << "caa,bp5,bp4,bp3,bp2,bp1,ap1,ap2,ap3,ap4,ap5,bs5,bs4,bs3,bs2,bs1,"
+  // bo4 is the required external spelling for the fourth bid price.
+  output << "caa,secid,sno,asn,tst,nts,cvl,cto,lpr,opx,bp5,bo4,bp3,bp2,bp1,"
+            "ap1,ap2,ap3,ap4,ap5,bs5,bs4,bs3,bs2,bs1,"
             "as1,as2,as3,as4,as5\n";
   std::vector<Snapshot>::const_iterator snapshot = snapshots.begin();
   for (; snapshot != snapshots.end(); ++snapshot) {
     if (snapshot->trading_session != TradingSession::ContinuousTrade) {
       continue;
     }
-    output << snapshot->caa;
+    output << snapshot->caa << ',' << snapshot->secid << ',' << snapshot->sequence_no << ','
+           << snapshot->appl_seq_num << ',' << snapshot->transaction_time << ','
+           << snapshot->trade_count << ',' << snapshot->cumulative_trade_quantity << ','
+           << format_fixed_point(snapshot->cumulative_turnover) << ','
+           << format_fixed_point(snapshot->last_trade_price) << ','
+           << format_fixed_point(snapshot->opening_price);
     for (std::size_t index = 0; index < 5; ++index) {
       write_price(output, snapshot->bids, 4 - index);
     }
