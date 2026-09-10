@@ -2,8 +2,8 @@
 #define MY_OBR_ORDER_BOOK_HPP
 
 #include "model.hpp"
+#include "price_levels.hpp"
 
-#include <functional>
 #include <map>
 #include <utility>
 #include <vector>
@@ -22,9 +22,6 @@ public:
   Snapshot make_snapshot(Event& event);
 
 private:
-  // begin() selects the highest bid and lowest ask respectively.
-  typedef std::map<int64_t, int64_t, std::greater<int64_t>> BidLevels;
-  typedef std::map<int64_t, int64_t> AskLevels;
   // One trading day per instance. Channel scopes every source order reference.
   typedef std::pair<int64_t, int64_t> OrderKey;
   typedef std::map<OrderKey, OrderInfo> OrderPriceMap;
@@ -39,8 +36,9 @@ private:
   void find_call_action_result(int64_t& auction_price, int64_t& trade_quantity,
                                int64_t& remaining_quantity_at_price, char& side);
 
-  BidLevels bids;
-  AskLevels asks;
+  // 两侧价格档只通过 PriceLevels 方法读写，业务函数不再操作底层 map。
+  PriceLevels bids;
+  PriceLevels asks;
   OrderPriceMap order_price;
   OrderTradeMap order_trade_map;
   // Simulated matching totals retained for the existing experiment.

@@ -87,12 +87,15 @@ B 的快照包含模拟撮合后的盘口，真实统计仍为零；C 的快照�
 - [main.cpp](../src/main.cpp)：保留本事件 ASN，按固定 30 列写表头及数据。
 
 两份输入表头和可选 events 导出的 12 列格式保持不变。现有命令行用法不变：
+价格档读写现已独立封装，编译时也需要链接 `price_levels.cpp`，接口说明见
+[价格档读写封装](price_levels.md)。
 
 ```bash
 clang++ -std=c++11 -pedantic-errors -Wall -Wextra -Wconversion \
   -Wsign-conversion -Wshadow -Werror -O2 \
   -I quant/my_obr/include \
   quant/my_obr/src/main.cpp quant/my_obr/src/order_book.cpp \
+  quant/my_obr/src/price_levels.cpp \
   -o /tmp/my_obr_30
 
 /tmp/my_obr_30 --order /path/to/order.csv --trade /path/to/trade.csv \

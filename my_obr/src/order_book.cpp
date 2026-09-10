@@ -7,8 +7,9 @@
 #include <vector>
 
 OrderBook::OrderBook()
-    : cumulative_trade_quantity_num(0), cumulative_turnover_num(0), source_trade_count(0),
-      source_trade_quantity(0), source_turnover(0), last_trade_price(0), opening_price(0) {}
+    : bids('1'), asks('2'), cumulative_trade_quantity_num(0), cumulative_turnover_num(0),
+      source_trade_count(0), source_trade_quantity(0), source_turnover(0), last_trade_price(0),
+      opening_price(0) {}
 
 void OrderBook::build_trade_map(Event& event) {
   if (event.type == EventType::Order) {
@@ -141,8 +142,8 @@ void OrderBook::apply(Event& event, TradingSession session) {
 
   // Keep the current function structure. Only levels are copied, not the entire
   // order registry or execution history; a failed new order can erase its key.
-  BidLevels previous_bids = bids;
-  AskLevels previous_asks = asks;
+  PriceLevels previous_bids = bids;
+  PriceLevels previous_asks = asks;
   const int64_t previous_quantity = cumulative_trade_quantity_num;
   const int64_t previous_turnover = cumulative_turnover_num;
   const bool previous_snapshot_flag = event.generate_snapshot;
@@ -187,37 +188,31 @@ void OrderBook::apply_market_order(Event& event) {
     throw std::runtime_error("market order has no opposite level; empty-book policy is unresolved");
   }
   if (event.side == '1') {
-    best_price = asks.begin()->first;
-    quantity_at_best = asks.begin()->second;
+    const PriceLevel level = asks.best();
+    best_price = level.price;
+    quantity_at_best = level.quantity;
   } else {
-    best_price = bids.begin()->first;
-    quantity_at_best = bids.begin()->second;
+    const PriceLevel level = bids.best();
+    best_price = level.price;
+    quantity_at_best = level.quantity;
   }
 
   // trade as normal
   if (quantity_at_best >= remaining_quantity) {
     if (event.side == '1') {
 
-      AskLevels::iterator best_ask = asks.begin();
+      const PriceLevel best_ask = asks.best();
 
       record_trade(best_price, remaining_quantity);
 
-      best_ask->second -= remaining_quantity;
-
-      if (best_ask->second == 0) {
-        asks.erase(best_price);
-      }
+      asks.reduce(best_ask.price, remaining_quantity);
 
     } else {
-      BidLevels::iterator best_bid = bids.begin();
+      const PriceLevel best_bid = bids.best();
 
       record_trade(best_price, remaining_quantity);
 
-      best_bid->second -= remaining_quantity;
-
-      if (best_bid->second == 0) {
-        bids.erase(best_bid);
-      }
+      bids.reduce(best_bid.price, remaining_quantity);
     }
     return;
   }
@@ -243,12 +238,12 @@ void OrderBook::apply_market_order(Event& event) {
 
     if (event.side == '1') {
 
-      int64_t price = bids.begin()->first;
-      bids[price] = checked_add(bids[price], event.quantity);
+      int64_t price = bids.best().price;
+      bids.add(price, event.quantity);
       order_price.at(OrderKey(event.channel_no, event.order_appl_seq_num)).price = price;
     } else {
-      int64_t price = asks.begin()->first;
-      asks[price] = checked_add(asks[price], event.quantity);
+      int64_t price = asks.best().price;
+      asks.add(price, event.quantity);
       order_price.at(OrderKey(event.channel_no, event.order_appl_seq_num)).price = price;
     }
     return;
@@ -275,20 +270,17 @@ void OrderBook::apply_market_order(Event& event) {
     if (event.side == '1') {
       int64_t level_cnt = 0;
       while (remaining_quantity > 0 && !asks.empty() && level_cnt < 5) {
-        AskLevels::iterator best_ask = asks.begin();
+        const PriceLevel best_ask = asks.best();
 
-        int64_t traded_quantity = std::min(remaining_quantity, best_ask->second);
+        int64_t traded_quantity = std::min(remaining_quantity, best_ask.quantity);
 
-        int64_t price = best_ask->first;
+        int64_t price = best_ask.price;
         record_trade(price, traded_quantity);
 
         remaining_quantity -= traded_quantity;
 
-        best_ask->second -= traded_quantity;
+        asks.reduce(best_ask.price, traded_quantity);
 
-        if (best_ask->second == 0) {
-          asks.erase(price);
-        }
         level_cnt++;
       }
 
@@ -300,21 +292,18 @@ void OrderBook::apply_market_order(Event& event) {
 
       int64_t level_cnt = 0;
       while (remaining_quantity > 0 && !bids.empty() && level_cnt < 5) {
-        BidLevels::iterator best_bid = bids.begin();
+        const PriceLevel best_bid = bids.best();
 
-        int64_t traded_quantity = std::min(remaining_quantity, best_bid->second);
+        int64_t traded_quantity = std::min(remaining_quantity, best_bid.quantity);
 
-        int64_t price = best_bid->first;
+        int64_t price = best_bid.price;
 
-        record_trade(best_bid->first, traded_quantity);
+        record_trade(price, traded_quantity);
 
         remaining_quantity -= traded_quantity;
 
-        best_bid->second -= traded_quantity;
+        bids.reduce(best_bid.price, traded_quantity);
 
-        if (best_bid->second == 0) {
-          bids.erase(price);
-        }
         level_cnt++;
       }
 
@@ -337,14 +326,14 @@ void OrderBook::apply_market_order(Event& event) {
     remaining_quantity -= quantity_at_best;
 
     if (event.side == '1') {
-      asks.erase(best_price);
-      bids[best_price] = checked_add(bids[best_price], remaining_quantity);
+      asks.reduce(best_price, quantity_at_best);
+      bids.add(best_price, remaining_quantity);
 
       record_trade(best_price, quantity_at_best);
     } else {
 
-      bids.erase(best_price);
-      asks[best_price] = checked_add(asks[best_price], remaining_quantity);
+      bids.reduce(best_price, quantity_at_best);
+      asks.add(best_price, remaining_quantity);
       record_trade(best_price, quantity_at_best);
     }
 
@@ -355,19 +344,15 @@ void OrderBook::apply_market_order(Event& event) {
 
   if (event.side == '1') {
     while (remaining_quantity > 0 && !asks.empty()) {
-      AskLevels::iterator best_ask = asks.begin();
+      const PriceLevel best_ask = asks.best();
 
-      int64_t traded_quantity = std::min(remaining_quantity, best_ask->second);
+      int64_t traded_quantity = std::min(remaining_quantity, best_ask.quantity);
 
-      record_trade(best_ask->first, traded_quantity);
+      record_trade(best_ask.price, traded_quantity);
 
       remaining_quantity -= traded_quantity;
 
-      best_ask->second -= traded_quantity;
-
-      if (best_ask->second == 0) {
-        asks.erase(best_ask);
-      }
+      asks.reduce(best_ask.price, traded_quantity);
     }
 
     order_price.at(OrderKey(event.channel_no, event.order_appl_seq_num)).pending_cancel_quantity =
@@ -377,19 +362,15 @@ void OrderBook::apply_market_order(Event& event) {
   }
 
   while (remaining_quantity > 0 && !bids.empty()) {
-    BidLevels::iterator best_bid = bids.begin();
+    const PriceLevel best_bid = bids.best();
 
-    int64_t traded_quantity = std::min(remaining_quantity, best_bid->second);
+    int64_t traded_quantity = std::min(remaining_quantity, best_bid.quantity);
 
-    record_trade(best_bid->first, traded_quantity);
+    record_trade(best_bid.price, traded_quantity);
 
     remaining_quantity -= traded_quantity;
 
-    best_bid->second -= traded_quantity;
-
-    if (best_bid->second == 0) {
-      bids.erase(best_bid);
-    }
+    bids.reduce(best_bid.price, traded_quantity);
   }
   order_price.at(OrderKey(event.channel_no, event.order_appl_seq_num)).pending_cancel_quantity =
       remaining_quantity;
@@ -402,22 +383,22 @@ void OrderBook::apply_BBO_order(Event& event) {
         "own-side-best order has no own-side level; cancellation policy is unresolved");
   }
   if (event.side == '1') {
-    int64_t price = bids.begin()->first;
-    bids[price] = checked_add(bids[price], event.quantity);
+    int64_t price = bids.best().price;
+    bids.add(price, event.quantity);
     order_price.at(OrderKey(event.channel_no, event.order_appl_seq_num)).price = price;
   } else {
-    int64_t price = asks.begin()->first;
-    asks[price] = checked_add(asks[price], event.quantity);
+    int64_t price = asks.best().price;
+    asks.add(price, event.quantity);
     order_price.at(OrderKey(event.channel_no, event.order_appl_seq_num)).price = price;
   }
 }
 
 void OrderBook::apply_order_in_acution(Event& event) {
   if (event.side == '1') {
-    bids[event.price] = checked_add(bids[event.price], event.quantity);
+    bids.add(event.price, event.quantity);
 
   } else {
-    asks[event.price] = checked_add(asks[event.price], event.quantity);
+    asks.add(event.price, event.quantity);
   }
 
   order_price.at(OrderKey(event.channel_no, event.order_appl_seq_num)).price = event.price;
@@ -431,26 +412,22 @@ void OrderBook::apply_limit_order(Event& event) {
   // buy
   if (event.side == '1') {
     while (remaining_quantity > 0 && !asks.empty()) {
-      AskLevels::iterator best_ask = asks.begin();
-      if (best_ask->first > event.price) {
+      const PriceLevel best_ask = asks.best();
+      if (best_ask.price > event.price) {
         break;
       }
 
-      int64_t traded_quantity = std::min(remaining_quantity, best_ask->second);
+      int64_t traded_quantity = std::min(remaining_quantity, best_ask.quantity);
 
-      record_trade(best_ask->first, traded_quantity);
+      record_trade(best_ask.price, traded_quantity);
 
       remaining_quantity -= traded_quantity;
 
-      best_ask->second -= traded_quantity;
-
-      if (best_ask->second == 0) {
-        asks.erase(best_ask);
-      }
+      asks.reduce(best_ask.price, traded_quantity);
     }
 
     if (remaining_quantity > 0) {
-      bids[event.price] = checked_add(bids[event.price], remaining_quantity);
+      bids.add(event.price, remaining_quantity);
     }
 
     return;
@@ -460,26 +437,22 @@ void OrderBook::apply_limit_order(Event& event) {
 
   while (remaining_quantity > 0 && !bids.empty()) {
 
-    BidLevels::iterator best_bid = bids.begin();
-    if (best_bid->first < event.price) {
+    const PriceLevel best_bid = bids.best();
+    if (best_bid.price < event.price) {
       break;
     }
 
-    int64_t traded_quantity = std::min(remaining_quantity, best_bid->second);
+    int64_t traded_quantity = std::min(remaining_quantity, best_bid.quantity);
 
-    record_trade(best_bid->first, traded_quantity);
+    record_trade(best_bid.price, traded_quantity);
 
     remaining_quantity -= traded_quantity;
 
-    best_bid->second -= traded_quantity;
-
-    if (best_bid->second == 0) {
-      bids.erase(best_bid);
-    }
+    bids.reduce(best_bid.price, traded_quantity);
   }
 
   if (remaining_quantity > 0) {
-    asks[event.price] = checked_add(asks[event.price], remaining_quantity);
+    asks.add(event.price, remaining_quantity);
   }
 }
 
@@ -516,27 +489,19 @@ void OrderBook::apply_cancel(Event& event) {
 
   const int64_t price = info.price;
   if (info.side == '1') {
-    BidLevels::iterator bid = bids.find(price);
-    if (bid == bids.end() || bid->second < event.quantity) {
+    if (bids.quantity_at(price) < event.quantity) {
       throw std::runtime_error("cancel buy level is missing or has insufficient quantity");
     }
-    bid->second -= event.quantity;
+    bids.reduce(price, event.quantity);
     info.remaining_quantity -= event.quantity;
-    if (bid->second == 0) {
-      bids.erase(bid);
-    }
     return;
   }
 
-  AskLevels::iterator ask = asks.find(price);
-  if (ask == asks.end() || ask->second < event.quantity) {
+  if (asks.quantity_at(price) < event.quantity) {
     throw std::runtime_error("cancel sell level is missing or has insufficient quantity");
   }
-  ask->second -= event.quantity;
+  asks.reduce(price, event.quantity);
   info.remaining_quantity -= event.quantity;
-  if (ask->second == 0) {
-    asks.erase(ask);
-  }
 }
 
 void OrderBook::record_trade(int64_t price, int64_t quantity) {
@@ -554,15 +519,17 @@ void OrderBook::find_call_action_result(int64_t& auction_price, int64_t& trade_q
   remaining_quantity_at_price = 0;
   side = '\0';
   std::vector<int64_t> prices;
-  BidLevels::iterator bid = bids.begin();
-
-  for (; bid != bids.end(); ++bid) {
-    prices.push_back(bid->first);
+  // 集合竞价筛选期间不修改盘口，一次读取两侧全量副本即可反复遍历。
+  const std::vector<PriceLevel> bid_levels = bids.read_all();
+  const std::vector<PriceLevel> ask_levels = asks.read_all();
+  std::vector<PriceLevel>::const_iterator bid = bid_levels.begin();
+  for (; bid != bid_levels.end(); ++bid) {
+    prices.push_back(bid->price);
   }
 
-  AskLevels::iterator ask = asks.begin();
-  for (; ask != asks.end(); ++ask) {
-    prices.push_back(ask->first);
+  std::vector<PriceLevel>::const_iterator ask = ask_levels.begin();
+  for (; ask != ask_levels.end(); ++ask) {
+    prices.push_back(ask->price);
   }
 
   std::sort(prices.begin(), prices.end());
@@ -576,19 +543,19 @@ void OrderBook::find_call_action_result(int64_t& auction_price, int64_t& trade_q
     int64_t sell_quantity = 0;
     AuctionCandidate candidate;
 
-    bid = bids.begin();
+    bid = bid_levels.begin();
 
-    for (; bid != bids.end(); ++bid) {
-      if (bid->first >= *price) {
-        buy_quantity = checked_add(buy_quantity, bid->second);
+    for (; bid != bid_levels.end(); ++bid) {
+      if (bid->price >= *price) {
+        buy_quantity = checked_add(buy_quantity, bid->quantity);
       }
     }
 
-    ask = asks.begin();
+    ask = ask_levels.begin();
 
-    for (; ask != asks.end(); ++ask) {
-      if (ask->first <= *price) {
-        sell_quantity = checked_add(sell_quantity, ask->second);
+    for (; ask != ask_levels.end(); ++ask) {
+      if (ask->price <= *price) {
+        sell_quantity = checked_add(sell_quantity, ask->quantity);
       }
     }
 
@@ -598,14 +565,8 @@ void OrderBook::find_call_action_result(int64_t& auction_price, int64_t& trade_q
     }
     int64_t strictly_better_buy = buy_quantity;
     int64_t strictly_better_sell = sell_quantity;
-    const BidLevels::const_iterator same_bid = bids.find(*price);
-    const AskLevels::const_iterator same_ask = asks.find(*price);
-    if (same_bid != bids.end()) {
-      strictly_better_buy -= same_bid->second;
-    }
-    if (same_ask != asks.end()) {
-      strictly_better_sell -= same_ask->second;
-    }
+    strictly_better_buy -= bids.quantity_at(*price);
+    strictly_better_sell -= asks.quantity_at(*price);
     if (strictly_better_buy > actual_trade || strictly_better_sell > actual_trade) {
       continue;
     }
@@ -656,44 +617,29 @@ void OrderBook::finish_call_auction() {
   if (trade_quantity == 0) {
     return;
   }
-  // Validate all statistics before the non-throwing level reductions.
+  // 先检查统计运算；之后按原规则扣量，reduce 不分配内存并统一删除空档。
   record_trade(auction_price, trade_quantity);
 
-  BidLevels::iterator bid = bids.begin();
-  AskLevels::iterator ask = asks.begin();
   int64_t bid_quantity_left = trade_quantity;
-
-  while (bid != bids.end() && bid_quantity_left > 0 && bid->first >= auction_price) {
-
-    const int64_t reduced = std::min(bid_quantity_left, bid->second);
-
-    bid->second -= reduced;
-    bid_quantity_left -= reduced;
-
-    if (bid->second == 0) {
-      BidLevels::iterator empty_level = bid;
-      ++bid;
-      bids.erase(empty_level);
-    } else {
-      ++bid;
+  while (!bids.empty() && bid_quantity_left > 0) {
+    const PriceLevel bid = bids.best();
+    if (bid.price < auction_price) {
+      break;
     }
+    const int64_t reduced = std::min(bid_quantity_left, bid.quantity);
+    bids.reduce(bid.price, reduced);
+    bid_quantity_left -= reduced;
   }
 
   int64_t ask_quantity_left = trade_quantity;
-  while (ask != asks.end() && ask_quantity_left > 0 && ask->first <= auction_price) {
-
-    const int64_t reduced = std::min(ask_quantity_left, ask->second);
-
-    ask->second -= reduced;
-    ask_quantity_left -= reduced;
-
-    if (ask->second == 0) {
-      AskLevels::iterator empty_level = ask;
-      ++ask;
-      asks.erase(empty_level);
-    } else {
-      ++ask;
+  while (!asks.empty() && ask_quantity_left > 0) {
+    const PriceLevel ask = asks.best();
+    if (ask.price > auction_price) {
+      break;
     }
+    const int64_t reduced = std::min(ask_quantity_left, ask.quantity);
+    asks.reduce(ask.price, reduced);
+    ask_quantity_left -= reduced;
   }
 }
 
@@ -711,29 +657,12 @@ Snapshot OrderBook::make_snapshot(Event& event) {
   snapshot.opening_price = opening_price;
   snapshot.event_type = event.type;
 
-  BidLevels::iterator bid = bids.begin();
-
-  for (; bid != bids.end() && snapshot.bids.size() < 5; ++bid) {
-    PriceLevel level = {bid->first, bid->second};
-
-    snapshot.bids.push_back(level);
-  }
-
-  while (snapshot.bids.size() < 5) {
-    PriceLevel level = {0, 0};
-    snapshot.bids.push_back(level);
-  }
-
-  AskLevels::iterator ask = asks.begin();
-  for (; ask != asks.end() && snapshot.asks.size() < 5; ++ask) {
-    PriceLevel level = {ask->first, ask->second};
-    snapshot.asks.push_back(level);
-  }
-
-  while (snapshot.asks.size() < 5) {
-    PriceLevel level = {0, 0};
-    snapshot.asks.push_back(level);
-  }
+  // PriceLevels 负责最优到最差的顺序；快照层仍按原输出约定补足五档。
+  snapshot.bids = bids.read_top(5);
+  snapshot.asks = asks.read_top(5);
+  const PriceLevel empty_level = {0, 0};
+  snapshot.bids.resize(5, empty_level);
+  snapshot.asks.resize(5, empty_level);
 
   snapshot.trading_session = event.trading_session;
 
