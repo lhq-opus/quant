@@ -228,7 +228,6 @@ Event parse_event(std::vector<std::string> columns, bool is_order) {
     // Prices remain integer multiples of 0.0001, as in the existing experiment.
     event.price = parse_integer(14, "Price", event.order_type == '2' ? 1 : 0);
     event.order_appl_seq_num = event.appl_seq_num;
-    event.need_handle = true;
   } else {
     if (columns[11] != "4" && columns[11] != "F") {
       throw std::invalid_argument("unsupported ExecType: " + columns[11]);
@@ -242,7 +241,6 @@ Event parse_event(std::vector<std::string> columns, bool is_order) {
       event.type = EventType::Cancel;
       event.order_appl_seq_num =
           event.bid_appl_seq_num != 0 ? event.bid_appl_seq_num : event.offer_appl_seq_num;
-      event.need_handle = true;
     } else {
       if (event.bid_appl_seq_num == 0 || event.offer_appl_seq_num == 0 ||
           event.bid_appl_seq_num == event.offer_appl_seq_num) {
@@ -250,7 +248,6 @@ Event parse_event(std::vector<std::string> columns, bool is_order) {
       }
       event.type = EventType::Trade;
       event.price = parse_integer(14, "TradePrice", 1);
-      event.need_handle = false;
       event.generate_snapshot = false;
     }
   }
@@ -472,7 +469,10 @@ int main(int argc, char* argv[]) {
                    "Prices are integer multiples of 0.0001; TransactTime uses "
                    "HHMMSSmmm.\n"
                    "Input must contain one instrument/channel and one trading "
-                   "day's events.\n";
+                   "day's events.\n"
+                   "F executions drive book reductions, including auctions.\n"
+                   "Each continuous order/cancel snapshot includes following F "
+                   "events until the next order/cancel or session boundary.\n";
       if (!std::cout) {
         throw std::runtime_error("cannot write usage output");
       }
@@ -496,20 +496,24 @@ int main(int argc, char* argv[]) {
     }
     std::vector<Snapshot> snapshots;
     snapshots.reserve(events.size());
+    // 一张连续阶段order/4只保存自己的元数据，等后续F全部处理完再拍照。
+    bool has_pending_snapshot = false;
+    std::size_t snapshot_event_index = 0;
     for (std::size_t index = 0; index < events.size(); ++index) {
       try {
-        order_book.apply(events[index], events[index].trading_session);
-        const bool is_last_event_in_session =
-            index + 1 == events.size() ||
-            events[index + 1].trading_session != events[index].trading_session;
-        const bool is_call_auction =
-            events[index].trading_session == TradingSession::OpeningAution ||
-            events[index].trading_session == TradingSession::ClosingAuction;
-        if (is_call_auction && is_last_event_in_session) {
-          order_book.finish_call_auction();
+        const Event& event = events[index];
+        if (has_pending_snapshot &&
+            (event.type != EventType::Trade ||
+             event.trading_session != events[snapshot_event_index].trading_session)) {
+          // 新order/4尚未入簿：现在的状态恰好属于上一个CAA区间。
+          // 切入收盘阶段时也先结束连续阶段的最后一行，不把收盘F归到它上面。
+          snapshots.push_back(order_book.make_snapshot(events[snapshot_event_index]));
+          has_pending_snapshot = false;
         }
+        order_book.apply(events[index], events[index].trading_session);
         if (events[index].generate_snapshot) {
-          snapshots.push_back(order_book.make_snapshot(events[index]));
+          snapshot_event_index = index;
+          has_pending_snapshot = true;
         }
       } catch (const std::exception& error) {
         throw std::runtime_error(
@@ -517,6 +521,10 @@ int main(int argc, char* argv[]) {
             events[index].caa + ", sequenceNo=" + std::to_string(events[index].sequence_no) +
             ", order_id=" + std::to_string(events[index].order_appl_seq_num) + ": " + error.what());
       }
+    }
+    if (has_pending_snapshot) {
+      // 文件以F结束时，也要把这些成交计入最后一个order/4对应的快照。
+      snapshots.push_back(order_book.make_snapshot(events[snapshot_event_index]));
     }
     write_book(options.output_path, snapshots);
     return EXIT_SUCCESS;

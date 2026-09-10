@@ -13,9 +13,6 @@ enum class TradingSession { OpeningAution, ContinuousTrade, ClosingAuction };
 
 enum class TradeType { Normal, Cancel };
 
-// These are the implementation's inferred categories, not raw exchange codes.
-enum class MarketOrderType { TradeAtBest, CancelAfterFiveLevel, TradeWithSlippage };
-
 // Value-initialize with {} before assigning parsed fields. Side and order_type
 // retain raw CSV characters; fields unrelated to an event remain zero/empty.
 struct Event {
@@ -38,36 +35,26 @@ struct Event {
   int64_t order_appl_seq_num;
   int64_t bid_appl_seq_num;
   int64_t offer_appl_seq_num;
-  bool need_handle;
+  // 连续阶段的order/4作为快照起点；后续F处理完才真正拍照。
   bool generate_snapshot;
 };
 
 struct TradeInfo {
   TradeType trade_type;
   int64_t price;
-  int64_t quantity;
 };
 
-// The existing implementation uses this field order for aggregate initialization.
+// 原订单登记。price为实际采用的挂价，0表示本实验中不计入可见价格档。
 struct OrderInfo {
   int64_t price;
   char side;
-  // Original quantity minus source F/4 events, not simulated level fills.
+  // 原委托量减去已经重放到的F/4数量，绝不提前扣未来成交或推算待撤量。
   int64_t remaining_quantity;
-  // Simulated unpriced remainder awaiting a source cancellation; never a level.
-  int64_t pending_cancel_quantity;
 };
 
 struct PriceLevel {
   int64_t price;
   int64_t quantity;
-};
-
-struct AuctionCandidate {
-  int64_t price;
-  int64_t trade_quantity;
-  int64_t remain_quantity_at_price;
-  char side;
 };
 
 // make_snapshot supplies five levels on each side, padding missing levels with 0.

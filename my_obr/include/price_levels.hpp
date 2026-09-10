@@ -30,7 +30,7 @@ public:
   std::vector<PriceLevel> read_top(std::size_t count) const;
   std::vector<PriceLevel> read_all() const;
 
-  // 配合默认的值拷贝，保留 OrderBook 原有的新单失败回滚方式。
+  // 交换两份盘口数据，方向也一起交换；默认值拷贝可独立保存一份盘口。
   void swap(PriceLevels& other);
 
 private:
