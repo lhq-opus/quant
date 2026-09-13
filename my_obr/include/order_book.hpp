@@ -7,11 +7,15 @@
 #include <map>
 #include <vector>
 
-// Declares the existing exploratory implementation. Input validation and safe
-// handling of missing orders/levels are not provided by these declarations.
+// Teaching experiment: complete, valid input and representable arithmetic are
+// assumed. Equal-price orders follow replay arrival order; source F is not reapplied.
 class OrderBook {
 public:
   OrderBook();
+
+  // Registry iterators refer to this instance's queues.
+  OrderBook(const OrderBook&) = delete;
+  OrderBook& operator=(const OrderBook&) = delete;
 
   void build_trade_map(Event& event);
   void apply(Event& event, TradingSession session);
@@ -20,8 +24,8 @@ public:
 
 private:
   // begin() selects the highest bid and lowest ask respectively.
-  typedef std::map<int64_t, int64_t, std::greater<int64_t>> BidLevels;
-  typedef std::map<int64_t, int64_t> AskLevels;
+  typedef std::map<int64_t, BookLevel, std::greater<int64_t>> BidLevels;
+  typedef std::map<int64_t, BookLevel> AskLevels;
   typedef std::map<int64_t, OrderInfo> OrderPriceMap;
   typedef std::map<int64_t, std::vector<TradeInfo>> OrderTradeMap;
 
@@ -40,6 +44,9 @@ private:
   OrderTradeMap order_trade_map;
   int64_t cumulative_trade_quantity_num;
   int64_t cumulative_turnover_num;
+  int64_t trade_number;
+  int64_t last_price;
+  int64_t opening_price;
 };
 
 #endif

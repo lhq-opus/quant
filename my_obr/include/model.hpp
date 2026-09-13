@@ -1,6 +1,7 @@
 #ifndef MY_OBR_MODEL_HPP
 #define MY_OBR_MODEL_HPP
 
+#include <list>
 #include <stdint.h>
 #include <string>
 #include <vector>
@@ -41,10 +42,26 @@ struct TradeInfo {
   int64_t quantity;
 };
 
-// The existing implementation uses this field order for aggregate initialization.
+struct RestingOrder {
+  int64_t order_appl_seq_num;
+  int64_t remaining_quantity;
+};
+
+typedef std::list<RestingOrder> OrderQueue;
+
+// Orders enter at the back and match at the front; the cached total feeds snapshots.
+struct BookLevel {
+  BookLevel() : total_quantity(0) {}
+
+  int64_t total_quantity;
+  OrderQueue orders;
+};
+
+// position belongs to the queue at price. A price of -1 has no queued order.
 struct OrderInfo {
   int64_t price;
   char side;
+  OrderQueue::iterator position;
 };
 
 struct PriceLevel {
@@ -62,6 +79,12 @@ struct AuctionCandidate {
 // make_snapshot supplies five levels on each side, padding missing levels with 0.
 struct Snapshot {
   std::string caa;
+  // Simulated order-pair statistics, available immediately after apply().
+  int64_t trade_number;
+  int64_t last_price;
+  int64_t opening_price;
+  int64_t cumulative_trade_quantity;
+  int64_t cumulative_turnover;
   EventType event_type;
   TradingSession trading_session;
   std::vector<PriceLevel> bids;
