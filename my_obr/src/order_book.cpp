@@ -117,7 +117,7 @@ void OrderBook::apply_market_order(Event& event) {
       best_bid->second -= remaining_quantity;
 
       if (best_bid->second == 0) {
-        asks.erase(best_price);
+        bids.erase(best_price);
       }
     }
     return;
@@ -163,7 +163,7 @@ void OrderBook::apply_market_order(Event& event) {
 
   market_order_type = MarketOrderType::TradeAtBest;
 
-  if (trades.size() != 1 && trades[trades.size() - 1].trade_type == TradeType::Cancel) {
+  if (trades.size() > 1 && trades.back().trade_type == TradeType::Cancel) {
     market_order_type = MarketOrderType::CancelAfterFiveLevel;
   } else {
     for (std::size_t index = 0; index < trades.size(); ++index) {
@@ -199,9 +199,6 @@ void OrderBook::apply_market_order(Event& event) {
         level_cnt++;
       }
 
-      if (remaining_quantity > 0) {
-        bids[-1] += remaining_quantity;
-      }
     } else {
 
       int64_t level_cnt = 0;
@@ -231,13 +228,11 @@ void OrderBook::apply_market_order(Event& event) {
       if (event.caa == "1629943945030354") {
         std::cout << remaining_quantity << std::endl;
       }
-
-      if (remaining_quantity > 0) {
-        asks[-1] += remaining_quantity;
-      }
     }
 
+    // Keep the pending-cancel marker outside the price levels.
     order_price[event.order_appl_seq_num] = OrderInfo{-1, event.side};
+    return;
   }
 
   // trade at fixed price
@@ -253,13 +248,13 @@ void OrderBook::apply_market_order(Event& event) {
 
     if (event.side == '1') {
       asks.erase(best_price);
-      bids[best_price] = remaining_quantity;
+      bids[best_price] += remaining_quantity;
 
       record_trade(best_price, quantity_at_best);
     } else {
 
       bids.erase(best_price);
-      asks[best_price] = remaining_quantity;
+      asks[best_price] += remaining_quantity;
       record_trade(best_price, quantity_at_best);
     }
 
@@ -390,11 +385,21 @@ void OrderBook::apply_limit_order(Event& event) {
 
 void OrderBook::apply_cancel(Event& event) {
 
-  int64_t price = order_price[event.order_appl_seq_num].price;
-  char side = order_price[event.order_appl_seq_num].side;
+  OrderPriceMap::const_iterator order = order_price.find(event.order_appl_seq_num);
+  if (order == order_price.end()) {
+    return;
+  }
+  int64_t price = order->second.price;
+  if (price == -1) {
+    return;
+  }
+  char side = order->second.side;
 
   if (side == '1') {
     BidLevels::iterator bid = bids.find(price);
+    if (bid == bids.end()) {
+      return;
+    }
     bid->second -= event.quantity;
 
     if (bid->second == 0) {
@@ -405,20 +410,24 @@ void OrderBook::apply_cancel(Event& event) {
   }
 
   AskLevels::iterator ask = asks.find(price);
+  if (ask == asks.end()) {
+    return;
+  }
   ask->second -= event.quantity;
 
   if (ask->second == 0) {
     asks.erase(ask);
   }
 
-  if (event.caa == "1629943945030657") {
-    std::cout << "?3" << std::endl;
-    std::cout << event.caa << "," << price << "," << side << "," << event.quantity << ask->first
-              << std::endl;
+  //   if (event.caa == "1629943945030657") {
+  //     std::cout << "?3" << std::endl;
+  //     std::cout << event.caa << "," << price << "," << side << "," << event.quantity <<
+  //     ask->first
+  //               << std::endl;
 
-    BidLevels::iterator bid = bids.begin();
-    std::cout << "?3" << bid->first << std::endl;
-  }
+  //     BidLevels::iterator bid = bids.begin();
+  //     std::cout << "?3" << bid->first << std::endl;
+  //   }
 
   return;
 }
