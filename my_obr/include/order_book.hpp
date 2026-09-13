@@ -17,10 +17,12 @@ public:
   OrderBook(const OrderBook&) = delete;
   OrderBook& operator=(const OrderBook&) = delete;
 
-  void build_trade_map(Event& event);
-  void apply(Event& event, TradingSession session);
+  void build_trade_map(const Trade& trade);
+  void apply(Order& order);
+  void apply(const Trade& trade);
   void finish_call_auction();
-  Snapshot make_snapshot(Event& event);
+  Snapshot make_snapshot(const Order& order);
+  Snapshot make_snapshot(const Trade& trade);
 
 private:
   // begin() selects the highest bid and lowest ask respectively.
@@ -29,11 +31,12 @@ private:
   typedef std::map<int64_t, OrderInfo> OrderPriceMap;
   typedef std::map<int64_t, std::vector<TradeInfo>> OrderTradeMap;
 
-  void apply_market_order(Event& event);
-  void apply_BBO_order(Event& event);
-  void apply_order_in_acution(Event& event);
-  void apply_limit_order(Event& event);
-  void apply_cancel(Event& event);
+  void apply_market_order(Order& order);
+  void apply_BBO_order(Order& order);
+  void apply_order_in_acution(Order& order);
+  void apply_limit_order(Order& order);
+  void apply_cancel(const Trade& trade);
+  Snapshot make_snapshot(const std::string& caa, EventType event_type, TradingSession session);
   void record_trade(int64_t price, int64_t quantity);
   void find_call_action_result(int64_t& auction_price, int64_t& trade_quantity,
                                int64_t& remaining_quantity_at_price, char& side);

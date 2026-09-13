@@ -1,12 +1,48 @@
-# 逐单盘口与即时模拟成交统计
+# 逐单盘口、独立输入类型与模拟成交统计
 
-本轮把 `bids/asks` 的价格档内容改为逐单 FIFO 队列。限价单和本方最优 U 单处理完成后，
+`bids/asks` 的价格档内容为逐单 FIFO 队列。限价单和本方最优 U 单处理完成后，
 即可读取包含模拟成交笔数、最新成交价等信息的 `Snapshot`，不必等待后续 F。
 市价单沿用当前根据关联成交/撤单历史推断的实验分支。
 
 代码仍使用 C++11，保留原有函数划分，`apply_market_order` 没有拆分。按用户指定，
 不新增数据溢出、空盘口、输入校验或异常恢复框架；输入完整、合法、引用正确且运算可表示
 是本轮前提。已有六项局部修复继续保留。
+
+## Order 和 Trade 分开处理
+
+输入现在有两个独立类型，解析后保持各自类型直至进入盘口：
+
+| 类型 | 来源与专属字段 |
+| --- | --- |
+| `Order` | order.csv；`side`、`order_type`、`order_appl_seq_num` |
+| `Trade` | trade.csv；`trade_type`、`trade_appl_seq_num`、`bid_appl_seq_num`、`offer_appl_seq_num` |
+
+两者各自保存 CAA、时间、通道、`sequence_no`、价格、数量和快照开关。
+`TradeType::Normal` 对应 F，`TradeType::Cancel` 对应撤单 4；撤单也属于 `Trade` 输入。
+`trade_appl_seq_num` 标识成交/撤单记录本身，撤单定位使用非零的买方或卖方原订单引用。
+
+`OrderBook` 提供以下重载，由 C++ 根据实参类型选择：
+
+```cpp
+void apply(Order& order);
+void apply(const Trade& trade);
+Snapshot make_snapshot(const Order& order);
+Snapshot make_snapshot(const Trade& trade);
+```
+
+`apply(Order&)` 直接读取委托自身的 `trading_session`，调用原限价/U/市价/竞价函数。
+`apply(const Trade&)` 对撤单调用 `apply_cancel`；普通 F 继续跳过，以免重复应用模拟成交。
+原 `need_handle` 标志已移除。`EventType` 只保留为快照及 CSV 的来源标签，不再有统一的
+`Event` 输入对象、基类或中间转换。
+
+main 分别通过 `parse_order` / `read_orders` 和 `parse_trade` / `read_trades` 读取两表。
+两个数组各按 `sequence_no` 排序，用双索引归并后直接调用对应的 `apply` 重载。
+导出与重放共用 `next_is_order`；两流的序号相同时先取 Order，这是本程序的调度约定，
+不是新增的交易所排序规则。原混合数组在等序号时没有稳定顺序保证。
+
+阶段切换使用前一条已处理记录的阶段和当前阶段判断：离开开盘竞价时，先结算再应用当前
+记录；文件结束时若仍在开盘竞价则结算。原来的下一元素 `index + 1` 读取已移除。
+`build_trade_map` 仅适配为接受 `Trade`，保留原实验逻辑；此次不调整市价推断规则。
 
 ## 盘口现在保存什么
 
@@ -54,8 +90,8 @@ order_price
 虽然只消费一个价格档，也不能只算成一笔。之后收到的源 F 继续沿用原跳过逻辑，不重复
 扣量或重复更新统计。
 
-`apply_BBO_order` 仍把 U 解释为**本方最优**。先锁定到达时本方最优价，再用事件副本
-按这个限价调用限价处理，原事件的 `price` 不被改写。正常未交叉盘口下，U 只是排入
+`apply_BBO_order` 仍把 U 解释为**本方最优**。先锁定到达时本方最优价，再用 `Order` 副本
+按这个限价调用限价处理，原委托的 `price` 不被改写。正常未交叉盘口下，U 只是排入
 本方最优档队尾，不会产生新成交，此时笔数和最新价保持原值，也可以立即生成快照。
 
 ## 市价单如何适配
@@ -81,9 +117,9 @@ order_price
 
 例如同一竞价价格下，买队列数量为 `[3, 4]`，卖队列为 `[2, 5]`，依次配对成交
 `2、1、4`，模拟成交 3 笔、总量 7；不会把整场竞价记成 1 笔，也不会因同时扣买卖两侧
-把成交量算成 14。本轮只适配队列和统计，未补齐原竞价选价或主程序阶段收尾的其他问题。
+把成交量算成 14。原竞价选价规则仍然保留，本次类型拆分没有扩展收盘竞价处理。
 
-`Snapshot` 新增的字段如下：
+`Snapshot` 保存的模拟统计如下：
 
 | 字段 | 含义 |
 | --- | --- |
@@ -102,23 +138,28 @@ order_price
 ## 如何读取及修改范围
 
 ```cpp
-order_book.apply(event, event.trading_session);
-Snapshot snapshot = order_book.make_snapshot(event);
-std::cout << snapshot.trade_number << ',' << snapshot.last_price << '\n';
+order_book.apply(order);
+Snapshot order_snapshot = order_book.make_snapshot(order);
+
+order_book.apply(trade);
+Snapshot trade_snapshot = order_book.make_snapshot(trade);
 ```
 
-以上是事件应用后读取内存快照的示意。main 仍使用原来的 `generate_snapshot` 条件，
-市价分支原先关闭快照的行为保留。
+以上假设 `order` 和 `trade` 已完成读取；调用后可以直接读取快照的统计字段。两种
+快照重载复用同一段五档投影代码，并分别复制原记录的 CAA、阶段和来源标签。
+main 仍使用原来的 `generate_snapshot` 条件，普通 F 不产生输出行，市价分支原先关闭
+快照的行为保留。
 
-用户已选择只扩展内存 `Snapshot`。本轮不修改 main、21 列 book 或 12 列 events 输出；
-新增统计不写入 CSV。完整程序仍先读取两份文件并预建历史，本轮改善的是单事件应用后
-统计的可用时点，没有把程序改成实时行情订阅或流式输出，也没有做性能基准。
+用户已选择只在内存 `Snapshot` 中保存新增统计。Order/Trade 拆分调整了 main 的读取和
+分发，21 列 book 及 12 列 events 的格式、格式化方法保持原样。events 中 Trade 的
+方向/委托类型写空字段，普通 F 的原单列写 0，撤单的原单列写被撤订单引用；撤单价格仍
+沿用此前的 0。`trade_appl_seq_num` 暂不增加到导出列。本次没有做性能基准。
 
-修改文件为 `include/model.hpp`、`include/order_book.hpp`、`src/order_book.cpp`。
-验证使用临时核心驱动，不提交测试框架或 mock；实际命令与结果记录在工作区
-`my_obr_fifo_validation.txt`。
+本次类型拆分修改 `include/model.hpp`、`include/order_book.hpp`、`src/order_book.cpp`、
+`src/main.cpp`，并更新本文档。实际命令与结果记录在工作区 `my_obr_types_validation.txt`；
+临时验证驱动、mock 和二进制不提交。
 
-## 验证结果
+## 逐单盘口阶段的验证记录
 
 - 30 组核心场景分别在 Debug、Release、ASan/UBSan 下运行，共 90 组运行全部通过。
   覆盖双侧 FIFO、指定订单撤量、U 定价、跨档最新价、市价原分支、五价十单、深档晋升、
@@ -127,4 +168,18 @@ std::cout << snapshot.trade_number << ',' << snapshot.last_price << '\n';
   ASan/UBSan 无诊断，运行时使用 `ASAN_OPTIONS=detect_leaks=0`。
 - 两个头文件独立及重复包含检查、ClangFormat、`git diff --check` 均通过。
 - 完整程序编译链接通过，仅有未修改的 `main.cpp` 中原整数转 `double` 精度告警。
-  本轮未运行 main 的完整文件重放，未验证 CSV、非法输入或数值溢出。
+  该阶段未运行 main 的完整文件重放，未验证 CSV、非法输入或数值溢出。
+  详细记录在工作区 `my_obr_fifo_validation.txt`。
+
+## Order/Trade 拆分的验证记录
+
+- 34 组核心场景在 Debug、Release、ASan/UBSan 下全部通过。其中 30 组回归原 FIFO、
+  市价和统计行为，4 组检查独立类型、重载、快照元信息及成交自身 ASN 与撤单引用分离。
+  核心和驱动使用严格 C++11 与 `-Werror` 编译，无告警。
+- 7 组完整程序回放在 Debug、ASan/UBSan 下全部通过，输入包括两表各自乱序、两种类型
+  的尾段、F 跳过、开盘转连续及相同序号的调度；输出与手算的 12 列 events、21 列 book
+  逐字一致。完整构建保留原价格格式化处整数转 `double` 的一条告警。
+- 两个头文件独立及重复包含、ClangFormat、`git diff --check` 均通过。独立差分复核确认
+  市价长函数和其他撮合函数只有参数类型与名称适配，算法保持原样。
+- ASan/UBSan 运行无代码诊断；当前平台不支持泄漏检测，使用 `detect_leaks=0`，未验证
+  内存泄漏。没有增加非法输入或溢出检查，也未据合成数据声明真实行情恢复正确。

@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+// Snapshot/output source labels; input records use separate Order and Trade types.
 enum class EventType { Order, Trade, Cancel };
 
 // Keep the existing source spellings until a separate naming change is requested.
@@ -16,23 +17,35 @@ enum class TradeType { Normal, Cancel };
 // These are the implementation's inferred categories, not raw exchange codes.
 enum class MarketOrderType { TradeAtBest, CancelAfterFiveLevel, TradeWithSlippage };
 
-// Value-initialize with {} before assigning parsed fields. Side and order_type
-// retain raw CSV characters; fields unrelated to an event remain zero/empty.
-struct Event {
+// Value-initialize parsed records with {}. Side and order_type retain raw codes.
+struct Order {
   std::string caa;
   std::string transaction_time;
   int64_t sequence_no;
   int64_t channel_no;
-  EventType type;
   TradingSession trading_session;
   char side;
   char order_type;
   int64_t price;
   int64_t quantity;
   int64_t order_appl_seq_num;
+  bool generate_snapshot;
+};
+
+// A trade.csv record is either a normal execution or a cancellation.
+// Its own sequence identifies this record; bid/offer sequences reference orders.
+struct Trade {
+  std::string caa;
+  std::string transaction_time;
+  int64_t sequence_no;
+  int64_t channel_no;
+  TradingSession trading_session;
+  TradeType trade_type;
+  int64_t price;
+  int64_t quantity;
+  int64_t trade_appl_seq_num;
   int64_t bid_appl_seq_num;
   int64_t offer_appl_seq_num;
-  bool need_handle;
   bool generate_snapshot;
 };
 
