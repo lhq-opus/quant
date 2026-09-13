@@ -35,7 +35,7 @@ Snapshot make_snapshot(const Trade& trade);
 原 `need_handle` 标志已移除。`EventType` 只保留为快照及 CSV 的来源标签，不再有统一的
 `Event` 输入对象、基类或中间转换。
 
-main 通过 `CsvReplayStream::read_line` 每次取得一条原始记录，在循环内调用
+main 通过普通函数 `read_line` 每次取得一条原始记录，在循环内调用
 `parse_order` 或 `parse_trade`，然后调用对应的 `apply` 重载。
 
 阶段切换使用前一条已处理记录的阶段和当前阶段判断：离开开盘竞价时，先结算再应用当前
@@ -44,8 +44,17 @@ main 通过 `CsvReplayStream::read_line` 每次取得一条原始记录，在循
 
 ## 按 CAA 模拟逐行推送
 
-两份输入文件必须各自已经按**数值 CAA 非降序**排列。`CsvReplayStream` 打开两份文件、
-跳过表头，在每路保存一条待处理原文及其 CAA。每次 `read_line`：
+读取状态直接保存在 main.cpp 的全局变量中：`order_input/trade_input` 保存文件流，
+`order_line/trade_line` 保存待处理原文，`order_caa/trade_caa` 保存数值 CAA，
+`has_order/has_trade` 表示对应流是否还有待处理记录。`static` 使这些变量只在当前文件可见。
+
+读取流程由三个普通函数完成：
+
+- `read_next_line`：从指定文件读取一行，并提取 CAA。
+- `open_inputs`：关闭前一次输入、清理 EOF 状态，重新打开两表，跳过表头并缓存各自首行。
+- `read_line`：比较两路当前 CAA，每次返回一条原文及其来源。
+
+两份输入文件必须各自已经按**数值 CAA 非降序**排列。每次 `read_line`：
 
 1. 比较两条待处理记录的 CAA，返回较小的那条原文和来源标记。
 2. CAA 相同时先取 Order，同一文件内保持物理行序。
@@ -58,8 +67,9 @@ CAA 通过整数比较，因此 `9` 排在 `10` 前面；原始字符串原样�
 主循环的读取、转换和应用过程如下，实际代码还保留阶段结算和逐条输出：
 
 ```cpp
+open_inputs(options.order_path, options.trade_path);
 for (;;) {
-  if (!input.read_line(line, is_order)) {
+  if (!read_line(line, is_order)) {
     break;
   }
   const std::vector<std::string> columns = split_csv_line(line);
@@ -80,7 +90,9 @@ for (;;) {
 在主循环前完整扫描两份 CSV。订单行只推进扫描，成交/撤单行解析成 `Trade` 后调用
 原 `OrderBook::build_trade_map`。关联历史按 trade 文件中的行序保存，不再按
 `sequence_no` 重排。预处理不调用 `apply`，不增加盘口订单或成交统计。
-预处理结束后，main 创建新的 `CsvReplayStream`，从两份文件开头重新模拟推送。
+预处理方法先调用 `open_inputs` 扫描两表；结束后 main 再调用一次 `open_inputs`，
+清理上次扫描留下的 EOF 和缓存，从两份文件开头重新模拟推送。两个阶段顺序复用
+同一对全局输入流。
 
 book 和 events 输出流各打开一次并写一次表头。每次解析后先写当前 events 行，再
 `apply`；需要快照时立即生成一个 `Snapshot` 并写入 book 输出流。程序不再保存
@@ -198,9 +210,9 @@ main 仍使用原来的 `generate_snapshot` 条件，普通 F 不产生输出行
 方向/委托类型写空字段，普通 F 的原单列写 0，撤单的原单列写被撤订单引用；撤单价格仍
 沿用此前的 0。`trade_appl_seq_num` 暂不增加到导出列。本次没有做性能基准。
 
-本次流式改造只修改 `src/main.cpp` 和本文档；两个头文件及 `src/order_book.cpp` 保持
-原样。实际命令与结果记录在工作区 `my_obr_stream_validation.txt`；临时验证驱动、mock
-和二进制不提交。
+本次按用户要求将读取类改为全局变量和普通函数，只修改 `src/main.cpp` 和本文档；
+两个头文件及 `src/order_book.cpp` 保持原样。实际命令与结果记录在工作区
+`my_obr_global_stream_validation.txt`；临时验证驱动、mock 和二进制不提交。
 
 ## 逐单盘口阶段的验证记录
 
@@ -242,3 +254,11 @@ main 仍使用原来的 `generate_snapshot` 条件，普通 F 不产生输出行
   平台不支持的泄漏检测，未测试非法输入或数值溢出。
 - 格式及差分检查通过；两个头文件和核心 cpp 与前一提交逐字一致。main 中没有全量
   Order、Trade、Snapshot 数组或排序调用。详细命令见 `my_obr_stream_validation.txt`。
+
+## 全局变量和函数版本的验证记录
+
+- Debug、ASan/UBSan 下，原 12 组回放、13 组读取和 4 组预处理统计检查全部通过。
+- 新增 6 组同进程重开检查，覆盖读取至 EOF 后重开、切换文件及只有表头的一侧、部分
+  读取后从头重开。确认 `open_inputs` 重置文件位置、EOF 和缓存，预扫描后能完整重放。
+- C++11 构建只保留原价格格式化精度告警；地址/UB 检查无诊断。格式及差分检查通过，
+  两个头文件和核心 cpp 逐字未变。详细记录见 `my_obr_global_stream_validation.txt`。

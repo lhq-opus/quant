@@ -123,58 +123,64 @@ Trade parse_trade(const std::vector<std::string>& columns) {
 }
 
 // Each input is already ordered by numeric CAA. Keep one pending line per input.
-class CsvReplayStream {
-public:
-  CsvReplayStream(const std::string& order_path, const std::string& trade_path)
-      : order_input(order_path.c_str()), trade_input(trade_path.c_str()), order_caa(0),
-        trade_caa(0), has_order(false), has_trade(false) {
-    std::string header;
-    std::getline(order_input, header);
-    std::getline(trade_input, header);
+static std::ifstream order_input;
+static std::ifstream trade_input;
+static std::string order_line;
+static std::string trade_line;
+static int64_t order_caa = 0;
+static int64_t trade_caa = 0;
+static bool has_order = false;
+static bool has_trade = false;
+
+bool read_next_line(std::ifstream& input, std::string& line, int64_t& caa) {
+  if (!std::getline(input, line)) {
+    return false;
+  }
+  caa = std::stoll(line.substr(0, line.find(',')));
+  return true;
+}
+
+void open_inputs(const std::string& order_path, const std::string& trade_path) {
+  // Restart the shared inputs after the history scan or a previous replay.
+  order_input.close();
+  order_input.clear();
+  order_input.open(order_path.c_str());
+  trade_input.close();
+  trade_input.clear();
+  trade_input.open(trade_path.c_str());
+  order_line.clear();
+  trade_line.clear();
+  order_caa = 0;
+  trade_caa = 0;
+
+  std::string header;
+  std::getline(order_input, header);
+  std::getline(trade_input, header);
+  has_order = read_next_line(order_input, order_line, order_caa);
+  has_trade = read_next_line(trade_input, trade_line, trade_caa);
+}
+
+bool read_line(std::string& line, bool& is_order) {
+  if (!has_order && !has_trade) {
+    return false;
+  }
+  is_order = !has_trade || (has_order && order_caa <= trade_caa);
+  if (is_order) {
+    line = order_line;
     has_order = read_next_line(order_input, order_line, order_caa);
+  } else {
+    line = trade_line;
     has_trade = read_next_line(trade_input, trade_line, trade_caa);
   }
-
-  bool read_line(std::string& line, bool& is_order) {
-    if (!has_order && !has_trade) {
-      return false;
-    }
-    is_order = !has_trade || (has_order && order_caa <= trade_caa);
-    if (is_order) {
-      line = order_line;
-      has_order = read_next_line(order_input, order_line, order_caa);
-    } else {
-      line = trade_line;
-      has_trade = read_next_line(trade_input, trade_line, trade_caa);
-    }
-    return true;
-  }
-
-private:
-  bool read_next_line(std::ifstream& input, std::string& line, int64_t& caa) {
-    if (!std::getline(input, line)) {
-      return false;
-    }
-    caa = std::stoll(line.substr(0, line.find(',')));
-    return true;
-  }
-
-  std::ifstream order_input;
-  std::ifstream trade_input;
-  std::string order_line;
-  std::string trade_line;
-  int64_t order_caa;
-  int64_t trade_caa;
-  bool has_order;
-  bool has_trade;
-};
+  return true;
+}
 
 void build_trade_map_from_csv(const std::string& order_path, const std::string& trade_path,
                               OrderBook& order_book) {
-  CsvReplayStream input(order_path, trade_path);
+  open_inputs(order_path, trade_path);
   std::string line;
   bool is_order = false;
-  while (input.read_line(line, is_order)) {
+  while (read_line(line, is_order)) {
     // Order rows are scanned too; only trades contribute to the existing history map.
     if (!is_order) {
       const Trade trade = parse_trade(split_csv_line(line));
@@ -274,7 +280,7 @@ int main(int argc, char* argv[]) {
   OrderBook order_book = {};
   build_trade_map_from_csv(options.order_path, options.trade_path, order_book);
 
-  CsvReplayStream input(options.order_path, options.trade_path);
+  open_inputs(options.order_path, options.trade_path);
   std::ofstream output(options.output_path.c_str());
   if (!output) {
     std::cerr << "无法写入 book.csv: " << options.output_path << '\n';
@@ -290,7 +296,7 @@ int main(int argc, char* argv[]) {
   TradingSession previous_session = TradingSession::ContinuousTrade;
   for (;;) {
     // Read one raw record, convert it to its own type, then apply it.
-    if (!input.read_line(line, is_order)) {
+    if (!read_line(line, is_order)) {
       break;
     }
     const std::vector<std::string> columns = split_csv_line(line);
