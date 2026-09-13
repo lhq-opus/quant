@@ -35,14 +35,57 @@ Snapshot make_snapshot(const Trade& trade);
 原 `need_handle` 标志已移除。`EventType` 只保留为快照及 CSV 的来源标签，不再有统一的
 `Event` 输入对象、基类或中间转换。
 
-main 分别通过 `parse_order` / `read_orders` 和 `parse_trade` / `read_trades` 读取两表。
-两个数组各按 `sequence_no` 排序，用双索引归并后直接调用对应的 `apply` 重载。
-导出与重放共用 `next_is_order`；两流的序号相同时先取 Order，这是本程序的调度约定，
-不是新增的交易所排序规则。原混合数组在等序号时没有稳定顺序保证。
+main 通过 `CsvReplayStream::read_line` 每次取得一条原始记录，在循环内调用
+`parse_order` 或 `parse_trade`，然后调用对应的 `apply` 重载。
 
 阶段切换使用前一条已处理记录的阶段和当前阶段判断：离开开盘竞价时，先结算再应用当前
 记录；文件结束时若仍在开盘竞价则结算。原来的下一元素 `index + 1` 读取已移除。
-`build_trade_map` 仅适配为接受 `Trade`，保留原实验逻辑；此次不调整市价推断规则。
+此次不调整市价推断规则。
+
+## 按 CAA 模拟逐行推送
+
+两份输入文件必须各自已经按**数值 CAA 非降序**排列。`CsvReplayStream` 打开两份文件、
+跳过表头，在每路保存一条待处理原文及其 CAA。每次 `read_line`：
+
+1. 比较两条待处理记录的 CAA，返回较小的那条原文和来源标记。
+2. CAA 相同时先取 Order，同一文件内保持物理行序。
+3. 只补读刚取出记录的那一路；一路结束后继续另一条流，两路结束时返回 `false`。
+
+CAA 通过整数比较，因此 `9` 排在 `10` 前面；原始字符串原样保留用于输出。
+`sequence_no` 仍被解析和导出，但不参与调度，也不再全量排序。这是用户指定的到达顺序
+模拟规则，不是新增的交易所业务排序规则。程序不检查输入是否有序。
+
+主循环的读取、转换和应用过程如下，实际代码还保留阶段结算和逐条输出：
+
+```cpp
+for (;;) {
+  if (!input.read_line(line, is_order)) {
+    break;
+  }
+  const std::vector<std::string> columns = split_csv_line(line);
+  if (is_order) {
+    Order order = parse_order(columns);
+    order_book.apply(order);
+  } else {
+    const Trade trade = parse_trade(columns);
+    order_book.apply(trade);
+  }
+}
+```
+
+读取层的 `line` 和 `is_order` 只表示原文及来源，不是统一的业务 Event。每轮循环只向
+盘口推送一个 `Order` 或 `Trade`；另一条待处理记录留到后续循环。
+
+`build_trade_map_from_csv(order_path, trade_path, order_book)` 是独立的预处理方法，
+在主循环前完整扫描两份 CSV。订单行只推进扫描，成交/撤单行解析成 `Trade` 后调用
+原 `OrderBook::build_trade_map`。关联历史按 trade 文件中的行序保存，不再按
+`sequence_no` 重排。预处理不调用 `apply`，不增加盘口订单或成交统计。
+预处理结束后，main 创建新的 `CsvReplayStream`，从两份文件开头重新模拟推送。
+
+book 和 events 输出流各打开一次并写一次表头。每次解析后先写当前 events 行，再
+`apply`；需要快照时立即生成一个 `Snapshot` 并写入 book 输出流。程序不再保存
+完整的 Order、Trade 或 Snapshot 数组，也不强制逐行 flush。输入缓存规模不随记录数
+增长；历史 map 和盘口仍保存各自所需的状态。
 
 ## 盘口现在保存什么
 
@@ -63,8 +106,8 @@ order_price
                                      position 指向该订单的链表节点
 ```
 
-同价订单按当前重放顺序插入队尾，撮合从队首开始。重放顺序继续采用原 main 的
-`sequenceNo` 排序，不新增另一套排序或数据完整性检查。
+同价订单按当前重放顺序插入队尾，撮合从队首开始。当前重放顺序按上述数值 CAA 归并，
+同一输入文件内保持行序；没有新增数据完整性检查。
 
 价格档缓存 `total_quantity`。撮合和撤单同时维护订单剩余量与档位总量，因此生成五档
 快照只读取每侧前五档的缓存总量，不需要再扫描全簿或这些档位内的所有订单。
@@ -117,7 +160,7 @@ order_price
 
 例如同一竞价价格下，买队列数量为 `[3, 4]`，卖队列为 `[2, 5]`，依次配对成交
 `2、1、4`，模拟成交 3 笔、总量 7；不会把整场竞价记成 1 笔，也不会因同时扣买卖两侧
-把成交量算成 14。原竞价选价规则仍然保留，本次类型拆分没有扩展收盘竞价处理。
+把成交量算成 14。原竞价选价规则仍然保留，流式输入改造没有扩展收盘竞价处理。
 
 `Snapshot` 保存的模拟统计如下：
 
@@ -150,14 +193,14 @@ Snapshot trade_snapshot = order_book.make_snapshot(trade);
 main 仍使用原来的 `generate_snapshot` 条件，普通 F 不产生输出行，市价分支原先关闭
 快照的行为保留。
 
-用户已选择只在内存 `Snapshot` 中保存新增统计。Order/Trade 拆分调整了 main 的读取和
-分发，21 列 book 及 12 列 events 的格式、格式化方法保持原样。events 中 Trade 的
+用户已选择只在内存 `Snapshot` 中保存新增统计。流式改造调整了 main 的读取和
+写出方式，21 列 book 及 12 列 events 的格式、格式化方法保持原样。events 中 Trade 的
 方向/委托类型写空字段，普通 F 的原单列写 0，撤单的原单列写被撤订单引用；撤单价格仍
 沿用此前的 0。`trade_appl_seq_num` 暂不增加到导出列。本次没有做性能基准。
 
-本次类型拆分修改 `include/model.hpp`、`include/order_book.hpp`、`src/order_book.cpp`、
-`src/main.cpp`，并更新本文档。实际命令与结果记录在工作区 `my_obr_types_validation.txt`；
-临时验证驱动、mock 和二进制不提交。
+本次流式改造只修改 `src/main.cpp` 和本文档；两个头文件及 `src/order_book.cpp` 保持
+原样。实际命令与结果记录在工作区 `my_obr_stream_validation.txt`；临时验证驱动、mock
+和二进制不提交。
 
 ## 逐单盘口阶段的验证记录
 
@@ -173,6 +216,8 @@ main 仍使用原来的 `generate_snapshot` 条件，普通 F 不产生输出行
 
 ## Order/Trade 拆分的验证记录
 
+以下记录来自此前按 `sequence_no` 排序的类型拆分阶段，不代表当前流式输入接受乱序 CAA。
+
 - 34 组核心场景在 Debug、Release、ASan/UBSan 下全部通过。其中 30 组回归原 FIFO、
   市价和统计行为，4 组检查独立类型、重载、快照元信息及成交自身 ASN 与撤单引用分离。
   核心和驱动使用严格 C++11 与 `-Werror` 编译，无告警。
@@ -183,3 +228,17 @@ main 仍使用原来的 `generate_snapshot` 条件，普通 F 不产生输出行
   市价长函数和其他撮合函数只有参数类型与名称适配，算法保持原样。
 - ASan/UBSan 运行无代码诊断；当前平台不支持泄漏检测，使用 `detect_leaks=0`，未验证
   内存泄漏。没有增加非法输入或溢出检查，也未据合成数据声明真实行情恢复正确。
+  详细记录在工作区 `my_obr_types_validation.txt`。
+
+## 按CAA逐行推送的验证记录
+
+- Debug、Release、ASan/UBSan 下，12 组整程序回放、13 组读取顺序检查和 4 组预处理及
+  即时统计检查全部通过。覆盖数值 CAA 的 `9 < 10`、同 CAA Order 优先、与 `sequence_no`
+  相反的顺序、两路尾段、单流、开盘阶段切换、F 跳过和撤单。
+- 四组市价场景验证预扫描后的盘口和统计仍为空，完整关联历史可用于原跨价、仅撤单、
+  同价和五档末撤分支；主循环每条记录及输出都符合手算结果。
+- 整程序 book/events 与手算的 21/12 列输出逐字一致；构建只保留原
+  `format_fixed_point` 中整数转 `double` 的一条告警。地址/UB 检查无诊断，未启用当前
+  平台不支持的泄漏检测，未测试非法输入或数值溢出。
+- 格式及差分检查通过；两个头文件和核心 cpp 与前一提交逐字一致。main 中没有全量
+  Order、Trade、Snapshot 数组或排序调用。详细命令见 `my_obr_stream_validation.txt`。

@@ -1,6 +1,5 @@
 #include "order_book.hpp"
 
-#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -123,41 +122,65 @@ Trade parse_trade(const std::vector<std::string>& columns) {
   return trade;
 }
 
-std::vector<Order> read_orders(const std::string& path) {
-  std::vector<Order> orders;
-  std::ifstream input(path.c_str());
-  std::string line;
-  std::getline(input, line);
-  while (std::getline(input, line)) {
-    const std::vector<std::string> columns = split_csv_line(line);
-    orders.push_back(parse_order(columns));
+// Each input is already ordered by numeric CAA. Keep one pending line per input.
+class CsvReplayStream {
+public:
+  CsvReplayStream(const std::string& order_path, const std::string& trade_path)
+      : order_input(order_path.c_str()), trade_input(trade_path.c_str()), order_caa(0),
+        trade_caa(0), has_order(false), has_trade(false) {
+    std::string header;
+    std::getline(order_input, header);
+    std::getline(trade_input, header);
+    has_order = read_next_line(order_input, order_line, order_caa);
+    has_trade = read_next_line(trade_input, trade_line, trade_caa);
   }
-  std::sort(orders.begin(), orders.end(), [](const Order& left, const Order& right) {
-    return left.sequence_no < right.sequence_no;
-  });
-  return orders;
-}
 
-std::vector<Trade> read_trades(const std::string& path) {
-  std::vector<Trade> trades;
-  std::ifstream input(path.c_str());
-  std::string line;
-  std::getline(input, line);
-  while (std::getline(input, line)) {
-    const std::vector<std::string> columns = split_csv_line(line);
-    trades.push_back(parse_trade(columns));
+  bool read_line(std::string& line, bool& is_order) {
+    if (!has_order && !has_trade) {
+      return false;
+    }
+    is_order = !has_trade || (has_order && order_caa <= trade_caa);
+    if (is_order) {
+      line = order_line;
+      has_order = read_next_line(order_input, order_line, order_caa);
+    } else {
+      line = trade_line;
+      has_trade = read_next_line(trade_input, trade_line, trade_caa);
+    }
+    return true;
   }
-  std::sort(trades.begin(), trades.end(), [](const Trade& left, const Trade& right) {
-    return left.sequence_no < right.sequence_no;
-  });
-  return trades;
-}
 
-bool next_is_order(const std::vector<Order>& orders, const std::vector<Trade>& trades,
-                   std::size_t order_index, std::size_t trade_index) {
-  return trade_index == trades.size() ||
-         (order_index < orders.size() &&
-          orders[order_index].sequence_no <= trades[trade_index].sequence_no);
+private:
+  bool read_next_line(std::ifstream& input, std::string& line, int64_t& caa) {
+    if (!std::getline(input, line)) {
+      return false;
+    }
+    caa = std::stoll(line.substr(0, line.find(',')));
+    return true;
+  }
+
+  std::ifstream order_input;
+  std::ifstream trade_input;
+  std::string order_line;
+  std::string trade_line;
+  int64_t order_caa;
+  int64_t trade_caa;
+  bool has_order;
+  bool has_trade;
+};
+
+void build_trade_map_from_csv(const std::string& order_path, const std::string& trade_path,
+                              OrderBook& order_book) {
+  CsvReplayStream input(order_path, trade_path);
+  std::string line;
+  bool is_order = false;
+  while (input.read_line(line, is_order)) {
+    // Order rows are scanned too; only trades contribute to the existing history map.
+    if (!is_order) {
+      const Trade trade = parse_trade(split_csv_line(line));
+      order_book.build_trade_map(trade);
+    }
+  }
 }
 
 std::string format_fixed_point(int64_t value) {
@@ -192,33 +215,24 @@ void write_quantity(std::ofstream& output, const std::vector<PriceLevel>& levels
   }
 }
 
-void write_book(const std::string& path, const std::vector<Snapshot>& snapshots) {
-  std::ofstream output(path.c_str());
-  if (!output) {
-    std::cerr << "无法写入 book.csv: " << path << '\n';
-    std::exit(EXIT_FAILURE);
+void write_book(std::ofstream& output, const Snapshot& snapshot) {
+  if (snapshot.trading_session != TradingSession::ContinuousTrade) {
+    return;
   }
-  output << "caa,bp5,bp4,bp3,bp2,bp1,ap1,ap2,ap3,ap4,ap5,bs5,bs4,bs3,bs2,bs1,as1,as2,as3,as4,as5\n";
-  std::vector<Snapshot>::const_iterator snapshot = snapshots.begin();
-  for (; snapshot != snapshots.end(); ++snapshot) {
-    if (snapshot->trading_session != TradingSession::ContinuousTrade) {
-      continue;
-    }
-    output << snapshot->caa;
-    for (std::size_t index = 0; index < 5; ++index) {
-      write_price(output, snapshot->bids, 4 - index);
-    }
-    for (std::size_t index = 0; index < 5; ++index) {
-      write_price(output, snapshot->asks, index);
-    }
-    for (std::size_t index = 0; index < 5; ++index) {
-      write_quantity(output, snapshot->bids, 4 - index);
-    }
-    for (std::size_t index = 0; index < 5; ++index) {
-      write_quantity(output, snapshot->asks, index);
-    }
-    output << '\n';
+  output << snapshot.caa;
+  for (std::size_t index = 0; index < 5; ++index) {
+    write_price(output, snapshot.bids, 4 - index);
   }
+  for (std::size_t index = 0; index < 5; ++index) {
+    write_price(output, snapshot.asks, index);
+  }
+  for (std::size_t index = 0; index < 5; ++index) {
+    write_quantity(output, snapshot.bids, 4 - index);
+  }
+  for (std::size_t index = 0; index < 5; ++index) {
+    write_quantity(output, snapshot.asks, index);
+  }
+  output << '\n';
 }
 
 const char* event_type_text(EventType type) {
@@ -228,83 +242,85 @@ const char* event_type_text(EventType type) {
   return type == EventType::Trade ? "trade" : "cancel";
 }
 
-void write_events(const std::string& path, const std::vector<Order>& orders,
-                  const std::vector<Trade>& trades) {
-  // Merge the two typed inputs in replay order without changing either one.
-  std::ofstream output(path.c_str());
-  output << "caa,transaction_time,sequence_no,event_type,side,order_type,price,quantity,"
-            "channel_no,order_appl_seq_num,bid_appl_seq_num,offer_appl_seq_num\n";
-  std::size_t order_index = 0;
-  std::size_t trade_index = 0;
-  while (order_index < orders.size() || trade_index < trades.size()) {
-    if (next_is_order(orders, trades, order_index, trade_index)) {
-      const Order& order = orders[order_index++];
-      output << order.caa << ',' << order.transaction_time << ',' << order.sequence_no << ','
-             << event_type_text(EventType::Order) << ',';
-      if (order.side != '\0') {
-        output << order.side;
-      }
-      output << ',';
-      if (order.order_type != '\0') {
-        output << order.order_type;
-      }
-      output << ',' << format_fixed_point(order.price) << ',' << order.quantity << ','
-             << order.channel_no << ',' << order.order_appl_seq_num << ",0,0\n";
-    } else {
-      const Trade& trade = trades[trade_index++];
-      const bool is_cancel = trade.trade_type == TradeType::Cancel;
-      const int64_t order_appl_seq_num =
-          is_cancel
-              ? (trade.bid_appl_seq_num != 0 ? trade.bid_appl_seq_num : trade.offer_appl_seq_num)
-              : 0;
-      // Preserve the existing CSV columns: side/type empty, original order ID for cancels only.
-      output << trade.caa << ',' << trade.transaction_time << ',' << trade.sequence_no << ','
-             << event_type_text(is_cancel ? EventType::Cancel : EventType::Trade) << ",,,"
-             << format_fixed_point(trade.price) << ',' << trade.quantity << ',' << trade.channel_no
-             << ',' << order_appl_seq_num << ',' << trade.bid_appl_seq_num << ','
-             << trade.offer_appl_seq_num << '\n';
-    }
+void write_event(std::ofstream& output, const Order& order) {
+  output << order.caa << ',' << order.transaction_time << ',' << order.sequence_no << ','
+         << event_type_text(EventType::Order) << ',';
+  if (order.side != '\0') {
+    output << order.side;
   }
+  output << ',';
+  if (order.order_type != '\0') {
+    output << order.order_type;
+  }
+  output << ',' << format_fixed_point(order.price) << ',' << order.quantity << ','
+         << order.channel_no << ',' << order.order_appl_seq_num << ",0,0\n";
+}
+
+void write_event(std::ofstream& output, const Trade& trade) {
+  const bool is_cancel = trade.trade_type == TradeType::Cancel;
+  const int64_t order_appl_seq_num =
+      is_cancel ? (trade.bid_appl_seq_num != 0 ? trade.bid_appl_seq_num : trade.offer_appl_seq_num)
+                : 0;
+  // Preserve the existing CSV columns: side/type empty, original order ID for cancels only.
+  output << trade.caa << ',' << trade.transaction_time << ',' << trade.sequence_no << ','
+         << event_type_text(is_cancel ? EventType::Cancel : EventType::Trade) << ",,,"
+         << format_fixed_point(trade.price) << ',' << trade.quantity << ',' << trade.channel_no
+         << ',' << order_appl_seq_num << ',' << trade.bid_appl_seq_num << ','
+         << trade.offer_appl_seq_num << '\n';
 }
 
 int main(int argc, char* argv[]) {
   const CommandLineOptions options = parse_command_line(argc, argv);
-  std::vector<Order> orders = read_orders(options.order_path);
-  std::vector<Trade> trades = read_trades(options.trade_path);
-  write_events(options.events_output_path, orders, trades);
   OrderBook order_book = {};
-  for (std::size_t index = 0; index < trades.size(); ++index) {
-    order_book.build_trade_map(trades[index]);
+  build_trade_map_from_csv(options.order_path, options.trade_path, order_book);
+
+  CsvReplayStream input(options.order_path, options.trade_path);
+  std::ofstream output(options.output_path.c_str());
+  if (!output) {
+    std::cerr << "无法写入 book.csv: " << options.output_path << '\n';
+    std::exit(EXIT_FAILURE);
   }
-  std::vector<Snapshot> snapshots;
-  snapshots.reserve(orders.size() + trades.size());
-  std::size_t order_index = 0;
-  std::size_t trade_index = 0;
+  output << "caa,bp5,bp4,bp3,bp2,bp1,ap1,ap2,ap3,ap4,ap5,bs5,bs4,bs3,bs2,bs1,as1,as2,as3,as4,as5\n";
+  std::ofstream events_output(options.events_output_path.c_str());
+  events_output << "caa,transaction_time,sequence_no,event_type,side,order_type,price,quantity,"
+                   "channel_no,order_appl_seq_num,bid_appl_seq_num,offer_appl_seq_num\n";
+
+  std::string line;
+  bool is_order = false;
   TradingSession previous_session = TradingSession::ContinuousTrade;
-  while (order_index < orders.size() || trade_index < trades.size()) {
-    const bool take_order = next_is_order(orders, trades, order_index, trade_index);
-    const TradingSession session =
-        take_order ? orders[order_index].trading_session : trades[trade_index].trading_session;
-    if (previous_session == TradingSession::OpeningAution && session != previous_session) {
-      order_book.finish_call_auction();
+  for (;;) {
+    // Read one raw record, convert it to its own type, then apply it.
+    if (!input.read_line(line, is_order)) {
+      break;
     }
-    if (take_order) {
-      Order& order = orders[order_index++];
+    const std::vector<std::string> columns = split_csv_line(line);
+    if (is_order) {
+      Order order = parse_order(columns);
+      if (previous_session == TradingSession::OpeningAution &&
+          order.trading_session != previous_session) {
+        order_book.finish_call_auction();
+      }
+      write_event(events_output, order);
       order_book.apply(order);
       if (order.generate_snapshot) {
-        snapshots.push_back(order_book.make_snapshot(order));
+        write_book(output, order_book.make_snapshot(order));
       }
+      previous_session = order.trading_session;
     } else {
-      const Trade& trade = trades[trade_index++];
+      const Trade trade = parse_trade(columns);
+      if (previous_session == TradingSession::OpeningAution &&
+          trade.trading_session != previous_session) {
+        order_book.finish_call_auction();
+      }
+      write_event(events_output, trade);
       order_book.apply(trade);
       if (trade.generate_snapshot) {
-        snapshots.push_back(order_book.make_snapshot(trade));
+        write_book(output, order_book.make_snapshot(trade));
       }
+      previous_session = trade.trading_session;
     }
-    previous_session = session;
   }
   if (previous_session == TradingSession::OpeningAution) {
     order_book.finish_call_auction();
   }
-  write_book(options.output_path, snapshots);
 }
