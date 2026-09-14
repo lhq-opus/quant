@@ -46,6 +46,67 @@ void execute_trade(int64_t price, int64_t quantity, bool reduce_bids, bool reduc
 当前价格档，调用后下一轮必须重新获取最优档，不能继续使用原档位引用或迭代器。
 撤单仍定位指定订单并按撤销量处理，不走成交方法，也不增加成交统计。
 
+## 只填充快照五档
+
+`fill_snapshot_levels` 是公开的只读方法，只从当前盘口取买卖各五档：
+
+```cpp
+Snapshot snapshot = {};
+order_book.fill_snapshot_levels(snapshot);
+```
+
+方法先把 `snapshot.bids`、`snapshot.asks` 重置为五个零档，再按现有 map 顺序复制
+前五档。买档由高到低、卖档由低到高，缺档保持零。复用一个此前装满档位的
+Snapshot 时，仍只有五档，不会追加旧档位或保留已经消失的价格、数量。
+
+现有 `PriceLevel` 同时保存一档的价格和总量，对应关系如下，`i` 取 `0..4`：
+
+| 快照字段 | 五档含义 |
+| --- | --- |
+| `snapshot.bids[i].price` | `bp1..bp5` |
+| `snapshot.bids[i].quantity` | `bs1..bs5` |
+| `snapshot.asks[i].price` | `ap1..ap5` |
+| `snapshot.asks[i].quantity` | `as1..as5` |
+
+方法不修改快照的 CAA、交易阶段、事件类型和成交统计。需要完整快照时继续调用
+`make_snapshot(order)` 或 `make_snapshot(trade)`：它们填好这些信息后统一调用
+`fill_snapshot_levels`。CSV 导出仍按原列顺序组织，买档倒序写出，内部买一仍在下标0。
+
+## 查询 Trade 两侧是否引用市价单
+
+外层可以直接取得两个布尔结果，再自行决定后续行为：
+
+```cpp
+bool is_bid = false;
+bool is_ask = false;
+order_book.get_market_trade_sides(trade, is_bid, is_ask);
+```
+
+`is_bid` 表示 `BidApplSeqNum` 引用的买方原单是市价单，`is_ask` 表示
+`OfferApplSeqNum` 引用的卖方原单是市价单。两个结果独立赋值，每次调用都覆盖旧值：
+
+| is_bid | is_ask | 含义 |
+| --- | --- | --- |
+| false | false | 两侧都不是已记录的市价原单 |
+| true | false | 买方原单是市价单 |
+| false | true | 卖方原单是市价单 |
+| true | true | 双方原单都是市价单 |
+
+`apply(Order&)` 在处理委托之前，把 `OrderType='1'` 的 `(ChannelNo, ApplSeqNum)`
+记录进 `market_order_ids`。限价 `'2'` 和本方最优 `'U'` 不加入。查询使用 Trade 的
+通道及双方**原委托引用**，不使用 Trade 自身的 `trade_appl_seq_num`，也不根据价格、
+`TradeBSFlag` 或是否还在盘口中推测类型。零引用自然不在这个集合中。
+
+市价单可能在刚收到时就全部成交，后续才收到关联 Trade，所以这份身份记录在全部成交
+或撤单后仍保留。集合随当前单交易日的 `OrderBook` 实例存在，新实例初始为空；仅记录
+已经传给 `apply` 的订单，不预读未来订单。当前查询键包含通道，不会把另一个通道相同
+ASN 的原单混进来；现有撮合核心的单 ASN 索引和单证券范围仍保持原样。
+
+该方法是 `const` 查询，不改盘口、统计或快照开关。它也能查询撤单记录中的非零原单
+引用；外层根据 `trade.trade_type` 选择处理普通成交还是撤单。`is_bid/is_ask` 是原单
+类型信息，不是 `execute_trade` 的盘口扣减开关，二者不能直接等同。
+本轮提供这一查询接口，普通 F 的既有跳过逻辑继续保留。
+
 ## Order 和 Trade 分开处理
 
 输入现在有两个独立类型，解析后保持各自类型直至进入盘口：
@@ -250,8 +311,24 @@ main 仍使用原来的 `generate_snapshot` 条件，普通 F 不产生输出行
 
 此前按用户要求将读取类改为全局变量和普通函数，只修改 `src/main.cpp` 和本文档；
 该次实际命令与结果记录在工作区 `my_obr_global_stream_validation.txt`。
-当前成交公共方法增量只修改 `src/order_book.cpp`、`include/order_book.hpp` 和本文档，
+当前五档填充与市价查询增量只修改 `src/order_book.cpp`、`include/order_book.hpp` 和本文档，
 `main.cpp` 与 `model.hpp` 保持原样；临时验证驱动、mock 和二进制不提交。
+
+## 五档填充与市价查询的验证记录（2026-09-14）
+
+- 使用公开接口进行独立手算验证，Debug、Release、ASan/UBSan 各通过152项检查。
+  五档覆盖空簿、少于/超过五档、同价聚合、买降卖升、删档后深档晋升、复用快照补零，
+  并确认填充方法保留元信息/统计；市价查询覆盖四种布尔组合、重复使用输出变量、
+  限价/U、部分及全部成交、部分及全部撤单后的身份、通道隔离、零引用和成交自身序号。
+  两个方法均可通过 `const OrderBook&` 调用，查询前后盘口与统计保持一致。
+- 核心严格 C++11、`-Werror` 构建通过；原15组盘口回归在基线及修改版的
+  Debug/Release/ASan/UBSan 下每次107次快照、3761项检查均通过，输出逐字一致。
+  原两组完整CSV在基线和修改版三种配置共8次回放中，12/21列结果逐字匹配手算值。
+- 格式、diff及头文件独立/重复包含检查通过。完整程序保留原 `main.cpp:194`
+  整数转 `double` 格式化告警。ASan/UBSan 无诊断，macOS使用 `detect_leaks=0`，
+  未验证泄漏、非法输入、溢出或真实行情。
+- 本轮精确命令和结果记录在工作区 `my_obr_snapshot_market_validation.txt`、
+  `my_obr_snapshot_market_regression_validation.txt`、`my_obr_snapshot_market_build_validation.txt`。
 
 ## 成交公共方法的验证记录（2026-09-14）
 

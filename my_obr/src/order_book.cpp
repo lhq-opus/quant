@@ -26,6 +26,12 @@ void OrderBook::build_trade_map(const Trade& trade) {
 }
 
 void OrderBook::apply(Order& order) {
+  // 在撮合前记录原始市价身份：市价单可能立即全部成交，不会留在活动订单索引中。
+  // 只根据原委托的类型判断；本方最优 U 和限价单都不属于这里的市价单。
+  if (order.order_type == '1') {
+    market_order_ids.insert(std::make_pair(order.channel_no, order.order_appl_seq_num));
+  }
+
   // auction
   if (order.trading_session == TradingSession::OpeningAution ||
       order.trading_session == TradingSession::ClosingAuction) {
@@ -63,6 +69,13 @@ void OrderBook::apply(const Trade& trade) {
   }
 
   apply_cancel(trade);
+}
+
+void OrderBook::get_market_trade_sides(const Trade& trade, bool& is_bid, bool& is_ask) const {
+  // 使用 Trade 引用的原委托序号，而不是该 Trade 自身的序号；通道也是查询键的一部分。
+  // 两侧独立查询，所以结果可同时为 true；零引用自然不在合法市价原单集合中。
+  is_bid = market_order_ids.count(std::make_pair(trade.channel_no, trade.bid_appl_seq_num)) != 0;
+  is_ask = market_order_ids.count(std::make_pair(trade.channel_no, trade.offer_appl_seq_num)) != 0;
 }
 
 void OrderBook::apply_market_order(Order& order) {
@@ -524,47 +537,29 @@ Snapshot OrderBook::make_snapshot(const std::string& caa, EventType event_type,
   snapshot.cumulative_trade_quantity = cumulative_trade_quantity_num;
   snapshot.cumulative_turnover = cumulative_turnover_num;
   snapshot.event_type = event_type;
-
-  // if (caa !=""){
-  //     std::cout<<"bids:" << std::endl;
-  // for (; bid != bids.end(); ++bid) {
-  //     std::cout<< bid->first <<" ,"<< bid->second << std::endl;
-  // }
-  // }
-
-  // while (bid != bids.end() && snapshot.bids.size() < 5) {
-
-  //     PriceLevel level = {bid->first, bid->second.total_quantity};
-
-  //     snapshot.bids.push_back(level);
-
-  //     ++bid;
-  // }
-  BidLevels::iterator bid = bids.begin();
-
-  for (; bid != bids.end() && snapshot.bids.size() < 5; ++bid) {
-    PriceLevel level = {bid->first, bid->second.total_quantity};
-
-    snapshot.bids.push_back(level);
-  }
-
-  while (snapshot.bids.size() < 5) {
-    PriceLevel level = {0, 0};
-    snapshot.bids.push_back(level);
-  }
-
-  AskLevels::iterator ask = asks.begin();
-  for (; ask != asks.end() && snapshot.asks.size() < 5; ++ask) {
-    PriceLevel level = {ask->first, ask->second.total_quantity};
-    snapshot.asks.push_back(level);
-  }
-
-  while (snapshot.asks.size() < 5) {
-    PriceLevel level = {0, 0};
-    snapshot.asks.push_back(level);
-  }
-
   snapshot.trading_session = session;
 
+  // 元信息与统计在这里填写，五档价格和数量统一由盘口投影方法生成。
+  fill_snapshot_levels(snapshot);
   return snapshot;
+}
+
+void OrderBook::fill_snapshot_levels(Snapshot& snapshot) const {
+  // 每次重建恰好五个零档，随后覆盖当前存在的档位；复用快照时不会残留旧数据。
+  snapshot.bids.assign(5, PriceLevel{0, 0});
+  snapshot.asks.assign(5, PriceLevel{0, 0});
+
+  // bids 已按价格降序排列：下标 0 是买一，price/quantity 分别对应 bp1/bs1。
+  std::size_t index = 0;
+  for (BidLevels::const_iterator bid = bids.begin(); bid != bids.end() && index < 5;
+       ++bid, ++index) {
+    snapshot.bids[index] = PriceLevel{bid->first, bid->second.total_quantity};
+  }
+
+  // asks 已按价格升序排列：下标 0 是卖一，price/quantity 分别对应 ap1/as1。
+  index = 0;
+  for (AskLevels::const_iterator ask = asks.begin(); ask != asks.end() && index < 5;
+       ++ask, ++index) {
+    snapshot.asks[index] = PriceLevel{ask->first, ask->second.total_quantity};
+  }
 }

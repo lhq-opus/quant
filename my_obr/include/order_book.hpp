@@ -5,6 +5,8 @@
 
 #include <functional>
 #include <map>
+#include <set>
+#include <utility>
 #include <vector>
 
 // Teaching experiment: complete, valid input and representable arithmetic are
@@ -23,6 +25,14 @@ public:
   void finish_call_auction();
   Snapshot make_snapshot(const Order& order);
   Snapshot make_snapshot(const Trade& trade);
+
+  // 只覆盖 snapshot 的买卖五档：价格由优到劣，数量为档位总量，缺档补零。
+  // 不改变快照的元信息、成交统计或盘口；同一 snapshot 可以反复填充。
+  void fill_snapshot_levels(Snapshot& snapshot) const;
+
+  // 分别判断 Trade 的买方、卖方原单是否为已处理过的市价委托，覆盖两个输出值。
+  // 适用于普通成交和撤单引用；这两个值表示原单类型，不表示要扣哪一侧盘口。
+  void get_market_trade_sides(const Trade& trade, bool& is_bid, bool& is_ask) const;
 
 private:
   // begin() selects the highest bid and lowest ask respectively.
@@ -49,6 +59,9 @@ private:
   AskLevels asks;
   OrderPriceMap order_price;
   OrderTradeMap order_trade_map;
+  // 保存本盘口实例已收到的市价原单身份：(通道，原委托序号)。实例按单交易日使用。
+  // 全部成交或撤单后也保留，后续 Trade 仍可查询，不依赖活动订单是否还在簿内。
+  std::set<std::pair<int64_t, int64_t>> market_order_ids;
   int64_t cumulative_trade_quantity_num;
   int64_t cumulative_turnover_num;
   int64_t trade_number;
