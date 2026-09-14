@@ -1,50 +1,143 @@
 #include "order_book.hpp"
 
+#include <algorithm>
 #include <vector>
+#include <iostream>
 
-// 保留用户 v2 采用的创业板范围：买价不高于卖一的 102%，卖价不低于
-// 买一的 98%；只对连续竞价限价委托使用。对手侧为空时沿用 v2 的
-// 不暂存处理，不引入输入中没有提供的昨收价或其他规则版本。
-bool OrderBook::is_outside_cyb_range(const Order& order) const {
-  if (!order.is_CYB || order.trading_session != TradingSession::ContinuousTrade) {
-    return false;
-  }
-  if (order.side == EventSide::Buy) {
-    return !asks.empty() && order.price * 100 > asks.begin()->first * 102;
-  }
-  return !bids.empty() && order.price * 100 < bids.begin()->first * 98;
+void OrderBook::handle_pending_CYB_limit_order(Order &order)
+{
+    if (!order.is_CYB)
+    {
+        return;
+    }
+
+    replay_CYB_trades(pending_CYB_trades);
+
+    pending_CYB_trades.clear();
 }
 
-// 盘口改变后，原先笼子外的委托可能恢复展示。每轮先基于同一盘口收集
-// 符合条件的委托，再统一入簿；新增档位可能使其他暂存单也符合条件，
-// 所以持续处理到没有新激活的订单。每个订单最多从暂存区移出一次。
-void OrderBook::activate_cyb_orders() {
-  if (trading_session != TradingSession::ContinuousTrade) {
-    // 收盘竞价不使用连续竞价价格笼子，暂存余量全部进入竞价簿。
-    for (std::map<int64_t, Order>::const_iterator held = pending_limit_order_alive.begin();
-         held != pending_limit_order_alive.end(); ++held) {
-      add_resting_order(held->second);
+void OrderBook::handle_pending_CYB_limit_order(Trade &trade)
+{
+    if (!trade.is_CYB)
+    {
+        return;
     }
-    pending_limit_order_alive.clear();
-    return;
-  }
 
-  while (!pending_limit_order_alive.empty()) {
-    std::vector<int64_t> activated_ids;
-    for (std::map<int64_t, Order>::const_iterator held = pending_limit_order_alive.begin();
-         held != pending_limit_order_alive.end(); ++held) {
-      if (!is_outside_cyb_range(held->second)) {
-        activated_ids.push_back(held->first);
-      }
+    if (trade.trade_type == TradeType::Normal)
+    {
+
+        if (pending_limit_order_alive.find(trade.bid_appl_seq_num) != pending_limit_order_alive.end())
+        {
+            pending_CYB_trades.push_back(trade);
+        }
+
+        if (pending_limit_order_alive.find(trade.offer_appl_seq_num) != pending_limit_order_alive.end())
+        {
+            pending_CYB_trades.push_back(trade);
+        }
+
+        return;
     }
-    if (activated_ids.empty()) {
-      return;
+
+    bool replay_caused_by_cancel = false;
+
+    if (trade.trade_type == TradeType::Cancel && pending_CYB_trades.size() != 0)
+    {
+        Trade trade = pending_CYB_trades[0];
+
+        int64_t bid_price = order_info_map[trade.bid_appl_seq_num].price;
+        int64_t ask_price = order_info_map[trade.offer_appl_seq_num].price;
+
+        int64_t best_bids = bids.begin()->first;
+        int64_t best_asks = asks.begin()->first;
+
+        if (pending_limit_order_alive.find(trade.bid_appl_seq_num) != pending_limit_order_alive.end())
+        {
+
+            replay_caused_by_cancel = best_asks != ask_price;
+        }
+
+        if (pending_limit_order_alive.find(trade.offer_appl_seq_num) != pending_limit_order_alive.end())
+        {
+            replay_caused_by_cancel = best_bids != bid_price;
+        }
     }
-    for (std::vector<int64_t>::const_iterator id = activated_ids.begin(); id != activated_ids.end();
-         ++id) {
-      std::map<int64_t, Order>::iterator held = pending_limit_order_alive.find(*id);
-      add_resting_order(held->second);
-      pending_limit_order_alive.erase(held);
+
+    replay_CYB_trades(pending_CYB_trades);
+
+    if (!replay_caused_by_cancel)
+    {
+        update_previous_snapshot();
     }
-  }
+
+    pending_CYB_trades.clear();
+}
+
+void OrderBook::replay_CYB_trades(std::vector<Trade> trades)
+{
+
+    for (int64_t i = 0; i < trades.size(); i++)
+    {
+
+        Trade trade = trades[i];
+
+        int64_t quantity = trade.quantity;
+
+        if (order_info_map.find(trade.bid_appl_seq_num) == order_info_map.end() || order_info_map.find(trade.offer_appl_seq_num) == order_info_map.end())
+        {
+            return;
+        }
+
+        int64_t bid_price = order_info_map[trade.bid_appl_seq_num].price;
+        int64_t ask_price = order_info_map[trade.offer_appl_seq_num].price;
+
+        if (bid_price == DROP_SIGNAL || ask_price == DROP_SIGNAL)
+        {
+            return;
+        }
+
+        if (pending_limit_order_alive.find(trade.bid_appl_seq_num) != pending_limit_order_alive.end())
+        {
+            // bid: pendind; ask normal
+            int64_t ask_order_seq_num = trade.offer_appl_seq_num;
+            std::map<int64_t, OrderInfo>::const_iterator ask_info = order_info_map.find(ask_order_seq_num);
+            AskLevels::iterator ask = asks.find(ask_info->second.price);
+
+            OrderQueue::iterator position = ask_info->second.position;
+            position->remaining_quantity -= trade.quantity;
+            ask->second.total_quantity -= trade.quantity;
+
+            if (position->remaining_quantity == 0)
+            {
+                ask->second.orders.erase(position);
+            }
+
+            if (ask->second.total_quantity == 0)
+            {
+                asks.erase(ask);
+            }
+        }
+        else
+        {
+            // bid: normal; ask pending
+            int64_t bid_order_seq_num = trade.bid_appl_seq_num;
+            std::map<int64_t, OrderInfo>::const_iterator bid_info = order_info_map.find(bid_order_seq_num);
+            BidLevels::iterator bid = bids.find(bid_info->second.price);
+
+            OrderQueue::iterator position = bid_info->second.position;
+            position->remaining_quantity -= trade.quantity;
+            bid->second.total_quantity -= trade.quantity;
+
+            if (position->remaining_quantity == 0)
+            {
+                bid->second.orders.erase(position);
+            }
+
+            if (bid->second.total_quantity == 0)
+            {
+                asks.erase(bid);
+            }
+        }
+        record_trade(trade.price, trade.quantity);
+    }
 }
