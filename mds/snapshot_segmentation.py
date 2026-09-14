@@ -7,6 +7,7 @@
 
 reset_threshold 是推断参数，不是业务保证。仅凭一列 ID，极稀疏的相邻
 snapshot 可能无法区别；输出的是一份具体推断，不表示边界都有真实标签。
+人工核查得到的必切/禁切反馈可单独传入，优先于位置回退启发式。
 """
 
 import argparse
@@ -31,23 +32,40 @@ def segment_snapshots(
     positions: np.ndarray,
     reset_threshold: float = 0.5,
     complete_prefix_count: int = 0,
+    required_boundaries: tuple[int, ...] = (),
+    forbidden_boundaries: tuple[int, ...] = (),
 ) -> np.ndarray:
     """返回从 0 开始的切点偏移，包括文件起点 0 和终点 len(sequence)。
 
     例如 [0, 5, 8] 表示数据行 1..5、6..8 两个 snapshot。
     complete_prefix_count 仅用于已知完整前缀，不推断后面也有固定长度。
+    required_boundaries / forbidden_boundaries 分别指定必切 / 禁切偏移。
+    偏移 N 就是在第 N 条数据后切分，行号不含表头；不按短段长度自动合并。
     """
     # 比较的是学习得到的位置，而不是 stock_id 的数值大小。
     drops = positions[sequence[:-1]] - positions[sequence[1:]]
     strong_cuts = np.flatnonzero(drops > reset_threshold) + 1
     prefix_end = complete_prefix_count * len(positions)
+    required = set(required_boundaries)
+    forbidden = set(forbidden_boundaries)
     if complete_prefix_count:
         # 已知完整轮的内部不得另切；最后一轮完整前缀之后可以开始缺失。
         prefix_cuts = np.arange(1, complete_prefix_count + 1) * len(positions)
+        if any(cut < prefix_end and cut % len(positions) for cut in required):
+            raise ValueError("必切反馈不能拆开已知完整前缀")
+        required.update(int(cut) for cut in prefix_cuts if cut < len(sequence))
         strong_cuts = np.unique(
             np.concatenate((prefix_cuts, strong_cuts[strong_cuts > prefix_end]))
         )
     strong_cuts = strong_cuts[strong_cuts < len(sequence)]
+    if required & forbidden:
+        raise ValueError("同一边界同时被要求切分和禁止切分")
+    if any(cut <= 0 or cut >= len(sequence) for cut in required | forbidden):
+        raise ValueError("反馈边界必须位于第一条数据之后、最后一条数据之前")
+    # 经人工核查的约束优先于回退分数，重新运行时也不能把禁切点加回来。
+    strong_cuts = np.array(
+        sorted((set(map(int, strong_cuts)) | required) - forbidden), dtype=np.int64
+    )
     anchors = np.concatenate(([0], strong_cuts, [len(sequence)]))
     cuts = set(map(int, strong_cuts))
     last_seen = np.full(len(positions), -1, dtype=np.int64)
@@ -64,7 +82,15 @@ def segment_snapshots(
                 # 新切点落在此前无重复的前缀内，因此被切出的左段合法；
                 # 右段的历史 last_seen 仍然有效，不需要清空再重复扫描。
                 low = previous + 1
-                cut = low + int(np.argmax(drops[previous:row_index]))
+                candidate_drops = drops[previous:row_index]
+                excluded = [cut for cut in forbidden if low <= cut <= row_index]
+                if excluded:
+                    candidate_drops = candidate_drops.copy()
+                    for cut in excluded:
+                        candidate_drops[cut - low] = -np.inf
+                    if np.all(np.isneginf(candidate_drops)):
+                        raise ValueError("禁切反馈与 snapshot 内股票不得重复的约束冲突")
+                cut = low + int(np.argmax(candidate_drops))
                 cuts.add(cut)
                 current_start = cut
             last_seen[stock] = row_index
@@ -80,6 +106,8 @@ def process_csv(
     complete_prefix_count: int = 40,
     reset_threshold: float = 0.5,
     boundary_csv: str | Path | None = None,
+    boundary_feedback_csv: str | Path | None = None,
+    complete_prefix_only: bool = False,
 ) -> dict:
     """读取固定的单列 stock_id CSV，保持原始值和行序，写出两个字段。"""
     input_path = Path(input_path)
@@ -90,12 +118,34 @@ def process_csv(
         paths.append(Path(boundary_csv).resolve())
     if len(set(paths)) != len(paths):
         raise ValueError("输入、输出和边界表必须使用不同路径")
+    required_boundaries = []
+    forbidden_boundaries = []
+    if boundary_feedback_csv is not None:
+        if Path(boundary_feedback_csv).resolve() in paths:
+            raise ValueError("边界反馈文件必须与输入、输出和边界表使用不同路径")
+        with Path(boundary_feedback_csv).open(newline="") as file:
+            for row in csv.DictReader(file):
+                cut = int(row["end_data_row"])
+                if row["action"] == "require":
+                    required_boundaries.append(cut)
+                elif row["action"] == "forbid":
+                    forbidden_boundaries.append(cut)
+                else:
+                    raise ValueError("边界反馈 action 必须为 require 或 forbid")
 
-    stock_ids = np.loadtxt(input_path, dtype=np.int64, skiprows=1, ndmin=1)
+    prefix_end = stock_count * complete_prefix_count
+    # 用户只要已确认部分时，只读取其声明完整的前缀。之后即使出现全集
+    # 或模型一致，也不能据此证明完整 snapshot 的边界，不混入此次导出。
+    stock_ids = np.loadtxt(
+        input_path,
+        dtype=np.int64,
+        skiprows=1,
+        ndmin=1,
+        max_rows=prefix_end if complete_prefix_only else None,
+    )
     labels, sequence = np.unique(stock_ids, return_inverse=True)
     del stock_ids
     sequence = sequence.astype(np.int32)
-    prefix_end = stock_count * complete_prefix_count
     prefix = sequence[:prefix_end].reshape(complete_prefix_count, stock_count)
     # 这是对训练依据的核实：若前缀不是给定股票全集的完整排列，不能继续
     # 使用“每 stock_count 行是一轮”训练。它不是重复记录的自动清洗。
@@ -105,7 +155,12 @@ def process_csv(
         raise ValueError("股票总数或完整前缀与给定的训练条件不符")
     positions = learn_stock_positions(prefix)
     cuts = segment_snapshots(
-        sequence, positions, reset_threshold, complete_prefix_count
+        sequence,
+        positions,
+        reset_threshold,
+        complete_prefix_count,
+        tuple(required_boundaries),
+        tuple(forbidden_boundaries),
     )
 
     # 输出前逐段独立验证硬约束；回退阈值本身不保证段内不重复。
@@ -125,6 +180,8 @@ def process_csv(
         writer.writerow(["stock_id", "snapshot_id"])
         snapshot_id = 1
         for row_index, row in enumerate(reader):
+            if row_index == len(sequence):
+                break
             if row_index == cuts[snapshot_id]:
                 snapshot_id += 1
             writer.writerow([row[0], snapshot_id])
@@ -144,13 +201,17 @@ def process_csv(
             )
             for snapshot_id, (start, end) in enumerate(pairwise(cuts), 1):
                 drop = ""
-                if end == len(sequence):
+                if complete_prefix_only:
+                    reason = "known_complete_prefix"
+                elif end == len(sequence):
                     reason = "file_end"
                 else:
                     drop = float(
                         positions[sequence[end - 1]] - positions[sequence[end]]
                     )
-                    if end <= prefix_end:
+                    if end in required_boundaries:
+                        reason = "user_required_boundary"
+                    elif end <= prefix_end:
                         reason = "known_complete_prefix"
                     elif drop > reset_threshold:
                         reason = "position_reset"
@@ -166,7 +227,10 @@ def process_csv(
         "stock_count": len(labels),
         "snapshot_count": len(lengths),
         "complete_prefix_count": complete_prefix_count,
+        "complete_prefix_only": complete_prefix_only,
         "reset_threshold": reset_threshold,
+        "required_boundary_count": len(required_boundaries),
+        "forbidden_boundary_count": len(forbidden_boundaries),
         "min_snapshot_size": int(lengths.min()),
         "median_snapshot_size": float(np.median(lengths)),
         "max_snapshot_size": int(lengths.max()),
@@ -181,6 +245,16 @@ def main() -> None:
     parser.add_argument("--complete-prefix-count", type=int, default=40)
     parser.add_argument("--reset-threshold", type=float, default=0.5)
     parser.add_argument("--boundary-csv", type=Path)
+    parser.add_argument(
+        "--complete-prefix-only",
+        action="store_true",
+        help="只导出用户声明的完整前缀（默认前40轮），不推断后续snapshot",
+    )
+    parser.add_argument(
+        "--boundary-feedback-csv",
+        type=Path,
+        help="含 end_data_row,action 的核查反馈；action 为 require 或 forbid",
+    )
     args = parser.parse_args()
     summary = process_csv(
         args.input_csv,
@@ -189,10 +263,13 @@ def main() -> None:
         complete_prefix_count=args.complete_prefix_count,
         reset_threshold=args.reset_threshold,
         boundary_csv=args.boundary_csv,
+        boundary_feedback_csv=args.boundary_feedback_csv,
+        complete_prefix_only=args.complete_prefix_only,
     )
+    source = "已知完整前缀" if args.complete_prefix_only else "推断"
     print(
         f"已写出 {summary['row_count']} 行，"
-        f"推断 {summary['snapshot_count']} 个 snapshot；snapshot_id 从 1 开始。"
+        f"{source} {summary['snapshot_count']} 个 snapshot；snapshot_id 从 1 开始。"
     )
 
 

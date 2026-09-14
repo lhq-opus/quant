@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import subprocess
+import sys
 import tempfile
 import unittest
 from itertools import pairwise
@@ -98,6 +100,60 @@ class SnapshotSegmentationTest(unittest.TestCase):
 
         np.testing.assert_array_equal(cuts, [0, 4, 8, 11, 14])
         self.assert_valid_partition(sequence, cuts)
+
+    def test_feedback_joins_late_tail_without_removing_next_true_boundary(self) -> None:
+        # 第一轮用于学习位置。第二轮的 1、2 延后到尾部，9 → 1 会触发伪边界，
+        # 但它们仍与本轮前面的股票组成一个无重复的完整集合。
+        sequence = np.array(
+            list(range(10)) + [0, 3, 4, 5, 6, 7, 8, 9, 1, 2] + [0, 3, 7, 9]
+        )
+        positions = np.linspace(0, 1, 10)
+        inferred_cuts = segment_snapshots(sequence, positions, complete_prefix_count=1)
+        self.assertIn(18, inferred_cuts.tolist())
+
+        cuts = segment_snapshots(
+            sequence,
+            positions,
+            complete_prefix_count=1,
+            required_boundaries=(20,),
+            forbidden_boundaries=(18,),
+        )
+
+        np.testing.assert_array_equal(cuts, [0, 10, 20, 24])
+        self.assert_valid_partition(sequence, cuts)
+
+    def test_required_boundary_resolves_an_ambiguous_sparse_case(self) -> None:
+        # 顺序本身无法证明 [2, 3] | [4, 5] 的边界；明确反馈可以补充这项信息。
+        sequence = np.array([2, 3, 4, 5])
+        positions = np.linspace(0, 1, 6)
+
+        cuts = segment_snapshots(sequence, positions, required_boundaries=(2,))
+
+        np.testing.assert_array_equal(cuts, [0, 2, 4])
+        self.assert_valid_partition(sequence, cuts)
+
+    def test_repeat_repair_uses_best_allowed_boundary(self) -> None:
+        # 两次 6 之间的最强回退在偏移 3，禁止后须选择其余位置中的最大回退，
+        # 不能在重复修复阶段把已被用户否决的边界重新加回去。
+        sequence = np.array([2, 4, 6, 3, 5, 6, 8])
+        positions = np.linspace(0, 1, 10)
+
+        cuts = segment_snapshots(sequence, positions, forbidden_boundaries=(3,))
+
+        np.testing.assert_array_equal(cuts, [0, 5, 7])
+        self.assert_valid_partition(sequence, cuts)
+
+    def test_conflicting_boundary_feedback_is_rejected(self) -> None:
+        sequence = np.array([0, 1, 2, 0, 1, 2])
+        positions = np.linspace(0, 1, 3)
+        for constraints in (
+            {"required_boundaries": (2,), "forbidden_boundaries": (2,)},
+            {"complete_prefix_count": 1, "forbidden_boundaries": (3,)},
+            # 两次 0 间的全部候选偏移都被禁止，无重复约束已无法满足。
+            {"forbidden_boundaries": (1, 2, 3)},
+        ):
+            with self.subTest(constraints=constraints), self.assertRaises(ValueError):
+                segment_snapshots(sequence, positions, **constraints)
 
     def test_random_missing_cycles_with_observed_ends_recover_truth(self) -> None:
         # 保留首尾位置是本成功样例的生成条件，不是对真实 CSV 的假设。
@@ -212,6 +268,162 @@ class SnapshotSegmentationTest(unittest.TestCase):
             [(1, 6), (7, 12), (13, 16), (17, 19)],
         )
         self.assertEqual([int(row["record_count"]) for row in boundaries], [6, 6, 4, 3])
+
+    def test_complete_prefix_only_exports_known_rows_and_boundaries(self) -> None:
+        first_round = ["000003", "600001", "000001", "600002", "000002", "600003"]
+        second_round = ["600001", "000003", "000001", "000002", "600002", "600003"]
+        known_stocks = first_round + second_round
+        # 后缀不完整且有重复，但不能影响只导出已知两轮的范围。
+        stocks = known_stocks + ["600003", "600003", "000001"]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            input_path = Path(temporary_directory) / "data.csv"
+            output_path = Path(temporary_directory) / "known_snapshots.csv"
+            boundary_path = Path(temporary_directory) / "known_boundaries.csv"
+            input_path.write_text(
+                "stock_id\n" + "\n".join(stocks) + "\n", encoding="utf-8"
+            )
+            original_input = input_path.read_bytes()
+
+            stats = process_csv(
+                input_path,
+                output_path,
+                stock_count=6,
+                complete_prefix_count=2,
+                complete_prefix_only=True,
+                boundary_csv=boundary_path,
+            )
+
+            with output_path.open(encoding="utf-8", newline="") as output_file:
+                reader = csv.DictReader(output_file)
+                self.assertEqual(reader.fieldnames, ["stock_id", "snapshot_id"])
+                rows = list(reader)
+            with boundary_path.open(encoding="utf-8", newline="") as boundary_file:
+                boundaries = list(csv.DictReader(boundary_file))
+            self.assertEqual(input_path.read_bytes(), original_input)
+
+        self.assertEqual([row["stock_id"] for row in rows], known_stocks)
+        self.assertEqual([int(row["snapshot_id"]) for row in rows], [1] * 6 + [2] * 6)
+        self.assertEqual(stats["row_count"], 12)
+        self.assertEqual(stats["snapshot_count"], 2)
+        self.assertTrue(stats["complete_prefix_only"])
+        self.assertEqual(
+            [
+                (
+                    int(row["snapshot_id"]),
+                    int(row["start_data_row"]),
+                    int(row["end_data_row"]),
+                    int(row["record_count"]),
+                    row["end_reason"],
+                )
+                for row in boundaries
+            ],
+            [
+                (1, 1, 6, 6, "known_complete_prefix"),
+                (2, 7, 12, 6, "known_complete_prefix"),
+            ],
+        )
+
+    def test_cli_complete_prefix_only_reports_and_exports_known_prefix(self) -> None:
+        known_stocks = ["02", "01", "03", "01", "02", "03"]
+        stocks = known_stocks + ["03", "03", "02"]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            input_path = Path(temporary_directory) / "data.csv"
+            output_path = Path(temporary_directory) / "known_snapshots.csv"
+            input_path.write_text(
+                "stock_id\n" + "\n".join(stocks) + "\n", encoding="utf-8"
+            )
+            # 用独立进程检查 CLI 参数传递；-B 避免测试在仓库生成字节码缓存。
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "mds.snapshot_segmentation",
+                    str(input_path),
+                    str(output_path),
+                    "--stock-count",
+                    "3",
+                    "--complete-prefix-count",
+                    "2",
+                    "--complete-prefix-only",
+                ],
+                cwd=Path(__file__).resolve().parents[2],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            with output_path.open(encoding="utf-8", newline="") as output_file:
+                rows = list(csv.DictReader(output_file))
+
+        self.assertIn("已知完整前缀", result.stdout)
+        self.assertIn("已写出 6 行", result.stdout)
+        self.assertEqual([row["stock_id"] for row in rows], known_stocks)
+        self.assertEqual([int(row["snapshot_id"]) for row in rows], [1] * 3 + [2] * 3)
+
+    def test_csv_applies_boundary_feedback_without_modifying_inputs(self) -> None:
+        stocks = ["0", "1", "2", "3", "0", "2", "3", "1", "0", "1", "3"]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            input_path = Path(temporary_directory) / "data.csv"
+            output_path = Path(temporary_directory) / "snapshots.csv"
+            feedback_path = Path(temporary_directory) / "feedback.csv"
+            input_path.write_text(
+                "stock_id\n" + "\n".join(stocks) + "\n", encoding="utf-8"
+            )
+            feedback_path.write_text(
+                "end_data_row,action\n7,forbid\n8,require\n", encoding="utf-8"
+            )
+            original_input = input_path.read_bytes()
+            original_feedback = feedback_path.read_bytes()
+
+            stats = process_csv(
+                input_path,
+                output_path,
+                stock_count=4,
+                complete_prefix_count=1,
+                boundary_feedback_csv=feedback_path,
+            )
+
+            with output_path.open(encoding="utf-8", newline="") as output_file:
+                rows = list(csv.DictReader(output_file))
+            self.assertEqual(input_path.read_bytes(), original_input)
+            self.assertEqual(feedback_path.read_bytes(), original_feedback)
+
+        self.assertEqual([row["stock_id"] for row in rows], stocks)
+        self.assertEqual(
+            [int(row["snapshot_id"]) for row in rows], [1] * 4 + [2] * 4 + [3] * 3
+        )
+        self.assertEqual(stats["snapshot_count"], 3)
+
+    def test_csv_rejects_outputs_that_would_overwrite_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            input_path = Path(temporary_directory) / "data.csv"
+            output_path = Path(temporary_directory) / "snapshots.csv"
+            feedback_path = Path(temporary_directory) / "feedback.csv"
+            input_path.write_text("stock_id\n0\n1\n0\n1\n", encoding="utf-8")
+            output_path.write_text("already exists\n", encoding="utf-8")
+            feedback_path.write_text(
+                "end_data_row,action\n2,require\n", encoding="utf-8"
+            )
+            original_files = {
+                path: path.read_bytes()
+                for path in (input_path, output_path, feedback_path)
+            }
+            for output, boundary in (
+                (feedback_path, None),
+                (output_path, feedback_path),
+            ):
+                with self.subTest(output=output, boundary=boundary):
+                    with self.assertRaises(ValueError):
+                        process_csv(
+                            input_path,
+                            output,
+                            stock_count=2,
+                            complete_prefix_count=1,
+                            boundary_csv=boundary,
+                            boundary_feedback_csv=feedback_path,
+                        )
+                    for path, contents in original_files.items():
+                        self.assertEqual(path.read_bytes(), contents)
 
     def test_csv_rejects_path_collisions_before_overwriting_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
