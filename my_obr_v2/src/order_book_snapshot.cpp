@@ -83,11 +83,10 @@ void OrderBook::update_previous_snapshot() {
   fill_snapshot_levels(snapshots.back());
   fill_snapshot_statistics(snapshots.back());
 
-  // 市价回放、限价推演确认、未定价余量参与组及创业板组都完成后才释放快照。
-  // 未定价余量参与时，来单看不到完整流动性，即使没有预测量也要等本组真实 F；
-  // 否则会提前输出仍有原始挂单量的行，F 到达后无法修正已经 Ready 的快照。
+  // 市价回放、限价推演确认及创业板组都完成后才释放快照。
+  // 无成交价且已结束成交组的市价余量仅等待撤销，不阻止新限价单确认和输出。
   if (pending_market_order_appl_seq == 0 && pending_limit_trade_quantity == 0 &&
-      !pending_cyb_group && !pending_unpriced_group) {
+      !pending_cyb_group) {
     snapshots.back().status = SnapshotStatus::Ready;
   }
 }

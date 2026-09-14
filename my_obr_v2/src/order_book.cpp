@@ -14,7 +14,6 @@ void OrderBook::apply(Order& order) {
   handle_pending_market_order(order);
   handle_pending_CYB_limit_order(order);
   pending_cyb_group = false;
-  pending_unpriced_group = false;
   update_previous_snapshot();
   pending_limit_order_appl_seq = 0;
   pending_limit_trade_quantity = 0;
@@ -34,8 +33,6 @@ void OrderBook::apply(Order& order) {
   // 暂存单可能随盘口变化参与本组成交；这一组不提前撮合普通限价来单，
   // 而是按真实 F 的双方引用统一回放，避免两种路径扣到同一份数量。
   pending_cyb_group = !pending_limit_order_alive.empty();
-  // 旧市价余量尚未定价时也必须依靠真实成交引用；新委托到达不能抹掉这份流动性。
-  pending_unpriced_group = !unpriced_market_orders.empty();
   if (order.order_type == OrderType::Limit) {
     apply_limit_order(order);
   } else if (order.order_type == OrderType::BBO) {
@@ -68,7 +65,6 @@ void OrderBook::apply(Trade& trade) {
     handle_pending_market_order(trade);
     handle_pending_CYB_limit_order(trade);
     pending_cyb_group = false;
-    pending_unpriced_group = false;
     update_previous_snapshot();
     pending_limit_order_appl_seq = 0;
     pending_limit_trade_quantity = 0;
@@ -77,8 +73,6 @@ void OrderBook::apply(Trade& trade) {
     }
 
     pending_cyb_group = cyb_affected || !pending_limit_order_alive.empty();
-    // 当前撤单之后仍可能出现与旧未定价余量相关的 F；保留撤单原始元信息等组末更新。
-    pending_unpriced_group = !unpriced_market_orders.empty();
     replay_CYB_trades(std::vector<Trade>());
     make_snapshot(trade);
     return;
@@ -103,35 +97,13 @@ void OrderBook::apply(Trade& trade) {
     replay_pending_market_order(pending_market_order_trades);
   }
 
-  // 原来没有成交价的市价余量收到首次 F 时，恢复到原市价缓存流程。
-  // 一组成交可能分布在多个价格，必须等整组回放后按最后 F 定价，不能
-  // 第一条 F 就把余量固定在首笔价格上；这次恢复没有新的市价委托快照。
-  if (pending_market_order_appl_seq == 0) {
-    const int64_t order_ids[2] = {trade.bid_appl_seq_num, trade.offer_appl_seq_num};
-    for (int index = 0; index < 2; ++index) {
-      std::map<int64_t, OrderInfo>::iterator info = order_info_map.find(order_ids[index]);
-      // 已推演全成的原单可能已经不在索引中，其 F 仍会在下面仅作量确认。
-      if (info != order_info_map.end() && unpriced_market_orders.count(order_ids[index]) != 0) {
-        pending_market_order_appl_seq = order_ids[index];
-        pending_market_order_quantity = info->second.unpriced_quantity;
-        pending_market_trade_quantity = 0;
-        pending_market_last_price = 0;
-        pending_market_has_cancel = false;
-        pending_market_has_snapshot = false;
-        info->second.unpriced_quantity = 0;
-        unpriced_market_orders.erase(order_ids[index]);
-        break;
-      }
-    }
-  }
-
   const bool market_trade = pending_market_order_appl_seq != 0 &&
                             (trade.bid_appl_seq_num == pending_market_order_appl_seq ||
                              trade.offer_appl_seq_num == pending_market_order_appl_seq);
   const bool held_trade = pending_limit_order_alive.count(trade.bid_appl_seq_num) != 0 ||
                           pending_limit_order_alive.count(trade.offer_appl_seq_num) != 0;
-  const bool predicted_trade = !pending_cyb_group && !pending_unpriced_group && !market_trade &&
-                               !held_trade && pending_limit_trade_quantity > 0 &&
+  const bool predicted_trade = !pending_cyb_group && !market_trade && !held_trade &&
+                               pending_limit_trade_quantity > 0 &&
                                (trade.bid_appl_seq_num == pending_limit_order_appl_seq ||
                                 trade.offer_appl_seq_num == pending_limit_order_appl_seq);
 
@@ -160,7 +132,7 @@ void OrderBook::apply_market_order(Order& order) {
   pending_market_trade_quantity = 0;
   pending_market_last_price = 0;
   pending_market_has_cancel = false;
-  pending_market_has_snapshot = true;
+  pending_market_has_snapshot = order.generate_snapshot;
   pending_market_order_trades.clear();
   // 未定价市价单不进入链表；按等待状态分流后才能决定扣独立余量还是 position。
   order_info_map[order.order_appl_seq_num] =
@@ -201,8 +173,6 @@ void OrderBook::apply_order_in_acution(Order& order) {
   position = level.orders.insert(position, RestingOrder{order.order_appl_seq_num, order.quantity});
   level.total_quantity += order.quantity;
   order_info_map[order.order_appl_seq_num] = OrderInfo{order.price, order.side, position, 0};
-  // 所有实际入簿路径集中在这里；余量有价入簿后不再属于未定价市价集合。
-  unpriced_market_orders.erase(order.order_appl_seq_num);
 }
 
 void OrderBook::apply_limit_order(Order& order) {
@@ -221,12 +191,6 @@ void OrderBook::apply_limit_order(Order& order) {
   }
   if (pending_cyb_group) {
     // 有暂存单参与的组，来单先全量登记，再按真实 F 的引用扣量。
-    apply_order_in_acution(order);
-    return;
-  }
-  if (pending_unpriced_group) {
-    // 可见盘口不包含旧未定价市价余量，提前撮合可能误吃另一张可见订单。
-    // 先保留当前限价的完整数量，后续 F 再按引用扣双方；避免重复扣量及错误删除索引。
     apply_order_in_acution(order);
     return;
   }
@@ -280,14 +244,13 @@ void OrderBook::apply_cancel(Trade& trade) {
 
   std::map<int64_t, OrderInfo>::iterator info = order_info_map.find(order_id);
   if (info->second.price == DROP_SIGNAL) {
-    // 无 F 的市价余量、无本方报价的 U 单都没有链表节点；按记录的未定价数量扣除。
+    // 已结束成交组且无 F 的市价余量，按当前前提后续只会撤销；空本方 U 单也只待撤。
+    // 两者都没有链表节点，按记录的未定价数量扣除，不能访问默认 position。
     // 部分撤销保留余量，全部撤销才清理索引；U 单不会因后来出现本方报价而重新入簿。
-    // 这不是盘口订单，绝不能访问其默认构造的 position。
     info->second.unpriced_quantity -= trade.quantity;
     if (info->second.unpriced_quantity == 0) {
       order_info_map.erase(info);
       order_arrival_rank.erase(order_id);
-      unpriced_market_orders.erase(order_id);
     }
     return;
   }
@@ -319,25 +282,10 @@ void OrderBook::execute_trade(Trade& trade) {
   const int64_t order_ids[2] = {trade.bid_appl_seq_num, trade.offer_appl_seq_num};
   for (int index = 0; index < 2; ++index) {
     const int64_t order_id = order_ids[index];
-    const OrderInfo& original = order_info_map.find(order_id)->second;
-    const bool previously_unpriced =
-        order_id != pending_market_order_appl_seq && original.price == DROP_SIGNAL;
-    const EventSide side = original.side;
-
     Trade consumed = trade;
     consumed.bid_appl_seq_num = index == 0 ? order_id : 0;
     consumed.offer_appl_seq_num = index == 1 ? order_id : 0;
     apply_cancel(consumed);
-
-    // 原先无成交价而保留的市价余量，首次实际 F 后即可确定其剩余部分的挂单价。
-    if (previously_unpriced && order_info_map.count(order_id) != 0) {
-      Order remaining_order = {};
-      remaining_order.order_appl_seq_num = order_id;
-      remaining_order.side = side;
-      remaining_order.price = trade.price;
-      remaining_order.quantity = order_info_map.find(order_id)->second.unpriced_quantity;
-      apply_order_in_acution(remaining_order);
-    }
   }
 }
 
@@ -407,7 +355,6 @@ void OrderBook::finish() {
   replay_CYB_trades(pending_CYB_trades);
   pending_CYB_trades.clear();
   pending_cyb_group = false;
-  pending_unpriced_group = false;
   update_previous_snapshot();
   pending_limit_order_appl_seq = 0;
 }

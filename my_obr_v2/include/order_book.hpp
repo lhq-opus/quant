@@ -3,7 +3,6 @@
 #include <deque>
 #include <map>
 #include <queue>
-#include <set>
 
 class OrderBook {
 public:
@@ -87,12 +86,6 @@ private:
   // 普通限价只提前扣盘口，相关真实 F 确认完这一份量后才允许输出快照。
   int64_t pending_limit_order_appl_seq = 0;
   int64_t pending_limit_trade_quantity = 0;
-  // 未定价市价余量不在可见盘口中；单独记录其原单号，避免每张来单扫描全部索引。
-  // 本方为空的 U 单只等待撤销，不属于这个集合，也不会阻止普通限价提前撮合。
-  std::set<int64_t> unpriced_market_orders;
-  // 本组开始时存在未定价市价余量，单凭可见盘口不能推演真实对手及成交量。
-  // 本组限价全量入簿后按真实 F 扣量，快照等待下一组边界或 EOF 再完成。
-  bool pending_unpriced_group = false;
   // 有暂存单参与的组统一按真实引用回放，避免与限价推演争用同一份对手量。
   bool pending_cyb_group = false;
   // 每段竞价的成交量独立于全日累计量；结算只扣盘，不重复统计真实 F。
@@ -108,7 +101,7 @@ private:
   int64_t pending_market_trade_quantity = 0;
   int64_t pending_market_last_price = 0;
   bool pending_market_has_cancel = false;
-  // 旧未定价余量恢复成交时复用市价缓存，但不能删除其他事件的快照。
+  // 当前市价委托是否请求了快照；没有生成该行时不删除其他事件的快照。
   bool pending_market_has_snapshot = false;
 
   // 创业板当前事件组的真实 F；外层保证每条成交只进入一份缓存。

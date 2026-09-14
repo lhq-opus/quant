@@ -68,21 +68,19 @@ void OrderBook::replay_pending_market_order(std::vector<Trade> trades) {
     remaining_order.quantity = remaining_quantity;
     apply_order_in_acution(remaining_order);
   } else if (remaining_quantity > 0) {
-    // 没有真实成交时无法给余量定价，但仍可能分多次撤单；保存未定价数量，
-    // 后续按 DROP_SIGNAL 分支扣减，不能把尚存余量的占位索引提前删除。
-    // 该记录没有队列节点，position 只在真正入簿后才可以解引用。
+    // 当前前提：本组成交结束仍没有成交价的市价余量，之后只会撤销，不再成交。
+    // 保存未定价数量供后续单次或分次撤单按 DROP_SIGNAL 分支扣减，
+    // 不能把尚存余量的占位索引提前删除；这条待撤记录没有可以解引用的 position。
     order_info_map.find(order_appl_seq)->second.unpriced_quantity = remaining_quantity;
-    unpriced_market_orders.insert(order_appl_seq);
   } else {
     // 全部成交或撤完后，数量归零的市价占位索引和原始到达次序一起删除。
     order_info_map.erase(order_appl_seq);
     order_arrival_rank.erase(order_appl_seq);
-    unpriced_market_orders.erase(order_appl_seq);
   }
 
   // 保留 v2 的输出口径：只有未带撤单且全部成交的市价委托才保留原快照。
   // 无快照的业务阶段不会创建快照，也无需访问 snapshots.back()。
-  // 旧未定价余量恢复成交时没有新的市价委托行，不能删除其他事件的快照。
+  // 是否生成了当前市价委托行由原事件标志确定。
   if (pending_market_has_snapshot && (pending_market_has_cancel || remaining_quantity > 0) &&
       !snapshots.empty() && snapshots.back().status == SnapshotStatus::Pending) {
     snapshots.back().status = SnapshotStatus::Deleted;
