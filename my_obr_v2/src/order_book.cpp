@@ -14,6 +14,7 @@ void OrderBook::apply(Order& order) {
   handle_pending_market_order(order);
   handle_pending_CYB_limit_order(order);
   pending_cyb_group = false;
+  pending_unpriced_group = false;
   update_previous_snapshot();
   pending_limit_order_appl_seq = 0;
   pending_limit_trade_quantity = 0;
@@ -33,6 +34,8 @@ void OrderBook::apply(Order& order) {
   // 暂存单可能随盘口变化参与本组成交；这一组不提前撮合普通限价来单，
   // 而是按真实 F 的双方引用统一回放，避免两种路径扣到同一份数量。
   pending_cyb_group = !pending_limit_order_alive.empty();
+  // 旧市价余量尚未定价时也必须依靠真实成交引用；新委托到达不能抹掉这份流动性。
+  pending_unpriced_group = !unpriced_market_orders.empty();
   if (order.order_type == OrderType::Limit) {
     apply_limit_order(order);
   } else if (order.order_type == OrderType::BBO) {
@@ -65,6 +68,7 @@ void OrderBook::apply(Trade& trade) {
     handle_pending_market_order(trade);
     handle_pending_CYB_limit_order(trade);
     pending_cyb_group = false;
+    pending_unpriced_group = false;
     update_previous_snapshot();
     pending_limit_order_appl_seq = 0;
     pending_limit_trade_quantity = 0;
@@ -73,6 +77,8 @@ void OrderBook::apply(Trade& trade) {
     }
 
     pending_cyb_group = cyb_affected || !pending_limit_order_alive.empty();
+    // 当前撤单之后仍可能出现与旧未定价余量相关的 F；保留撤单原始元信息等组末更新。
+    pending_unpriced_group = !unpriced_market_orders.empty();
     replay_CYB_trades(std::vector<Trade>());
     make_snapshot(trade);
     return;
@@ -105,7 +111,7 @@ void OrderBook::apply(Trade& trade) {
     for (int index = 0; index < 2; ++index) {
       std::map<int64_t, OrderInfo>::iterator info = order_info_map.find(order_ids[index]);
       // 已推演全成的原单可能已经不在索引中，其 F 仍会在下面仅作量确认。
-      if (info != order_info_map.end() && info->second.price == DROP_SIGNAL) {
+      if (info != order_info_map.end() && unpriced_market_orders.count(order_ids[index]) != 0) {
         pending_market_order_appl_seq = order_ids[index];
         pending_market_order_quantity = info->second.unpriced_quantity;
         pending_market_trade_quantity = 0;
@@ -113,6 +119,7 @@ void OrderBook::apply(Trade& trade) {
         pending_market_has_cancel = false;
         pending_market_has_snapshot = false;
         info->second.unpriced_quantity = 0;
+        unpriced_market_orders.erase(order_ids[index]);
         break;
       }
     }
@@ -123,8 +130,8 @@ void OrderBook::apply(Trade& trade) {
                              trade.offer_appl_seq_num == pending_market_order_appl_seq);
   const bool held_trade = pending_limit_order_alive.count(trade.bid_appl_seq_num) != 0 ||
                           pending_limit_order_alive.count(trade.offer_appl_seq_num) != 0;
-  const bool predicted_trade = !pending_cyb_group && !market_trade && !held_trade &&
-                               pending_limit_trade_quantity > 0 &&
+  const bool predicted_trade = !pending_cyb_group && !pending_unpriced_group && !market_trade &&
+                               !held_trade && pending_limit_trade_quantity > 0 &&
                                (trade.bid_appl_seq_num == pending_limit_order_appl_seq ||
                                 trade.offer_appl_seq_num == pending_limit_order_appl_seq);
 
@@ -161,11 +168,14 @@ void OrderBook::apply_market_order(Order& order) {
 }
 
 void OrderBook::apply_BBO_order(Order& order) {
-  // 本方为空时没有可引用的本方最优价，不生成零价/负价挂单，也不访问 end。
+  // 本方为空时无法确定本方最优价，订单不会进入盘口，但后续仍会收到自动撤单。
+  // 保留未入簿原单及待撤数量，让 apply_cancel 消耗这一业务状态；提前丢掉索引
+  // 会使合法撤单查到 end，随后把无效 position 当成链表节点访问。
   // 当前事件仍可输出未改变的盘口；有本方档位时沿用原来的转限价处理。
   if ((order.side == EventSide::Buy && bids.empty()) ||
       (order.side == EventSide::Sell && asks.empty())) {
-    order_arrival_rank.erase(order.order_appl_seq_num);
+    order_info_map[order.order_appl_seq_num] =
+        OrderInfo{DROP_SIGNAL, order.side, OrderQueue::iterator(), order.quantity};
     return;
   }
   Order limit_order = order;
@@ -191,6 +201,8 @@ void OrderBook::apply_order_in_acution(Order& order) {
   position = level.orders.insert(position, RestingOrder{order.order_appl_seq_num, order.quantity});
   level.total_quantity += order.quantity;
   order_info_map[order.order_appl_seq_num] = OrderInfo{order.price, order.side, position, 0};
+  // 所有实际入簿路径集中在这里；余量有价入簿后不再属于未定价市价集合。
+  unpriced_market_orders.erase(order.order_appl_seq_num);
 }
 
 void OrderBook::apply_limit_order(Order& order) {
@@ -209,6 +221,12 @@ void OrderBook::apply_limit_order(Order& order) {
   }
   if (pending_cyb_group) {
     // 有暂存单参与的组，来单先全量登记，再按真实 F 的引用扣量。
+    apply_order_in_acution(order);
+    return;
+  }
+  if (pending_unpriced_group) {
+    // 可见盘口不包含旧未定价市价余量，提前撮合可能误吃另一张可见订单。
+    // 先保留当前限价的完整数量，后续 F 再按引用扣双方；避免重复扣量及错误删除索引。
     apply_order_in_acution(order);
     return;
   }
@@ -262,12 +280,14 @@ void OrderBook::apply_cancel(Trade& trade) {
 
   std::map<int64_t, OrderInfo>::iterator info = order_info_map.find(order_id);
   if (info->second.price == DROP_SIGNAL) {
-    // 无 F 的市价单经过部分撤销仍可能有余量；保留未定价状态接收后续引用。
+    // 无 F 的市价余量、无本方报价的 U 单都没有链表节点；按记录的未定价数量扣除。
+    // 部分撤销保留余量，全部撤销才清理索引；U 单不会因后来出现本方报价而重新入簿。
     // 这不是盘口订单，绝不能访问其默认构造的 position。
     info->second.unpriced_quantity -= trade.quantity;
     if (info->second.unpriced_quantity == 0) {
       order_info_map.erase(info);
       order_arrival_rank.erase(order_id);
+      unpriced_market_orders.erase(order_id);
     }
     return;
   }
@@ -387,6 +407,7 @@ void OrderBook::finish() {
   replay_CYB_trades(pending_CYB_trades);
   pending_CYB_trades.clear();
   pending_cyb_group = false;
+  pending_unpriced_group = false;
   update_previous_snapshot();
   pending_limit_order_appl_seq = 0;
 }

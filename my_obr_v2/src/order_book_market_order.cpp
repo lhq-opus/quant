@@ -72,10 +72,12 @@ void OrderBook::replay_pending_market_order(std::vector<Trade> trades) {
     // 后续按 DROP_SIGNAL 分支扣减，不能把尚存余量的占位索引提前删除。
     // 该记录没有队列节点，position 只在真正入簿后才可以解引用。
     order_info_map.find(order_appl_seq)->second.unpriced_quantity = remaining_quantity;
+    unpriced_market_orders.insert(order_appl_seq);
   } else {
     // 全部成交或撤完后，数量归零的市价占位索引和原始到达次序一起删除。
     order_info_map.erase(order_appl_seq);
     order_arrival_rank.erase(order_appl_seq);
+    unpriced_market_orders.erase(order_appl_seq);
   }
 
   // 保留 v2 的输出口径：只有未带撤单且全部成交的市价委托才保留原快照。

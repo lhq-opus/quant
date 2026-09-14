@@ -3,6 +3,7 @@
 #include <deque>
 #include <map>
 #include <queue>
+#include <set>
 
 class OrderBook {
 public:
@@ -31,7 +32,7 @@ private:
     EventSide side;
     // 暂存/市价等待态使用默认迭代器，必须先分流；仅已入簿订单可解引用。
     OrderQueue::iterator position;
-    // 市价从未成交而尚有余量时，保留未定价数量供后续撤单/成交引用。
+    // 无成交价的市价余量，以及本方为空的 U 单待撤数量；两者都不在可见链表中。
     int64_t unpriced_quantity;
   };
 
@@ -86,6 +87,12 @@ private:
   // 普通限价只提前扣盘口，相关真实 F 确认完这一份量后才允许输出快照。
   int64_t pending_limit_order_appl_seq = 0;
   int64_t pending_limit_trade_quantity = 0;
+  // 未定价市价余量不在可见盘口中；单独记录其原单号，避免每张来单扫描全部索引。
+  // 本方为空的 U 单只等待撤销，不属于这个集合，也不会阻止普通限价提前撮合。
+  std::set<int64_t> unpriced_market_orders;
+  // 本组开始时存在未定价市价余量，单凭可见盘口不能推演真实对手及成交量。
+  // 本组限价全量入簿后按真实 F 扣量，快照等待下一组边界或 EOF 再完成。
+  bool pending_unpriced_group = false;
   // 有暂存单参与的组统一按真实引用回放，避免与限价推演争用同一份对手量。
   bool pending_cyb_group = false;
   // 每段竞价的成交量独立于全日累计量；结算只扣盘，不重复统计真实 F。
