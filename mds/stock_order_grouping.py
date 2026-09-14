@@ -1,20 +1,15 @@
-"""根据已切好的 snapshot 中的股票顺序恢复固定递增组。
+"""从同目录 data.csv 的 stock_id,snapshot_id 两列恢复固定递增组。
 
-输入固定为 stock_id,snapshot_id 两列，按原始记录顺序排列。
-同一轮中若较大的 ID 先出现，两只股票就不能同组；跨轮取这些冲突的并集。
-用图着色寻找合法组，再用两两冲突的股票集证明组数下界。
-最少组数是本次求解目标，不是用户已确认的业务组数。
-数据读取、snapshot 分段、汇总和 CSV 输出使用 pandas，始终保留轮内原序。
+输入由用户保证准确；使用 pandas 读取，保留每个 snapshot 的原始股票顺序。
+输出同目录 stock_groups.csv，只有 stock_id,group_id 两列。
 """
 
-import argparse
-import hashlib
-import json
-from collections import deque
-from itertools import combinations
 from pathlib import Path
 
 import pandas as pd
+
+INPUT_CSV = Path(__file__).with_name("data.csv")
+OUTPUT_CSV = Path(__file__).with_name("stock_groups.csv")
 
 
 def mask_members(mask: int):
@@ -44,7 +39,7 @@ def build_conflicts(data: pd.DataFrame, stock_count: int):
     for stock, neighbors in enumerate(upper):
         for other in mask_members(neighbors):
             adjacency[other] |= 1 << stock
-    return adjacency, sum(neighbors.bit_count() for neighbors in upper)
+    return adjacency
 
 
 def color_conflicts(adjacency: list[int]):
@@ -52,7 +47,7 @@ def color_conflicts(adjacency: list[int]):
 
     每次选择禁用组最多的股票，同分时选冲突邻居更多、ID 更小的股票。
     分配最小可用组号，并把该组加入未分配邻居的禁用组集合。
-    该方法保证合法，不一般性保证最优；最优性由后续下界证据确认。
+    该方法保证冲突股票不在同组，但贪心结果不一般性保证组数最少。
     """
     count = len(adjacency)
     colors = [-1] * count
@@ -79,229 +74,20 @@ def color_conflicts(adjacency: list[int]):
     return [labels[color] for color in colors]
 
 
-def find_clique(adjacency: list[int], target_size: int):
-    """寻找两两冲突的股票集，提供组数下界；不把贪心下界当精确值。
-
-    新成员必须与此前所有成员冲突，因此每加入一股，就对候选取邻居交集。
-    当下界等于已经找到的合法组数时，最少组数得到证明，可以立即结束。
-    """
-    degrees = [neighbors.bit_count() for neighbors in adjacency]
-    seeds = sorted(range(len(adjacency)), key=lambda value: (-degrees[value], value))
-    best = []
-    for seed in seeds[:16]:
-        clique = [seed]
-        candidates = adjacency[seed]
-        while candidates:
-            stock = max(
-                mask_members(candidates), key=lambda value: (degrees[value], -value)
-            )
-            clique.append(stock)
-            candidates &= adjacency[stock]
-        if len(clique) > len(best):
-            best = clique
-        if len(best) == target_size:
-            break
-    return best
-
-
-def prove_uniqueness(adjacency, groups, clique, stock_ids):
-    """固定满大小冲突团后，只用必然的禁组传播证明唯一性。
-
-    任意最优解中，团内各股票必须分属不同组，故可通过重命名对齐这些锚。
-    若一股已经与其余 K-1 组的已确定股票冲突，它就只能在剩下的一组。
-    保存按推导顺序排列的见证；若无法推到所有股票，只报告未证明唯一。
-    """
-    group_count = max(groups)
-    if len(clique) != group_count:
-        return [], False
-    domains = [(1 << group_count) - 1 for _ in groups]
-    excluded_by = [{} for _ in groups]
-    queue = deque(clique)
-    anchors = set(clique)
-    processed = set()
-    trace = []
-    for stock in clique:
-        domains[stock] = 1 << (groups[stock] - 1)
-
-    while queue:
-        stock = queue.popleft()
-        if stock in processed:
-            continue
-        processed.add(stock)
-        group = domains[stock].bit_length()
-        trace.append(
-            {
-                "step": len(trace) + 1,
-                "stock_id": int(stock_ids[stock]),
-                "group_id": group,
-                "anchor": stock in anchors,
-                "excluded_groups": {
-                    str(label): int(stock_ids[witness])
-                    for label, witness in sorted(excluded_by[stock].items())
-                },
-            }
-        )
-        for other in mask_members(adjacency[stock]):
-            if domains[other] & domains[stock]:
-                domains[other] &= ~domains[stock]
-                excluded_by[other][group] = stock
-                if not domains[other]:
-                    raise ValueError("冲突传播没有剩余可用组")
-                if domains[other].bit_count() == 1:
-                    queue.append(other)
-    return trace, len(processed) == len(groups)
-
-
-def audit_snapshots(data: pd.DataFrame, group_count: int) -> pd.DataFrame:
-    """直接按 snapshot 原序抽取各组，核对严格递增，绝不先排序再核对。"""
-    snapshots = data.groupby("snapshot_id", sort=False)
-    audit = snapshots.agg(
-        stock_count=("stock_id", "size"),
-        unique_stock_count=("stock_id", "nunique"),
+def main():
+    data = pd.read_csv(
+        INPUT_CSV,
+        encoding="utf-8",
+        dtype={"stock_id": "int64", "snapshot_id": "int64"},
     )
-    audit["duplicate_count"] = audit["stock_count"] - audit["unique_stock_count"]
-    audit = audit.drop(columns="unique_stock_count")
-
-    # diff 只比较同一 snapshot、同一组内相邻的记录；每组首条的差值为空，
-    # le(0) 会将它判为 False，其余差值小于等于 0 才是递增规则的违反。
-    group_rows = data.groupby(["snapshot_id", "group_id"], sort=False)
-    violations = group_rows["stock_id"].diff().le(0)
-    audit["order_violations"] = violations.groupby(
-        data["snapshot_id"], sort=False
-    ).sum()
-
-    # 将每轮每组数量展开成列。某组本轮缺失时填 0，再按原 snapshot 顺序对齐。
-    counts = group_rows.size().unstack("group_id", fill_value=0)
-    counts = counts.reindex(
-        index=audit.index, columns=range(1, group_count + 1), fill_value=0
-    )
-    counts.columns = [f"group_{group}_count" for group in counts.columns]
-    return audit.join(counts).reset_index()
-
-
-def find_witnesses(data: pd.DataFrame, stock_ids, groups, clique, trace):
-    """为团和唯一性推导中的冲突边找一处真实逆序及数据行号。
-
-    positions 是股票索引到输入数据行号的 Series；map 未匹配到时为空。
-    只查仍缺证据的股票对，一旦发现较大 ID 在前就记录并从待查集合删除。
-    """
-    index_of = {int(stock): index for index, stock in enumerate(stock_ids)}
-    pairs = {tuple(sorted(pair)) for pair in combinations(clique, 2)}
-    for step in trace:
-        stock = index_of[step["stock_id"]]
-        for witness in step["excluded_groups"].values():
-            pairs.add(tuple(sorted((stock, index_of[witness]))))
-    if not pairs:
-        return []
-    unresolved = pd.DataFrame(
-        sorted(pairs), columns=["smaller_stock_index", "larger_stock_index"]
-    )
-    rows = []
-    for snapshot_id, stocks in data.groupby("snapshot_id", sort=False)["stock_index"]:
-        # read_csv 的行索引从 0 开始且从未重排，+1 即不含表头的输入数据行号。
-        positions = pd.Series(stocks.index + 1, index=stocks)
-        smaller_rows = unresolved["smaller_stock_index"].map(positions)
-        larger_rows = unresolved["larger_stock_index"].map(positions)
-        found = larger_rows.lt(smaller_rows)
-        matched = unresolved.loc[found].assign(
-            larger_input_data_row=larger_rows[found],
-            smaller_input_data_row=smaller_rows[found],
-        )
-        for smaller, larger, larger_row, smaller_row in matched.itertuples(
-            index=False, name=None
-        ):
-            rows.append(
-                {
-                    "smaller_stock_id": int(stock_ids[smaller]),
-                    "larger_stock_id": int(stock_ids[larger]),
-                    "smaller_group_id": groups[smaller],
-                    "larger_group_id": groups[larger],
-                    "snapshot_id": int(snapshot_id),
-                    "larger_input_data_row": int(larger_row),
-                    "smaller_input_data_row": int(smaller_row),
-                }
-            )
-        unresolved = unresolved.loc[~found]
-        if unresolved.empty:
-            break
-    if len(unresolved):
-        raise ValueError("部分证明用的冲突边未找到实际逆序")
-    return sorted(
-        rows, key=lambda row: (row["smaller_stock_id"], row["larger_stock_id"])
-    )
-
-
-def write_csv(path: Path, data: pd.DataFrame):
-    data.to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
-
-
-def group_stocks(input_csv: Path, output_dir: Path):
-    # 输入格式已由本项目确定，不猜测表头，不清洗或重排原始记录。
-    data = pd.read_csv(input_csv, dtype={"stock_id": "int64", "snapshot_id": "int64"})
     # factorize 为每股建立整数索引。sort=True 只将股票字典按数值排序，
     # 不改变 data 的行顺序，所以索引大小仍能表达真实 stock_id 的大小。
     data["stock_index"], stock_ids = pd.factorize(data["stock_id"], sort=True)
     stock_ids = stock_ids.tolist()
-    adjacency, edge_count = build_conflicts(data, len(stock_ids))
+    adjacency = build_conflicts(data, len(stock_ids))
     groups = color_conflicts(adjacency)
-    clique = find_clique(adjacency, max(groups))
-    trace, unique = prove_uniqueness(adjacency, groups, clique, stock_ids)
     mapping = pd.DataFrame({"stock_id": stock_ids, "group_id": groups})
-    data["group_id"] = data["stock_id"].map(mapping.set_index("stock_id")["group_id"])
-    audit = audit_snapshots(data, max(groups))
-    if audit[["duplicate_count", "order_violations"]].ne(0).any().any():
-        raise ValueError("实际 snapshot 含重复股票或组内逆序，未导出分组")
-    witnesses = find_witnesses(data, stock_ids, groups, clique, trace)
-    group_summary = mapping.groupby("group_id", as_index=False).agg(
-        stock_count=("stock_id", "size"),
-        min_stock_id=("stock_id", "min"),
-        max_stock_id=("stock_id", "max"),
-    )
-    output_dir.mkdir(parents=True, exist_ok=True)
-    write_csv(output_dir / "stock_groups.csv", mapping)
-    write_csv(output_dir / "group_summary.csv", group_summary)
-    write_csv(output_dir / "snapshot_audit.csv", audit)
-    if witnesses:
-        write_csv(output_dir / "conflict_witnesses.csv", pd.DataFrame(witnesses))
-    certificate = {"group_count": max(groups), "unique_proved": unique, "trace": trace}
-    (output_dir / "uniqueness_certificate.json").write_text(
-        json.dumps(certificate, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    with input_csv.open("rb") as stream:
-        source_hash = hashlib.file_digest(stream, "sha256").hexdigest()
-    summary = {
-        "input_csv": str(input_csv.resolve()),
-        "input_sha256": source_hash,
-        "row_count": len(data),
-        "snapshot_count": len(audit),
-        "stock_count": len(stock_ids),
-        "conflict_pair_count": edge_count,
-        "group_count": max(groups),
-        "group_count_lower_bound": len(clique),
-        "minimum_group_count_proved": len(clique) == max(groups),
-        "unique_minimum_partition_proved": unique,
-        "uniqueness_fixed_stock_count": len(trace),
-        "clique_stock_ids": [int(stock_ids[stock]) for stock in clique],
-        "snapshot_order_violations": int(audit["order_violations"].sum()),
-        "snapshot_duplicate_count": int(audit["duplicate_count"].sum()),
-        "proof_witness_pair_count": len(witnesses),
-        "groups": group_summary.to_dict(orient="records"),
-        "assumption": "组数最少；只约束每组原序子序列递增，不要求组内记录连续",
-        "scope": "结论以输入snapshot切分与用户给定的组内递增规则成立为前提",
-    }
-    (output_dir / "summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    return summary
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input_csv", type=Path)
-    parser.add_argument("output_dir", type=Path)
-    args = parser.parse_args()
-    result = group_stocks(args.input_csv, args.output_dir)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    mapping.to_csv(OUTPUT_CSV, index=False, encoding="utf-8", lineterminator="\n")
 
 
 if __name__ == "__main__":
