@@ -37,7 +37,11 @@ private:
   void apply_limit_order(Order& order);
   void apply_cancel(const Trade& trade);
   Snapshot make_snapshot(const std::string& caa, EventType event_type, TradingSession session);
-  void record_trade(int64_t price, int64_t quantity);
+  // 执行已确定价格、数量的成交，并统一维护订单、档位和成交统计。
+  // reduce_bids/reduce_asks 指定扣减侧：连续撮合只扣对手侧，集合竞价同时扣两侧。
+  // 从所选侧最优档的 FIFO 队首扣量；price 是成交价，竞价时可不同于订单挂价。
+  // 调用方保证可成交量充足；连续撮合每次只传当前一个价档的成交量。
+  void execute_trade(int64_t price, int64_t quantity, bool reduce_bids, bool reduce_asks);
   void find_call_action_result(int64_t& auction_price, int64_t& trade_quantity,
                                int64_t& remaining_quantity_at_price, char& side);
 

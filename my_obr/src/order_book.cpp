@@ -79,51 +79,10 @@ void OrderBook::apply_market_order(Order& order) {
     quantity_at_best = bids.begin()->second.total_quantity;
   }
 
-  // trade as normal
+  // 对手最优档足够时，一次传入本单全部成交量，由公共方法按同价 FIFO 扣量。
   if (quantity_at_best >= remaining_quantity) {
-    if (order.side == '1') {
-      AskLevels::iterator best_ask = asks.begin();
-      BookLevel& level = best_ask->second;
-
-      while (remaining_quantity > 0) {
-        RestingOrder& resting_order = level.orders.front();
-        int64_t traded_quantity = std::min(remaining_quantity, resting_order.remaining_quantity);
-        record_trade(best_price, traded_quantity);
-        remaining_quantity -= traded_quantity;
-        resting_order.remaining_quantity -= traded_quantity;
-        level.total_quantity -= traded_quantity;
-
-        if (resting_order.remaining_quantity == 0) {
-          order_price.erase(resting_order.order_appl_seq_num);
-          level.orders.pop_front();
-        }
-      }
-
-      if (level.total_quantity == 0) {
-        asks.erase(best_ask);
-      }
-    } else {
-      BidLevels::iterator best_bid = bids.begin();
-      BookLevel& level = best_bid->second;
-
-      while (remaining_quantity > 0) {
-        RestingOrder& resting_order = level.orders.front();
-        int64_t traded_quantity = std::min(remaining_quantity, resting_order.remaining_quantity);
-        record_trade(best_price, traded_quantity);
-        remaining_quantity -= traded_quantity;
-        resting_order.remaining_quantity -= traded_quantity;
-        level.total_quantity -= traded_quantity;
-
-        if (resting_order.remaining_quantity == 0) {
-          order_price.erase(resting_order.order_appl_seq_num);
-          level.orders.pop_front();
-        }
-      }
-
-      if (level.total_quantity == 0) {
-        bids.erase(best_bid);
-      }
-    }
+    // 卖单扣 bids，买单扣 asks；来单尚未入簿，无需从本方档位再扣一次。
+    execute_trade(best_price, remaining_quantity, order.side == '2', order.side == '1');
     return;
   }
 
@@ -181,7 +140,7 @@ void OrderBook::apply_market_order(Order& order) {
     }
   }
 
-  // trade after five levels
+  // 五档分支按价格档计数，同一个档位内成交多张订单仍只算经过一档。
   if (market_order_type == MarketOrderType::CancelAfterFiveLevel) {
     order.generate_snapshot = false;
 
@@ -190,25 +149,10 @@ void OrderBook::apply_market_order(Order& order) {
       while (remaining_quantity > 0 && !asks.empty() && level_cnt < 5) {
         AskLevels::iterator best_ask = asks.begin();
         int64_t price = best_ask->first;
-        BookLevel& level = best_ask->second;
-
-        while (remaining_quantity > 0 && level.total_quantity > 0) {
-          RestingOrder& resting_order = level.orders.front();
-          int64_t traded_quantity = std::min(remaining_quantity, resting_order.remaining_quantity);
-          record_trade(price, traded_quantity);
-          remaining_quantity -= traded_quantity;
-          resting_order.remaining_quantity -= traded_quantity;
-          level.total_quantity -= traded_quantity;
-
-          if (resting_order.remaining_quantity == 0) {
-            order_price.erase(resting_order.order_appl_seq_num);
-            level.orders.pop_front();
-          }
-        }
-
-        if (level.total_quantity == 0) {
-          asks.erase(best_ask);
-        }
+        int64_t traded_quantity = std::min(remaining_quantity, best_ask->second.total_quantity);
+        // 买单只扣当前卖档；方法可能删除该档，调用后不再访问 best_ask。
+        execute_trade(price, traded_quantity, false, true);
+        remaining_quantity -= traded_quantity;
         level_cnt++;
       }
     } else {
@@ -216,31 +160,15 @@ void OrderBook::apply_market_order(Order& order) {
       while (remaining_quantity > 0 && !bids.empty() && level_cnt < 5) {
         BidLevels::iterator best_bid = bids.begin();
         int64_t price = best_bid->first;
-        BookLevel& level = best_bid->second;
-        int64_t traded_at_level = 0;
-
-        while (remaining_quantity > 0 && level.total_quantity > 0) {
-          RestingOrder& resting_order = level.orders.front();
-          int64_t traded_quantity = std::min(remaining_quantity, resting_order.remaining_quantity);
-          record_trade(price, traded_quantity);
-          remaining_quantity -= traded_quantity;
-          resting_order.remaining_quantity -= traded_quantity;
-          level.total_quantity -= traded_quantity;
-          traded_at_level += traded_quantity;
-
-          if (resting_order.remaining_quantity == 0) {
-            order_price.erase(resting_order.order_appl_seq_num);
-            level.orders.pop_front();
-          }
-        }
+        int64_t traded_at_level = std::min(remaining_quantity, best_bid->second.total_quantity);
+        // 卖单只扣当前买档，下一轮重新取得扣量后的最优档。
+        execute_trade(price, traded_at_level, true, false);
+        remaining_quantity -= traded_at_level;
 
         if (order.caa == "1629943945030354") {
           std::cout << price << "," << traded_at_level << std::endl;
         }
 
-        if (level.total_quantity == 0) {
-          bids.erase(best_bid);
-        }
         level_cnt++;
       }
 
@@ -254,43 +182,19 @@ void OrderBook::apply_market_order(Order& order) {
     return;
   }
 
-  // trade at fixed price
+  // 固定最优价分支只吃完原对手最优档，未成交余量随后挂在本方同价档。
   if (market_order_type == MarketOrderType::TradeAtBest) {
     order.generate_snapshot = false;
+    execute_trade(best_price, quantity_at_best, order.side == '2', order.side == '1');
+    remaining_quantity -= quantity_at_best;
 
     if (order.side == '1') {
-      AskLevels::iterator best_ask = asks.begin();
-      BookLevel& opposite_level = best_ask->second;
-      while (opposite_level.total_quantity > 0) {
-        RestingOrder& resting_order = opposite_level.orders.front();
-        int64_t traded_quantity = resting_order.remaining_quantity;
-        record_trade(best_price, traded_quantity);
-        remaining_quantity -= traded_quantity;
-        opposite_level.total_quantity -= traded_quantity;
-        order_price.erase(resting_order.order_appl_seq_num);
-        opposite_level.orders.pop_front();
-      }
-      asks.erase(best_ask);
-
       BookLevel& level = bids[best_price];
       OrderQueue::iterator position = level.orders.insert(
           level.orders.end(), RestingOrder{order.order_appl_seq_num, remaining_quantity});
       level.total_quantity += remaining_quantity;
       order_price[order.order_appl_seq_num] = OrderInfo{best_price, order.side, position};
     } else {
-      BidLevels::iterator best_bid = bids.begin();
-      BookLevel& opposite_level = best_bid->second;
-      while (opposite_level.total_quantity > 0) {
-        RestingOrder& resting_order = opposite_level.orders.front();
-        int64_t traded_quantity = resting_order.remaining_quantity;
-        record_trade(best_price, traded_quantity);
-        remaining_quantity -= traded_quantity;
-        opposite_level.total_quantity -= traded_quantity;
-        order_price.erase(resting_order.order_appl_seq_num);
-        opposite_level.orders.pop_front();
-      }
-      bids.erase(best_bid);
-
       BookLevel& level = asks[best_price];
       OrderQueue::iterator position = level.orders.insert(
           level.orders.end(), RestingOrder{order.order_appl_seq_num, remaining_quantity});
@@ -301,29 +205,13 @@ void OrderBook::apply_market_order(Order& order) {
     return;
   }
 
-  // trade at slippage price
+  // 跨价分支逐档决定成交价，避免把后续档位的成交也记在第一档价格上。
   if (order.side == '1') {
     while (remaining_quantity > 0 && !asks.empty()) {
       AskLevels::iterator best_ask = asks.begin();
-      BookLevel& level = best_ask->second;
-
-      while (remaining_quantity > 0 && level.total_quantity > 0) {
-        RestingOrder& resting_order = level.orders.front();
-        int64_t traded_quantity = std::min(remaining_quantity, resting_order.remaining_quantity);
-        record_trade(best_ask->first, traded_quantity);
-        remaining_quantity -= traded_quantity;
-        resting_order.remaining_quantity -= traded_quantity;
-        level.total_quantity -= traded_quantity;
-
-        if (resting_order.remaining_quantity == 0) {
-          order_price.erase(resting_order.order_appl_seq_num);
-          level.orders.pop_front();
-        }
-      }
-
-      if (level.total_quantity == 0) {
-        asks.erase(best_ask);
-      }
+      int64_t traded_quantity = std::min(remaining_quantity, best_ask->second.total_quantity);
+      execute_trade(best_ask->first, traded_quantity, false, true);
+      remaining_quantity -= traded_quantity;
     }
 
     return;
@@ -331,25 +219,9 @@ void OrderBook::apply_market_order(Order& order) {
 
   while (remaining_quantity > 0 && !bids.empty()) {
     BidLevels::iterator best_bid = bids.begin();
-    BookLevel& level = best_bid->second;
-
-    while (remaining_quantity > 0 && level.total_quantity > 0) {
-      RestingOrder& resting_order = level.orders.front();
-      int64_t traded_quantity = std::min(remaining_quantity, resting_order.remaining_quantity);
-      record_trade(best_bid->first, traded_quantity);
-      remaining_quantity -= traded_quantity;
-      resting_order.remaining_quantity -= traded_quantity;
-      level.total_quantity -= traded_quantity;
-
-      if (resting_order.remaining_quantity == 0) {
-        order_price.erase(resting_order.order_appl_seq_num);
-        level.orders.pop_front();
-      }
-    }
-
-    if (level.total_quantity == 0) {
-      bids.erase(best_bid);
-    }
+    int64_t traded_quantity = std::min(remaining_quantity, best_bid->second.total_quantity);
+    execute_trade(best_bid->first, traded_quantity, true, false);
+    remaining_quantity -= traded_quantity;
   }
 }
 
@@ -382,32 +254,16 @@ void OrderBook::apply_order_in_acution(Order& order) {
 void OrderBook::apply_limit_order(Order& order) {
   int64_t remaining_quantity = order.quantity;
 
-  // buy
+  // 买单依次吃卖档；本函数只决定可成交价格和数量，逐单扣量交给公共方法。
   if (order.side == '1') {
     while (remaining_quantity > 0 && !asks.empty()) {
       AskLevels::iterator best_ask = asks.begin();
       if (best_ask->first > order.price) {
         break;
       }
-      BookLevel& level = best_ask->second;
-
-      while (remaining_quantity > 0 && level.total_quantity > 0) {
-        RestingOrder& resting_order = level.orders.front();
-        int64_t traded_quantity = std::min(remaining_quantity, resting_order.remaining_quantity);
-        record_trade(best_ask->first, traded_quantity);
-        remaining_quantity -= traded_quantity;
-        resting_order.remaining_quantity -= traded_quantity;
-        level.total_quantity -= traded_quantity;
-
-        if (resting_order.remaining_quantity == 0) {
-          order_price.erase(resting_order.order_appl_seq_num);
-          level.orders.pop_front();
-        }
-      }
-
-      if (level.total_quantity == 0) {
-        asks.erase(best_ask);
-      }
+      int64_t traded_quantity = std::min(remaining_quantity, best_ask->second.total_quantity);
+      execute_trade(best_ask->first, traded_quantity, false, true);
+      remaining_quantity -= traded_quantity;
     }
 
     if (remaining_quantity > 0) {
@@ -421,31 +277,15 @@ void OrderBook::apply_limit_order(Order& order) {
     return;
   }
 
-  // sell
+  // 卖单执行镜像流程：每次只消耗当前买档，下一轮重新取得最优买价。
   while (remaining_quantity > 0 && !bids.empty()) {
     BidLevels::iterator best_bid = bids.begin();
     if (best_bid->first < order.price) {
       break;
     }
-    BookLevel& level = best_bid->second;
-
-    while (remaining_quantity > 0 && level.total_quantity > 0) {
-      RestingOrder& resting_order = level.orders.front();
-      int64_t traded_quantity = std::min(remaining_quantity, resting_order.remaining_quantity);
-      record_trade(best_bid->first, traded_quantity);
-      remaining_quantity -= traded_quantity;
-      resting_order.remaining_quantity -= traded_quantity;
-      level.total_quantity -= traded_quantity;
-
-      if (resting_order.remaining_quantity == 0) {
-        order_price.erase(resting_order.order_appl_seq_num);
-        level.orders.pop_front();
-      }
-    }
-
-    if (level.total_quantity == 0) {
-      bids.erase(best_bid);
-    }
+    int64_t traded_quantity = std::min(remaining_quantity, best_bid->second.total_quantity);
+    execute_trade(best_bid->first, traded_quantity, true, false);
+    remaining_quantity -= traded_quantity;
   }
 
   if (remaining_quantity > 0) {
@@ -520,14 +360,65 @@ void OrderBook::apply_cancel(const Trade& trade) {
   return;
 }
 
-void OrderBook::record_trade(int64_t price, int64_t quantity) {
-  if (trade_number == 0) {
-    opening_price = price;
+void OrderBook::execute_trade(int64_t price, int64_t quantity, bool reduce_bids, bool reduce_asks) {
+  // quantity 是调用方已经确定的成交量。一次调用可能涉及同价多单，
+  // 集合竞价还可能跨过不同挂价，因此循环按 FIFO 队首拆成逐单配对。
+  int64_t remaining_quantity = quantity;
+  while (remaining_quantity > 0) {
+    int64_t traded_quantity = remaining_quantity;
+    if (reduce_bids) {
+      traded_quantity =
+          std::min(traded_quantity, bids.begin()->second.orders.front().remaining_quantity);
+    }
+    if (reduce_asks) {
+      traded_quantity =
+          std::min(traded_quantity, asks.begin()->second.orders.front().remaining_quantity);
+    }
+
+    // 先确定这一对订单能成交多少，再用同一数量扣减所选侧。
+    // 连续撮合只选对手侧；集合竞价选两侧，但仍表示同一笔成交。
+    if (reduce_bids) {
+      BidLevels::iterator bid = bids.begin();
+      BookLevel& level = bid->second;
+      RestingOrder& order = level.orders.front();
+      order.remaining_quantity -= traded_quantity;
+      level.total_quantity -= traded_quantity;
+      if (order.remaining_quantity == 0) {
+        // 先删索引再删节点；节点删除后，order 引用和索引中的迭代器都不能再使用。
+        order_price.erase(order.order_appl_seq_num);
+        level.orders.pop_front();
+      }
+      if (level.orders.empty()) {
+        bids.erase(bid);
+      }
+    }
+
+    if (reduce_asks) {
+      AskLevels::iterator ask = asks.begin();
+      BookLevel& level = ask->second;
+      RestingOrder& order = level.orders.front();
+      order.remaining_quantity -= traded_quantity;
+      level.total_quantity -= traded_quantity;
+      if (order.remaining_quantity == 0) {
+        order_price.erase(order.order_appl_seq_num);
+        level.orders.pop_front();
+      }
+      if (level.orders.empty()) {
+        asks.erase(ask);
+      }
+    }
+
+    // 统计放在两侧扣量之后，每次配对只累计一次，避免竞价成交量被算成两倍。
+    // price 始终是实际模拟成交价；竞价时不能用被扣订单的挂价代替它。
+    if (trade_number == 0) {
+      opening_price = price;
+    }
+    ++trade_number;
+    last_price = price;
+    cumulative_trade_quantity_num += traded_quantity;
+    cumulative_turnover_num += price * traded_quantity;
+    remaining_quantity -= traded_quantity;
   }
-  ++trade_number;
-  last_price = price;
-  cumulative_trade_quantity_num += quantity;
-  cumulative_turnover_num += price * quantity;
 }
 
 void OrderBook::find_call_action_result(int64_t& auction_price, int64_t& trade_quantity,
@@ -609,37 +500,8 @@ void OrderBook::finish_call_auction() {
 
   find_call_action_result(auction_price, trade_quantity, remaining_quantity_at_price, side);
 
-  int64_t remaining_quantity = trade_quantity;
-  while (remaining_quantity > 0) {
-    BidLevels::iterator bid = bids.begin();
-    AskLevels::iterator ask = asks.begin();
-    RestingOrder& buy_order = bid->second.orders.front();
-    RestingOrder& sell_order = ask->second.orders.front();
-    int64_t traded_quantity = std::min(
-        remaining_quantity, std::min(buy_order.remaining_quantity, sell_order.remaining_quantity));
-
-    record_trade(auction_price, traded_quantity);
-    remaining_quantity -= traded_quantity;
-    buy_order.remaining_quantity -= traded_quantity;
-    sell_order.remaining_quantity -= traded_quantity;
-    bid->second.total_quantity -= traded_quantity;
-    ask->second.total_quantity -= traded_quantity;
-
-    if (buy_order.remaining_quantity == 0) {
-      order_price.erase(buy_order.order_appl_seq_num);
-      bid->second.orders.pop_front();
-    }
-    if (sell_order.remaining_quantity == 0) {
-      order_price.erase(sell_order.order_appl_seq_num);
-      ask->second.orders.pop_front();
-    }
-    if (bid->second.total_quantity == 0) {
-      bids.erase(bid);
-    }
-    if (ask->second.total_quantity == 0) {
-      asks.erase(ask);
-    }
-  }
+  // 竞价总成交量已由选价过程算出；公共方法同时扣双方最优订单，统一按竞价价格记账。
+  execute_trade(auction_price, trade_quantity, true, true);
 }
 
 Snapshot OrderBook::make_snapshot(const Order& order) {
