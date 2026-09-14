@@ -1,10 +1,10 @@
 #include "order_book.hpp"
 
-#include <algorithm>
 #include <vector>
-#include <iostream>
 
 void OrderBook::fill_snapshot_levels(Snapshot& snapshot) {
+  // 每次重新投影全部五档，保证旧快照复用后不会残留已经删除的价格或数量。
+  // 内部统一按最优到第五档存储，导出时再转换为 v2 的列顺序。
   snapshot.bids.clear();
   snapshot.asks.clear();
 
@@ -29,8 +29,8 @@ void OrderBook::fill_snapshot_levels(Snapshot& snapshot) {
   }
 }
 
-
-void OrderBook::fill_snapshot_statistics(Snapshot& snapshot)  {
+void OrderBook::fill_snapshot_statistics(Snapshot& snapshot) {
+  // 统计值只来自真实 F；限价撮合推演和市价/CYB 回放不会再次累计。
   snapshot.trade_count = trade_count;
   snapshot.last_price = last_trade_price;
   snapshot.cumulative_trade_quantity = cumulative_trade_quantity;
@@ -39,6 +39,7 @@ void OrderBook::fill_snapshot_statistics(Snapshot& snapshot)  {
 }
 
 void OrderBook::make_snapshot(Order& order) {
+  // 继续沿用 v2 的输出范围：只有连续竞价且要求输出的事件创建快照。
   if (!order.generate_snapshot || order.trading_session != TradingSession::ContinuousTrade) {
     return;
   }
@@ -51,11 +52,10 @@ void OrderBook::make_snapshot(Order& order) {
   snapshot.apply_seq_no = order.apply_seq_no;
   snapshot.transaction_time = order.transaction_time;
   snapshot.status = SnapshotStatus::Pending;
-  fill_snapshot_levels(snapshot);
-  fill_snapshot_statistics(snapshot);
   snapshots.push_back(snapshot);
+  // 无待确认成交时可立即输出；否则保留委托原始元信息，等待真实 F 补齐状态。
+  update_previous_snapshot();
 }
-
 
 void OrderBook::make_snapshot(Trade& trade) {
   if (!trade.generate_snapshot || trade.trading_session != TradingSession::ContinuousTrade) {
@@ -70,23 +70,29 @@ void OrderBook::make_snapshot(Trade& trade) {
   snapshot.apply_seq_no = trade.apply_seq_no;
   snapshot.transaction_time = trade.transaction_time;
   snapshot.status = SnapshotStatus::Pending;
-  fill_snapshot_levels(snapshot);
-  fill_snapshot_statistics(snapshot);
   snapshots.push_back(snapshot);
+  // 撤单生成自己的快照，成交本身仍由外层更新对应委托的待确认快照。
+  update_previous_snapshot();
 }
-
 
 void OrderBook::update_previous_snapshot() {
   if (snapshots.empty() || snapshots.back().status != SnapshotStatus::Pending) {
     return;
   }
+
   fill_snapshot_levels(snapshots.back());
   fill_snapshot_statistics(snapshots.back());
+
+  // 三类未完成状态全部结束后才释放快照：市价回放、限价推演的真实成交
+  // 确认，以及创业板暂存单相关成交组。Ready 后不再被后续事件覆盖。
+  if (pending_market_order_appl_seq == 0 && pending_limit_trade_quantity == 0 &&
+      !pending_cyb_group) {
+    snapshots.back().status = SnapshotStatus::Ready;
+  }
 }
 
-
-
 bool OrderBook::pop_snapshot(Snapshot& snapshot) {
+  // 删除行直接跳过；Pending 行阻止后续行越过它，保持事件输出顺序。
   while (!snapshots.empty() && snapshots.front().status == SnapshotStatus::Deleted) {
     snapshots.pop_front();
   }
@@ -96,4 +102,9 @@ bool OrderBook::pop_snapshot(Snapshot& snapshot) {
   snapshot = snapshots.front();
   snapshots.pop_front();
   return true;
+}
+
+std::vector<Snapshot> OrderBook::get_snapshots() {
+  // 保留原有查询接口；返回当前缓存的副本，不改变流式输出队列和快照状态。
+  return std::vector<Snapshot>(snapshots.begin(), snapshots.end());
 }

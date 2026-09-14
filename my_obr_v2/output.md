@@ -1,7 +1,62 @@
 # my_obr_v2 崩溃与逻辑审查
 
+## 修复更新：保留当前方法结构
+
+已在用户当前实现基础上修复下列问题。保留全部原有业务方法名、签名、文件分工、
+market/CYB 缓存及 handle/replay 流程；execute_trade、get_snapshots 仅补全原来已有的声明。
+没有引入 consume_order、add_resting_order 等新方法。仅显式禁止原本不安全的隐式复制，
+不新增可调用业务方法。C++11、合法输入和中文注释要求继续适用。
+
+| 原报告项 | 本次处理 |
+| --- | --- |
+| A1、A4：无效/悬空 position | apply_cancel 先分市价、未定价、暂存、可见状态；部分保留余量，全成/全撤同步清索引，只有可见原单才访问 position |
+| A2：CYB 错容器删除 | 回放调用已有 execute_trade，再复用 apply_cancel 按原单 side 清理正确档位 |
+| A3、B6：市价余量价格错误 | 回放只由真实 F 更新最后价格，余量通过已有入簿方法统一档位 key 与索引 price |
+| A5：阶段未初始化 | 原构造函数显式初始化 trading_session |
+| A6：特殊路由/空簿/复制风险 | 同 F 只入一份缓存，双方独立按实际状态扣量；CYB 不再无条件读取两边 begin；空 BBO 不虚构档位；禁用默认复制 |
+| B1：没有 Ready | update_previous_snapshot 在所有等待状态结束后设 Ready；普通未成交单立即完成，普通 limit 的 F 确认齐后立即完成 |
+| B2：竞价未扣盘 | F 累计本阶段独立价量，保留原 finish_call_auction/execute_auction_trade 结算，阶段切换和 EOF 均覆盖，统计不再重复 |
+| B3：nts 双计 | record_trade 只在 apply 处理真实 F 时调用，推演和回放不再累计 |
+| B4：EOF 遗留缓存 | 原 finish 回放市价、CYB 并结算竞价，随后完成旧快照 |
+| B5：暂存余量/激活/旧快照 | 回放扣清暂存原单，按原到达 FIFO 恢复合格余量，在新事件前更新并完成旧快照 |
+| B7：丢弃整段 F | 外层完成互斥路由，replay_CYB_trades 逐条执行，不再 return 后 clear 未处理的尾部 |
+| B8：非 C++11 初始化 | 原位置改为 C++11 聚合初始化，严格 C++11 强告警检查通过 |
+
+另补齐没有任何 F 的市价单分次撤销：未定价余量保存在原索引的 unpriced_quantity，
+不会丢失或进入可见档位；后续收到真实 F 时复用原市价缓存，按该组最后一笔 F 定价。
+新增等待字段只记录确认量、阶段量和当前组状态，未更换原有方法结构。
+
+普通 limit 提前撮合与 CYB 回放不能竞争同一份对手量，因此有暂存参与的整组关闭提前撮合，
+统一按真实 F 扣引用并在组末输出。仍沿用用户的 102%/98% 暂存口径、CAA 同值 Order 优先，
+普通推演对应 F 必须在下一事件组之前完整到齐；不扩展现行交易所规则或跨组延迟 F 模型。
+
+**最终验证：32 个核心/状态组合场景、2770 项断言通过；5 组完整 CLI 回放，
+11 行输出的 330 个字段与独立预期一致。严格 C++11、全部告警视为错误和 ASan/UBSan
+均通过。** 其中双暂存、市价对暂存的 3 项为内部状态组合夹具，不声称完整交易所行情。
+
+头文件逐项比对确认原有 27 个业务方法的声明/签名均保持不变；未定价余量多次撤单、
+后续多价 F 按最后价格入簿、其他事件快照保留，以及禁止复制/赋值均已验证。
+格式与 diff 检查通过，临时 CSV、驱动和二进制不进入提交。
+
+实际验证使用的命令（工作区根）：
+
+```bash
+python3 quant/obr/.v2_fix_validation/run.py
+clang++ -std=c++11 -pedantic-errors -Wall -Wextra -Wconversion -Wsign-conversion -Wshadow -Werror -Iquant/my_obr_v2/include -fsyntax-only quant/my_obr_v2/src/*.cpp
+/opt/homebrew/bin/clang-format --style=file:quant/obr/.clang-format --dry-run --Werror quant/my_obr_v2/include/order_book.hpp quant/my_obr_v2/src/*.cpp
+git -C quant diff --check
+```
+
+临时验证脚本分别以 -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer
+构建核心驱动和 CLI；追加组合/多价验证后，对原 26 场景和 5 组 CLI 再跑一次回归。
+完整结果与准确命令在工作区根 my_obr_v2_fix_validation.txt，
+方法签名/格式核对在 my_obr_v2_fix_structure_validation.txt。
+下面保留原报告，行号固定于修复前的 cc09358，不能把历史崩溃结果理解为修复后的结果。
+
+## 修复前审查记录
+
 审查基准：`main` 的 `cc093587247641b15bec018fb00478bd3d912ff6`（提交说明 `tmp`）。
-以下文件行号均对应这个提交。本轮只写报告，没有改动生产源码、架构、方法名或新增方法。
+以下文件行号均对应这个提交。该次审查只写报告，没有改动生产源码；后续修复情况见上节。
 
 **最贴近你描述的原因已经复现：创业板暂存单部分撤销时被整条移出暂存表，
 但仍保留没有绑定链表节点的 position；第二次撤销剩余数量时，在

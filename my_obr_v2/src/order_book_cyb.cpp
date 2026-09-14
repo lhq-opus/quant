@@ -1,143 +1,63 @@
 #include "order_book.hpp"
 
-#include <algorithm>
 #include <vector>
-#include <iostream>
 
-void OrderBook::handle_pending_CYB_limit_order(Order &order)
-{
-    if (!order.is_CYB)
-    {
-        return;
-    }
-
-    replay_CYB_trades(pending_CYB_trades);
-
-    pending_CYB_trades.clear();
+void OrderBook::handle_pending_CYB_limit_order(Order&) {
+  // 下一张委托是旧事件组边界：整组先回放再清缓存。真实 F 的统计已经在 apply
+  // 中累计，旧快照的完成由外层在处理新委托之前统一决定。
+  replay_CYB_trades(pending_CYB_trades);
+  pending_CYB_trades.clear();
+  update_previous_snapshot();
 }
 
-void OrderBook::handle_pending_CYB_limit_order(Trade &trade)
-{
-    if (!trade.is_CYB)
-    {
-        return;
-    }
-
-    if (trade.trade_type == TradeType::Normal)
-    {
-
-        if (pending_limit_order_alive.find(trade.bid_appl_seq_num) != pending_limit_order_alive.end())
-        {
-            pending_CYB_trades.push_back(trade);
-        }
-
-        if (pending_limit_order_alive.find(trade.offer_appl_seq_num) != pending_limit_order_alive.end())
-        {
-            pending_CYB_trades.push_back(trade);
-        }
-
-        return;
-    }
-
-    bool replay_caused_by_cancel = false;
-
-    if (trade.trade_type == TradeType::Cancel && pending_CYB_trades.size() != 0)
-    {
-        Trade trade = pending_CYB_trades[0];
-
-        int64_t bid_price = order_info_map[trade.bid_appl_seq_num].price;
-        int64_t ask_price = order_info_map[trade.offer_appl_seq_num].price;
-
-        int64_t best_bids = bids.begin()->first;
-        int64_t best_asks = asks.begin()->first;
-
-        if (pending_limit_order_alive.find(trade.bid_appl_seq_num) != pending_limit_order_alive.end())
-        {
-
-            replay_caused_by_cancel = best_asks != ask_price;
-        }
-
-        if (pending_limit_order_alive.find(trade.offer_appl_seq_num) != pending_limit_order_alive.end())
-        {
-            replay_caused_by_cancel = best_bids != bid_price;
-        }
-    }
-
-    replay_CYB_trades(pending_CYB_trades);
-
-    if (!replay_caused_by_cancel)
-    {
-        update_previous_snapshot();
-    }
-
-    pending_CYB_trades.clear();
+void OrderBook::handle_pending_CYB_limit_order(Trade& trade) {
+  if (trade.trade_type == TradeType::Normal) {
+    // 外层已经将市价关联 F 分给市价缓存。这里无论一侧还是两侧暂存，只存一次，
+    // 也保存暂存参与事件组中普通可见订单的 F，保持该组真实成交的先后次序。
+    pending_CYB_trades.push_back(trade);
+    return;
+  }
+  // 当前撤单之前的 F 属于上一组；先还原旧盘口。不要无条件读取两侧 begin，
+  // 单边没有可见订单同样是合法的业务状态。
+  replay_CYB_trades(pending_CYB_trades);
+  pending_CYB_trades.clear();
+  update_previous_snapshot();
 }
 
-void OrderBook::replay_CYB_trades(std::vector<Trade> trades)
-{
+void OrderBook::replay_CYB_trades(std::vector<Trade> trades) {
+  // 统一按两侧原单扣量：暂存原单自身也要扣，订单全成时同步删除其状态与索引。
+  // 不再因一条 F 属于市价/暂存就 return 丢弃整个尾部，也不另外累计成交统计。
+  for (std::size_t index = 0; index < trades.size(); ++index) {
+    execute_trade(trades[index]);
+  }
 
-    for (int64_t i = 0; i < trades.size(); i++)
-    {
-
-        Trade trade = trades[i];
-
-        int64_t quantity = trade.quantity;
-
-        if (order_info_map.find(trade.bid_appl_seq_num) == order_info_map.end() || order_info_map.find(trade.offer_appl_seq_num) == order_info_map.end())
-        {
-            return;
-        }
-
-        int64_t bid_price = order_info_map[trade.bid_appl_seq_num].price;
-        int64_t ask_price = order_info_map[trade.offer_appl_seq_num].price;
-
-        if (bid_price == DROP_SIGNAL || ask_price == DROP_SIGNAL)
-        {
-            return;
-        }
-
-        if (pending_limit_order_alive.find(trade.bid_appl_seq_num) != pending_limit_order_alive.end())
-        {
-            // bid: pendind; ask normal
-            int64_t ask_order_seq_num = trade.offer_appl_seq_num;
-            std::map<int64_t, OrderInfo>::const_iterator ask_info = order_info_map.find(ask_order_seq_num);
-            AskLevels::iterator ask = asks.find(ask_info->second.price);
-
-            OrderQueue::iterator position = ask_info->second.position;
-            position->remaining_quantity -= trade.quantity;
-            ask->second.total_quantity -= trade.quantity;
-
-            if (position->remaining_quantity == 0)
-            {
-                ask->second.orders.erase(position);
-            }
-
-            if (ask->second.total_quantity == 0)
-            {
-                asks.erase(ask);
-            }
-        }
-        else
-        {
-            // bid: normal; ask pending
-            int64_t bid_order_seq_num = trade.bid_appl_seq_num;
-            std::map<int64_t, OrderInfo>::const_iterator bid_info = order_info_map.find(bid_order_seq_num);
-            BidLevels::iterator bid = bids.find(bid_info->second.price);
-
-            OrderQueue::iterator position = bid_info->second.position;
-            position->remaining_quantity -= trade.quantity;
-            bid->second.total_quantity -= trade.quantity;
-
-            if (position->remaining_quantity == 0)
-            {
-                bid->second.orders.erase(position);
-            }
-
-            if (bid->second.total_quantity == 0)
-            {
-                asks.erase(bid);
-            }
-        }
-        record_trade(trade.price, trade.quantity);
+  // 每轮基于同一盘口收集能够恢复展示的余量，再统一入簿；恢复后的新最优价
+  // 可能影响其他暂存单，因此重复直到没有新增合格订单。空缓存也执行这一段，
+  // 以覆盖只有撤单/档位变化而没有 F 的激活。竞价阶段则解除连续竞价笼子。
+  while (!pending_limit_order_alive.empty()) {
+    std::vector<int64_t> activated;
+    for (std::map<int64_t, Order>::const_iterator held = pending_limit_order_alive.begin();
+         held != pending_limit_order_alive.end(); ++held) {
+      const Order& order = held->second;
+      bool outside = false;
+      if (trading_session == TradingSession::ContinuousTrade) {
+        outside = (order.side == EventSide::Buy && !asks.empty() &&
+                   order.price * 100 > asks.begin()->first * BID_COEFFICIENT) ||
+                  (order.side == EventSide::Sell && !bids.empty() &&
+                   order.price * 100 < bids.begin()->first * ASK_COEFFICIENT);
+      }
+      if (!outside) {
+        activated.push_back(held->first);
+      }
     }
+    if (activated.empty()) {
+      break;
+    }
+    for (std::size_t index = 0; index < activated.size(); ++index) {
+      std::map<int64_t, Order>::iterator held = pending_limit_order_alive.find(activated[index]);
+      // 复用现有只入簿方法，按原到达次序恢复 FIFO；不调用 limit 再推演成交。
+      apply_order_in_acution(held->second);
+      pending_limit_order_alive.erase(held);
+    }
+  }
 }
