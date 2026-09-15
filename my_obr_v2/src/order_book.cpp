@@ -61,20 +61,33 @@ void OrderBook::apply(Trade& trade) {
                                 trade.offer_appl_seq_num == pending_market_order_appl_seq);
 
     // 市价相关撤单已在它自己的回放中扣量，外层不能再扣第二次。
-    // CYB 先回放旧组，随后当前撤单只修改自己的原单并生成自己的快照。
+    // CYB 缓存可能包含由当前撤单触发、却先收到的 F；回放时区分其快照归属。
     handle_pending_market_order(trade);
     handle_pending_CYB_limit_order(trade);
     pending_cyb_group = false;
-    update_previous_snapshot();
+    if (!replay_caused_by_cancel) {
+      update_previous_snapshot();
+    }
     pending_limit_order_appl_seq = 0;
     pending_limit_trade_quantity = 0;
     if (!market_cancel) {
       apply_cancel(trade);
     }
 
-    pending_cyb_group = cyb_affected || !pending_limit_order_alive.empty();
+    // 特殊组的全部 F 已经在撤单之前收到；撤单扣量和余量激活后即可完成该行。
+    // 普通撤单仍沿用原来的等待方式，不能把它之后的组提前结束。
+    pending_cyb_group =
+        !replay_caused_by_cancel && (cyb_affected || !pending_limit_order_alive.empty());
     replay_CYB_trades(std::vector<Trade>());
-    make_snapshot(trade);
+    if (replay_caused_by_cancel) {
+      // 普通 F 的输出标记为 false，这里沿用撤单的输出开关，元信息取首笔 F。
+      // 这一行包含整组成交及撤单后的盘口，不再另外生成一条 cancel 行。
+      cyb_first_trade.generate_snapshot = trade.generate_snapshot;
+      make_snapshot(cyb_first_trade);
+    } else {
+      make_snapshot(trade);
+    }
+    replay_caused_by_cancel = false;
     return;
   }
 
@@ -102,13 +115,17 @@ void OrderBook::apply(Trade& trade) {
                              trade.offer_appl_seq_num == pending_market_order_appl_seq);
   const bool held_trade = pending_limit_order_alive.count(trade.bid_appl_seq_num) != 0 ||
                           pending_limit_order_alive.count(trade.offer_appl_seq_num) != 0;
+  const bool cyb_trade = !market_trade && (pending_cyb_group || held_trade);
   const bool predicted_trade = !pending_cyb_group && !market_trade && !held_trade &&
                                pending_limit_trade_quantity > 0 &&
                                (trade.bid_appl_seq_num == pending_limit_order_appl_seq ||
                                 trade.offer_appl_seq_num == pending_limit_order_appl_seq);
 
-  // 唯一真实成交统计入口。下面的推演确认、回放与 execute_trade 都不再累计。
-  record_trade(trade.price, trade.quantity);
+  // CYB 缓存要等后到撤单才能判断归属，价量和统计都延迟到回放时处理。
+  // 其他 F 仍在到达时统计一次，市价回放和限价推演确认不重复累计。
+  if (!cyb_trade) {
+    record_trade(trade.price, trade.quantity);
+  }
   if (predicted_trade) {
     pending_limit_trade_quantity -= trade.quantity;
     if (pending_limit_trade_quantity == 0) {
@@ -123,7 +140,9 @@ void OrderBook::apply(Trade& trade) {
   } else {
     execute_trade(trade);
   }
-  update_previous_snapshot();
+  if (!cyb_trade) {
+    update_previous_snapshot();
+  }
 }
 
 void OrderBook::apply_market_order(Order& order) {
@@ -290,7 +309,8 @@ void OrderBook::execute_trade(Trade& trade) {
 }
 
 void OrderBook::record_trade(int64_t price, int64_t quantity) {
-  // 只有 apply 收到真实 Normal F 时调用一次，回放、推演和撤单不进入这里。
+  // 每笔真实 F 只调用一次：普通/市价/竞价在 apply 中，CYB 缓存则在回放中。
+  // 推演和撤单不进入这里；CYB 延迟统计是为了先确定 F 应归属哪张快照。
   ++trade_count;
   last_trade_price = price;
   cumulative_trade_quantity += quantity;
@@ -352,6 +372,9 @@ void OrderBook::finish() {
   if (pending_market_order_appl_seq != 0) {
     replay_pending_market_order(pending_market_order_trades);
   }
+  // EOF/阶段边界没有后到的触发撤单，缓存仍归属当前事件组。
+  cyb_replay_has_cancel = false;
+  replay_caused_by_cancel = false;
   replay_CYB_trades(pending_CYB_trades);
   pending_CYB_trades.clear();
   pending_cyb_group = false;

@@ -30,7 +30,8 @@ void OrderBook::fill_snapshot_levels(Snapshot& snapshot) {
 }
 
 void OrderBook::fill_snapshot_statistics(Snapshot& snapshot) {
-  // 统计值只来自真实 F；限价撮合推演和市价/CYB 回放不会再次累计。
+  // 统计值只来自真实 F；CYB 缓存延迟到回放时累计，其余 F 到达时累计。
+  // 本方法仅复制已经确定归属的统计，限价推演和快照刷新都不增加笔数或量额。
   snapshot.trade_count = trade_count;
   snapshot.last_price = last_trade_price;
   snapshot.cumulative_trade_quantity = cumulative_trade_quantity;
@@ -71,7 +72,8 @@ void OrderBook::make_snapshot(Trade& trade) {
   snapshot.transaction_time = trade.transaction_time;
   snapshot.status = SnapshotStatus::Pending;
   snapshots.push_back(snapshot);
-  // 撤单生成自己的快照，成交本身仍由外层更新对应委托的待确认快照。
+  // 通常由撤单生成快照；创业板撤单触发但 F 先到的组，由外层传入首笔 F，
+  // 沿用同一个生成入口，使元信息属于首笔 F，盘口和统计包含整组及触发撤单。
   update_previous_snapshot();
 }
 

@@ -107,6 +107,12 @@ private:
   // 创业板当前事件组的真实 F；外层保证每条成交只进入一份缓存。
 
   std::vector<Trade> pending_CYB_trades;
+  // 仅在撤单入口回放缓存时识别“F 在前、触发撤单在后”的创业板特性。
+  // 保存撤单用于判断它是否删掉当前最优档；首笔相关 F 保存新快照的元信息。
+  bool cyb_replay_has_cancel = false;
+  bool replay_caused_by_cancel = false;
+  Trade cyb_cancel_trade = {};
+  Trade cyb_first_trade = {};
 
   struct BidCompare {
     bool operator()(const Event& a, const Event& b) const {
