@@ -30,8 +30,8 @@ void OrderBook::fill_snapshot_levels(Snapshot& snapshot) {
 }
 
 void OrderBook::fill_snapshot_statistics(Snapshot& snapshot) {
-  // 统计值只来自真实 F；CYB 缓存延迟到回放时累计，其余 F 到达时累计。
-  // 本方法仅复制已经确定归属的统计，限价推演和快照刷新都不增加笔数或量额。
+  // 限价/解冻单在撮合时累计量额和最新价，真实 F 补笔数；市价、竞价以及
+  // 撤单触发的特殊组按真实 F 完整统计。本方法只复制，不再增加任何统计量。
   snapshot.trade_count = trade_count;
   snapshot.last_price = last_trade_price;
   snapshot.cumulative_trade_quantity = cumulative_trade_quantity;
@@ -54,7 +54,7 @@ void OrderBook::make_snapshot(Order& order) {
   snapshot.transaction_time = order.transaction_time;
   snapshot.status = SnapshotStatus::Pending;
   snapshots.push_back(snapshot);
-  // 无待确认成交时可立即输出；否则保留委托原始元信息，等待真实 F 补齐状态。
+  // 保留原委托元信息，下一 Order/Cancel 或 EOF 前补齐本组真实笔数后再输出。
   update_previous_snapshot();
 }
 
@@ -85,10 +85,9 @@ void OrderBook::update_previous_snapshot() {
   fill_snapshot_levels(snapshots.back());
   fill_snapshot_statistics(snapshots.back());
 
-  // 市价回放、限价推演确认及创业板组都完成后才释放快照。
-  // 无成交价且已结束成交组的市价余量仅等待撤销，不阻止新限价单确认和输出。
-  if (pending_market_order_appl_seq == 0 && pending_limit_trade_quantity == 0 &&
-      !pending_cyb_group) {
+  // 在下一 Order/Cancel 或 EOF 结束当前组后释放快照，不再等待限价确认量归零。
+  // 无成交价且已结束成交组的市价余量仅等待撤销，不额外阻止新限价组完成。
+  if (pending_market_order_appl_seq == 0 && !pending_cyb_group) {
     snapshots.back().status = SnapshotStatus::Ready;
   }
 }

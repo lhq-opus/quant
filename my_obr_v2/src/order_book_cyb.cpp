@@ -1,9 +1,10 @@
 #include "order_book.hpp"
 
+#include <algorithm>
 #include <vector>
 
 void OrderBook::handle_pending_CYB_limit_order(Order&) {
-  // 下一张委托是旧事件组边界：整组先回放并统计，再清缓存。
+  // 下一张委托是旧事件组边界：补齐本组真实成交笔数，再清缓存。
   // 本入口没有触发撤单，旧快照的完成由外层在处理新委托之前统一决定。
   cyb_replay_has_cancel = false;
   replay_caused_by_cancel = false;
@@ -14,8 +15,8 @@ void OrderBook::handle_pending_CYB_limit_order(Order&) {
 
 void OrderBook::handle_pending_CYB_limit_order(Trade& trade) {
   if (trade.trade_type == TradeType::Normal) {
-    // 外层已经将市价关联 F 分给市价缓存。这里无论一侧还是两侧暂存，只存一次，
-    // 也保存暂存参与事件组中普通可见订单的 F，保持该组真实成交的先后次序。
+    // 市价关联 F 已由外层分流。其余 CYB F 按原顺序缓存，组末补笔数，
+    // 并在 Cancel 边界识别尚未提前撮合的撤单触发成交。
     pending_CYB_trades.push_back(trade);
     return;
   }
@@ -33,8 +34,8 @@ void OrderBook::handle_pending_CYB_limit_order(Trade& trade) {
 }
 
 void OrderBook::replay_CYB_trades(std::vector<Trade> trades) {
-  // 统一按两侧原单扣量：暂存原单自身也要扣，订单全成时同步删除其状态与索引。
-  // CYB F 到达时尚未统计；在回放中按先后顺序扣盘并且只累计一次。
+  // 普通限价及其解冻单已经撮合，回放只补真实笔数。
+  // 后到撤单触发的特殊组此前没有扣盘，识别组起点后才按双方引用执行并统计。
   for (std::size_t index = 0; index < trades.size(); ++index) {
     if (cyb_replay_has_cancel && !replay_caused_by_cancel) {
       // 普通成交前缀可能已经让其他暂存单恢复展示；此前市价回放也可能改变最优档。
@@ -73,13 +74,17 @@ void OrderBook::replay_CYB_trades(std::vector<Trade> trades) {
         cyb_first_trade = current;
       }
     }
-    execute_trade(trades[index]);
-    record_trade(trades[index].price, trades[index].quantity);
+    if (replay_caused_by_cancel) {
+      execute_trade(trades[index]);
+      record_trade(trades[index].price, trades[index].quantity);
+    } else {
+      ++trade_count;
+    }
   }
 
-  // 每轮基于同一盘口收集能够恢复展示的余量，再统一入簿；恢复后的新最优价
-  // 可能影响其他暂存单，因此重复直到没有新增合格订单。空缓存也执行这一段，
-  // 以覆盖只有撤单/档位变化而没有 F 的激活。竞价阶段则解除连续竞价笼子。
+  // 每轮基于同一盘口收集合格暂存单，再按价优/原到达顺序直接撮合，余量入簿。
+  // 撮合后的最优价可能继续解冻其他订单，因此重复直到没有新增合格订单。
+  // 空缓存也执行这一段；竞价阶段则解除连续竞价笼子，只入簿、不提前撮合。
   while (!pending_limit_order_alive.empty()) {
     std::vector<int64_t> activated;
     for (std::map<int64_t, Order>::const_iterator held = pending_limit_order_alive.begin();
@@ -99,11 +104,33 @@ void OrderBook::replay_CYB_trades(std::vector<Trade> trades) {
     if (activated.empty()) {
       break;
     }
+    // 同轮解冻的同侧订单按价格优先，同价沿用原到达次序；不能按 map 中的
+    // 订单号先后撮合，否则较低优先级的暂存单会先消耗对手量。
+    std::sort(activated.begin(), activated.end(), [this](int64_t left_id, int64_t right_id) {
+      const Order& left = pending_limit_order_alive.find(left_id)->second;
+      const Order& right = pending_limit_order_alive.find(right_id)->second;
+      if (left.side != right.side) {
+        return left.side == EventSide::Buy;
+      }
+      if (left.price != right.price) {
+        return left.side == EventSide::Buy ? left.price > right.price : left.price < right.price;
+      }
+      return order_arrival_rank.find(left_id)->second < order_arrival_rank.find(right_id)->second;
+    });
     for (std::size_t index = 0; index < activated.size(); ++index) {
       std::map<int64_t, Order>::iterator held = pending_limit_order_alive.find(activated[index]);
-      // 复用现有只入簿方法，按原到达次序恢复 FIFO；不调用 limit 再推演成交。
-      apply_order_in_acution(held->second);
+      // 先移除冻结态及没有节点的占位索引，再让原方法负责全成清理或余量入簿。
+      // 拷贝保存原单，避免 erase 后继续引用已失效的 map 元素。
+      Order order = held->second;
       pending_limit_order_alive.erase(held);
+      order_info_map.erase(order.order_appl_seq_num);
+      if (trading_session == TradingSession::ContinuousTrade) {
+        apply_limit_order(order);
+        // 本单完成后可能又解冻价格更优的旧单，重新收集，不能先把原批次撮合完。
+        break;
+      } else {
+        apply_order_in_acution(order);
+      }
     }
   }
 }

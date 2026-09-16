@@ -74,7 +74,7 @@ private:
   std::map<int64_t, int64_t> order_arrival_rank;
   int64_t next_arrival_rank = 0;
 
-  // 仅由真实 F 累计的全日成交统计。
+  // 全日成交统计：限价撮合立即累计量额/最新价，笔数由真实 F 确定。
 
   int64_t cumulative_trade_quantity = 0;
   int64_t cumulative_turnover = 0;
@@ -83,10 +83,8 @@ private:
   int64_t opening_price = 0;
 
   std::deque<Snapshot> snapshots;
-  // 普通限价只提前扣盘口，相关真实 F 确认完这一份量后才允许输出快照。
-  int64_t pending_limit_order_appl_seq = 0;
-  int64_t pending_limit_trade_quantity = 0;
-  // 有暂存单时等待整组快照；新限价自身仍可预测，解冻单 F 另外按真实引用回放。
+  // 沿用原组标志等待下一 Order/Cancel 或 EOF，届时当前组真实 F 已全部到齐。
+  // 普通限价组也使用这一边界，不再保存限价待确认序号和数量。
   bool pending_cyb_group = false;
   // 每段竞价的成交量独立于全日累计量；结算只扣盘，不重复统计真实 F。
   int64_t auction_trade_quantity = 0;

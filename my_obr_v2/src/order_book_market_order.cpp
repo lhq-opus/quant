@@ -94,7 +94,8 @@ void OrderBook::replay_pending_market_order(std::vector<Trade> trades) {
   pending_market_has_snapshot = false;
   pending_market_order_trades.clear();
 
-  // 市价部分完成并不代表同组成交涉及的创业板暂存单也已完成；统一由快照
-  // 方法根据所有待确认状态决定是否 Ready，避免过早输出中间盘口。
+  // 市价自身先按真实 F 回放，再直接撮合因此解冻的同向旧单。
+  // 本组快照仍等下一事件边界，解冻单随后到达的真实 F 只补笔数。
+  replay_CYB_trades(std::vector<Trade>());
   update_previous_snapshot();
 }

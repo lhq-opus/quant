@@ -1,6 +1,46 @@
 # my_obr_v2 崩溃与逻辑审查
 
-## 本次调整：创业板新限价先完成自身撮合
+## 本次调整：解冻单直接撮合，删除限价等待状态
+
+按用户确认的顺序，`Order A → F(A1) → F(A2) → F(B1) → Order C`，
+由 A 解冻的同向 B 的全部成交，会在下一 Order/Cancel 前收到。
+本次在原方法中完成以下调整，原 27 个业务方法名、签名和文件分工保持不变：
+
+- 删除 `pending_limit_order_appl_seq`、`pending_limit_trade_quantity`，
+  以及 `held_trade/predicted_trade` 分流和待确认数量归零的判断。
+- A 先完成自身撮合，原 CYB 激活循环再调用 `apply_limit_order` 直接撮合 B。
+  多张同侧解冻单按价格、原到达次序处理；每张完成后重新检查新解冻的单。
+  先移除冻结占位索引，再由原方法完成全成清理或余量入簿，避免留下无效 position。
+- `execute_order_at_price` 的单侧撮合当场累计量额和 last price；真实 F 只补笔数，
+  不重复扣盘或累计。双侧竞价结算保持只扣盘口，市价仍按真实 F 定价并完整统计。
+- 沿用 `pending_cyb_group` 等待连续竞价委托组，在下一 Order/Cancel 或 EOF 完成
+  snapshot；不再需要保存限价待确认数量。A 与 B 的量额、笔数和最新价都归 A 的行。
+- 非市价 CYB F 仍由原缓存保留接收顺序，以识别 `F1 → F2 → Cancel` 特性组。
+  普通前缀只补笔数；识别撤单触发组后，先完成旧行，再执行其真实 F，
+  这部分成交仍归首笔 F 元信息的 snapshot，包含后到 Cancel 处理后的盘口。
+
+未新增状态或业务方法；输入输出列、CAA 归并、市价行保留策略均未改动。
+全部连续竞价委托行（包括无成交的委托）统一等到组边界完成，这是删除等待数量后的输出时机。
+继续使用 C++11 和中文注释，不增加输入格式防御逻辑。
+
+验证通过 68 个合法场景：497 行、14910 个完整 CSV 字段与独立预期一致，
+34445 项即时统计、原单余量、position、FIFO、档位汇总及快照状态检查通过。
+覆盖买卖镜像、部分/全部成交、F 拆分笔数、同侧多价/同价/连续解冻、
+Order/Cancel/EOF 边界、撤单特性组及普通前缀、市价余量/待撤、U 单和开收盘竞价。
+严格 C++11、强告警 `-Werror`、ASan/UBSan、方法签名和格式检查通过。
+
+实际命令（工作区根；临时驱动、CSV 及二进制在提交前删除）：
+
+```bash
+python3 quant/obr/.cyb_cleanup_probe/run.py corrected
+clang++ -std=c++11 -pedantic-errors -Wall -Wextra -Wconversion -Wsign-conversion -Wshadow -Werror -Iquant/my_obr_v2/include -fsyntax-only quant/my_obr_v2/src/*.cpp
+git -C quant diff --check
+```
+
+完整命令与结果在工作区根 `cyb_cleanup_validation.txt`、`cyb_cleanup_structure_validation.txt`。
+下文保留各历史增量当时的行为记录，当前处理时机以本节和 `docs/replay.md` 为准。
+
+## 上一增量：创业板新限价先完成自身撮合
 
 用户确认：买单只解冻同向买单，解冻单不会改变当前买单自己的撮合结果；
 解冻单的成交及 last price 同样归入当前买单 snapshot。卖单处理对称。
