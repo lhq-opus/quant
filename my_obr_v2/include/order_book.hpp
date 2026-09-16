@@ -86,7 +86,7 @@ private:
   // 普通限价只提前扣盘口，相关真实 F 确认完这一份量后才允许输出快照。
   int64_t pending_limit_order_appl_seq = 0;
   int64_t pending_limit_trade_quantity = 0;
-  // 有暂存单参与的组统一按真实引用回放，避免与限价推演争用同一份对手量。
+  // 有暂存单时等待整组快照；新限价自身仍可预测，解冻单 F 另外按真实引用回放。
   bool pending_cyb_group = false;
   // 每段竞价的成交量独立于全日累计量；结算只扣盘，不重复统计真实 F。
   int64_t auction_trade_quantity = 0;

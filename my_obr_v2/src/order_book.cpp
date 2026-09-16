@@ -30,8 +30,8 @@ void OrderBook::apply(Order& order) {
     return;
   }
 
-  // 暂存单可能随盘口变化参与本组成交；这一组不提前撮合普通限价来单，
-  // 而是按真实 F 的双方引用统一回放，避免两种路径扣到同一份数量。
+  // 新限价先完成自身撮合，再处理由它解冻的同向订单；暂存单不阻止新单预测。
+  // 这里只保留整组快照等待，确保解冻单的成交和最后成交价也归当前委托行。
   pending_cyb_group = !pending_limit_order_alive.empty();
   if (order.order_type == OrderType::Limit) {
     apply_limit_order(order);
@@ -115,11 +115,12 @@ void OrderBook::apply(Trade& trade) {
                              trade.offer_appl_seq_num == pending_market_order_appl_seq);
   const bool held_trade = pending_limit_order_alive.count(trade.bid_appl_seq_num) != 0 ||
                           pending_limit_order_alive.count(trade.offer_appl_seq_num) != 0;
-  const bool cyb_trade = !market_trade && (pending_cyb_group || held_trade);
-  const bool predicted_trade = !pending_cyb_group && !market_trade && !held_trade &&
-                               pending_limit_trade_quantity > 0 &&
+  // 当前新单已预测的量优先确认，即使本组还会有解冻单成交，也不能重复扣盘。
+  // 全成原单及对手可能已经删掉，因此用原单序号和确认量识别，不访问其 position。
+  const bool predicted_trade = !market_trade && !held_trade && pending_limit_trade_quantity > 0 &&
                                (trade.bid_appl_seq_num == pending_limit_order_appl_seq ||
                                 trade.offer_appl_seq_num == pending_limit_order_appl_seq);
+  const bool cyb_trade = !predicted_trade && !market_trade && (pending_cyb_group || held_trade);
 
   // CYB 缓存要等后到撤单才能判断归属，价量和统计都延迟到回放时处理。
   // 其他 F 仍在到达时统计一次，市价回放和限价推演确认不重复累计。
@@ -208,12 +209,8 @@ void OrderBook::apply_limit_order(Order& order) {
     pending_cyb_group = true;
     return;
   }
-  if (pending_cyb_group) {
-    // 有暂存单参与的组，来单先全量登记，再按真实 F 的引用扣量。
-    apply_order_in_acution(order);
-    return;
-  }
-
+  // 合格新单先独立完成自身撮合；由盘口变化解冻的同向旧单不会改变这一份成交量。
+  // 自身真实 F 只确认这里的预测量；解冻单 F 由现有 CYB 回放扣量，共用当前快照。
   int64_t remaining_quantity = order.quantity;
   if (order.side == EventSide::Buy) {
     while (remaining_quantity > 0 && !asks.empty() && asks.begin()->first <= order.price) {
