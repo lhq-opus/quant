@@ -1,5 +1,7 @@
 # Agent Adoption and Delivery: Lessons from the Past Year
 
+**Language:** English | [Chinese version](report.zh-CN.md)
+
 **Status:** Working outline — case material and analysis pending.
 
 **Audience:** Leadership at the author's current company.
