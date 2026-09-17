@@ -20,11 +20,21 @@ To be established from the author's input: the organizational context, the autho
 
 Company-wide adoption efforts and department-level delivery practices will be distinguished throughout the report.
 
+## Company Attitudes, Decisions, and Reflection Over Time
+
+To be reconstructed from the events described, rather than the order in which material is received. Stage boundaries, dates, and types of agent application have not yet been established. Uncertain timing and links between events will remain explicit.
+
+For each stage supported by the material, this section will examine the company's attitude toward AI, the decisions made and their context, the state of agent adoption and delivery, and any organizational reflection or subsequent adjustments. It will connect these developments to the relevant cases. Formal company statements and actual actions will be distinguished from the author's observations about the company's attitude; relationships between decisions and outcomes will not be treated as proven causation without supporting evidence.
+
 ## Case Studies
 
-No cases have been supplied yet. Each case will cover the problem and intended outcome, the actions taken, the observed results, the author's reflection, supporting evidence, and implications for the current company.
+No cases have been supplied yet. Each case will identify the type of agent application, use case, relevant company or department, and timing or stage, then cover the problem and intended outcome, the actions taken, the observed results, organizational reflection where reported, the author's reflection, supporting evidence, and implications for the current company.
 
 Successful, unsuccessful, and mixed outcomes will be included as the evidence warrants. Missing information will remain explicit.
+
+## Author's Perspective
+
+No substantive personal views have been supplied yet. This section will bring together the author's assessments of the company's attitudes, decisions, and agent deployments, linked to the relevant stages and cases. Where the material permits, it will distinguish views held at the time from retrospective reflection. The author's personal views will not be presented as company consensus or organizational reflection; editorial inferences will be identified separately.
 
 ## Lessons Across Cases
 
@@ -37,6 +47,9 @@ To be developed after the relevant lessons and the current company's decision co
 ## Open Questions and Evidence Gaps
 
 - What are the exact dates, organizations, and roles covered by this review?
+- How did the company's attitude toward AI, decisions, and reflection develop across stages, and what supports the proposed chronology?
+- How did different types of agent application progress within those stages?
+- Which views represent company positions or organizational reflection, and which are the author's own observations or judgments?
 - Which initiatives illustrate successful, unsuccessful, or mixed outcomes?
 - What public evidence supports the reported actions and results?
 - Which AI decisions and constraints at the current company should the report address?
