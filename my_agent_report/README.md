@@ -1,27 +1,20 @@
-# Agent Adoption and Delivery: Lessons for AI Decision-Making
+# Reading Guide: From Agent Adoption to End-to-End Delivery
 
-I am preparing this report for leadership at my current company, drawing on my agent development work at miHoYo and my observations of its adoption efforts. My earlier experience at ByteDance provides comparative context. The report is written in my first-person voice for upward reporting, with a corresponding Chinese version so I can check completeness and wording.
-
-Read the [working report](report.md).
+I prepared [From Agent Adoption to End-to-End Delivery: Decisions and Lessons from miHoYo](report.md) for leadership at my current company. It draws on my agent development work and observations at miHoYo, with earlier ByteDance experience as comparative background.
 
 [Chinese reading guide](README.zh-CN.md) · [Chinese report](report.zh-CN.md)
 
-**Status:** Working draft. It covers miHoYo's November–December 2025 baseline and shared-platform discussion, Echo's independent emergence and adoption success in my assessment, and the following two to three months of aggressive expansion. Cases include my data-team work, limited attention to Dify, Echo's broad uptake especially outside R&D, at least four or five departmental OpenClaw adaptations, and individual tasks connected to workplace IM chatbots.
+The report is a first-person working draft covering November 2025 through July 2026. Its main thread is the shift from aggressive agent adoption and individual-task productivity toward shared infrastructure and attempts to connect end-to-end workflows. Those priorities overlap; workflow integration remains partly an ambition, not an established company-wide outcome.
 
-The report also covers the company's emphasis on existing frameworks and employee-written skills, its ambition to connect work across employees, and substantial investment. One multi-agent experiment using Opus 4.6 reportedly incurred RMB 2 million in one day and was treated by the company as a necessary exploration cost. I participated in the company review, which identified inadequate gateway quota logic, routing problems causing a low KV cache hit rate, and missing infrastructure for multi-agent and agent-to-agent (A2A) collaboration. Corrective actions and their results, the source of the framework-and-skills position, measured workflow results, and my personal assessment of those positions remain to be completed. Public sources support external product timelines and Anuttacon's name and stated research focus; they do not verify internal rollouts.
+Six chronological case studies each examine **decisions and actions, possible reasons, and key results**:
 
-The March–April 2026 account adds rapid infrastructure development, with MCP designs for nearly all internal systems. I considered the vast majority of implementations low quality, often wrapping existing service APIs without adequately adapting them for agents. Reading paginated data required repeated MCP calls and parameter adjustments, consuming substantial context. My account of that stage records unresolved permissions for personal and team agents. Deployment coverage, measured overhead, task outcomes, and the duration of the permissions issue still need detail.
+1. November–December 2025: the limited starting point and shared-platform discussion.
+2. After the January 2026 OpenClaw surge: Echo's broad adoption.
+3. The months after Echo: the framework-and-skills expansion and cost-incident review.
+4. March–April: MCP, permissions, disappointing progress, and departmental OpenClaw discontinuation.
+5. April: Project S's attempt to connect team workflows.
+6. May–July: harness work, infrastructure rework, an OpenCode-based delivery and verification framework, and the personal memory system I drove.
 
-I also recall a widespread sense in March–April that progress on AI projects was below expectations. The company believed anyone could create agents; my assessment is that it overlooked shared AI-native infrastructure, contributing to that shortfall. Nearly all departmental OpenClaw deployments were taken offline and no longer used. C04 now covers this outcome as well as the earlier expansion. Individual shutdown reasons, dates, and whether Echo was included still need detail.
+The report separates company positions, my observations and judgments, and working analysis pending my review. Key results include qualitative outcomes where measurements are unavailable. It ends with provisional decision options, material evidence gaps, and sources.
 
-The April account adds a founder's personal push for Project S, built around Claude Code and IM, to migrate team workflows and build shared memory with access across members' data. I recall smoother initial progress at Anuttacon and a failure to advance the intended rollout at miHoYo. I consider miHoYo's permissions complexity the largest obstacle and the requirements for team-wide memory visibility and all work entry points in IM too aggressive. The project's final status and scope remain to be clarified.
-
-From May through July 2026, I observed a less aggressive company approach alongside widespread departmental harness work on context for long tasks using Codex, Claude Code, and pi agent, and on infrastructure for delivery involving multiple people or agents. Nearly all rushed MCP interfaces were refactored; retrieval, agent permissions, and memory capabilities were added or developed. C06 now includes this follow-up. C08 covers a popular OpenCode-based development-to-release framework: initially favored by non-R&D staff, it later gained some R&D acceptance after adding end-to-end verification. Its front-end and back-end deployment allowed engineers to ask agents to verify the output through browser use or Playwright. C09 records the personal memory system I drove, enabling memory to move between endpoints and agents. Specific verification tasks, infrastructure outcomes, and measured adoption remain to be documented.
-
-ByteDance provides context from late 2023 to the end of 2025; Anuttacon provides a comparison within Project S. Full review dates and current-company constraints remain open. Analytical hypotheses and options on accessible interfaces, workflow validation, experimental consumption, supporting infrastructure, MCP usability and permissions, team workflows and memory, harness work and verification, and personal memory portability are draft material pending my review, separate from the personal judgments already expressed.
-
-**Language consistency:** The English and Chinese reports and reading guides must align in structure, facts, numbers, dates, sources, evidence status, conclusions, recommendations, uncertainties, and information gaps. Every addition, deletion, clarification, or correction must be reflected in both languages in the same update and Git commit. Both versions are reviewed section by section before committing and again after rebasing, before pushing.
-
-The report connects stages and types of agent application, distinguishing company positions and reflection, my observations, and my judgments. Successful, unsuccessful, and mixed outcomes will be developed as evidence becomes available. Events are organized by when they occurred; recollections, public evidence, analytical hypotheses, and decision options remain distinct.
-
-The deliverable is standard Markdown prepared for transfer to Confluence. Git publication does not publish a Confluence page.
+The English and Chinese versions carry the same structure, facts, dates, amounts, reasoning, evidence status, and uncertainties. Both are reviewed together and published in the same commit. The Markdown is prepared for transfer to Confluence; publication to this repository does not publish a Confluence page.
