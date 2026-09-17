@@ -34,14 +34,14 @@ void OrderBook::handle_pending_CYB_limit_order(Trade& trade) {
 }
 
 void OrderBook::replay_CYB_trades(std::vector<Trade> trades) {
-  // 普通限价及其解冻单已经撮合，回放只补真实笔数。
-  // 后到撤单触发的特殊组此前没有扣盘，识别组起点后才按双方引用执行并统计。
+  // 已提前撮合的普通限价及解冻单只补真实笔数。若真实 F 引用的原单仍在暂存表，
+  // 则该单尚未撮合，必须按真实引用扣量，不能把未执行的 F 也当成确认消息。
+  // 后到撤单触发的特殊组此前同样没有扣盘，识别组起点后按双方引用执行并统计。
   for (std::size_t index = 0; index < trades.size(); ++index) {
     if (cyb_replay_has_cancel && !replay_caused_by_cancel) {
-      // 普通成交前缀可能已经让其他暂存单恢复展示；此前市价回放也可能改变最优档。
-      // 先复用现有激活逻辑，保证分组判断和旧快照都基于前缀处理后的完整盘口。
-      // 空 vector 不进入本 for，只执行下方激活循环，因此不会继续递归。
-      replay_CYB_trades(std::vector<Trade>());
+      // 按已经处理的真实 F 前缀判断分组，中途不能再调用空回放提前撮合。
+      // 首笔 F 改变最优档后，若抢先撮合另一张暂存单，会消耗后续 F 的对手量，
+      // 使原单余量和真实引用错位；等普通前缀结束或整组回放结束后再激活余量。
       const Trade& current = trades[index];
       const bool held_bid = pending_limit_order_alive.count(current.bid_appl_seq_num) != 0;
       const bool held_ask = pending_limit_order_alive.count(current.offer_appl_seq_num) != 0;
@@ -65,6 +65,9 @@ void OrderBook::replay_CYB_trades(std::vector<Trade> trades) {
                               cyb_cancel_trade.quantity == bids.begin()->second.total_quantity;
       }
       if (cancel_removes_best) {
+        // 已确定普通前缀到此结束，先把它留下的合格余量恢复入簿，补齐旧行。
+        // 当前撤单尚未扣量，其触发单仍被旧最优价限制，不会在这里抢先撮合。
+        replay_CYB_trades(std::vector<Trade>());
         // 在第一笔撤单触发 F 扣盘和统计之前完成旧行，保留它应有的普通前缀。
         // 外层仍按原框架执行真正的撤单；这里只保存新行的起点，后续 F 同归新行。
         pending_cyb_group = false;
@@ -74,7 +77,9 @@ void OrderBook::replay_CYB_trades(std::vector<Trade> trades) {
         cyb_first_trade = current;
       }
     }
-    if (replay_caused_by_cancel) {
+    if (replay_caused_by_cancel ||
+        pending_limit_order_alive.count(trades[index].bid_appl_seq_num) != 0 ||
+        pending_limit_order_alive.count(trades[index].offer_appl_seq_num) != 0) {
       execute_trade(trades[index]);
       record_trade(trades[index].price, trades[index].quantity);
     } else {

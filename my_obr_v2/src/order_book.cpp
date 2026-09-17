@@ -110,8 +110,8 @@ void OrderBook::apply(Trade& trade) {
     record_trade(trade.price, trade.quantity);
     handle_pending_market_order(trade);
   } else if (trade.is_CYB) {
-    // 普通限价和解冻单已经撮合，只需补真实笔数；CYB 缓存保留到组边界，
-    // 以便把“F 先到、触发撤单后到”的特殊组分给首笔 F 的快照。
+    // 已提前撮合的限价 F 只补笔数，仍暂存的原单则需要按真实 F 扣量。
+    // CYB 缓存保留到组边界，以便把撤单触发的特殊组分给首笔 F 的快照。
     handle_pending_CYB_limit_order(trade);
   } else {
     // 非创业板限价已在来单时完成扣盘和量额统计，不能再次访问已全成的原单。
@@ -278,8 +278,8 @@ void OrderBook::execute_trade(Trade& trade) {
 }
 
 void OrderBook::record_trade(int64_t price, int64_t quantity) {
-  // 仅用于尚未在限价撮合中统计的真实 F：市价、竞价及撤单触发的特殊组。
-  // 普通限价/解冻单的量额已累计，其真实 F 只补笔数，不能再次调用这里。
+  // 仅用于尚未提前统计的真实 F：市价、竞价、仍暂存原单及撤单触发的特殊组。
+  // 已提前撮合的限价/解冻单量额已累计，其真实 F 只补笔数，不能重复调用这里。
   ++trade_count;
   last_trade_price = price;
   cumulative_trade_quantity += quantity;
