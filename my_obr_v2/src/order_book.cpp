@@ -1,6 +1,7 @@
 #include "order_book.hpp"
 
 #include <algorithm>
+#include <vector>
 
 // 输入引用和数值合法，但业务阶段必须显式初始化，首条订单才能安全判断边界。
 OrderBook::OrderBook()
@@ -38,8 +39,7 @@ void OrderBook::apply(Order& order) {
   } else {
     apply_market_order(order);
   }
-  // 当前新单先完成自身撮合，再撮合由它解冻的同向旧单，余量按原顺序入簿。
-  replay_CYB_trades(std::vector<Trade>());
+  // 限价入口已完成当前单及连续解冻单的撮合，这里直接记录整组快照。
   make_snapshot(order);
 }
 
@@ -170,43 +170,91 @@ void OrderBook::apply_order_in_acution(Order& order) {
 }
 
 void OrderBook::apply_limit_order(Order& order) {
-  // 保留用户 v2 的对手最优价 102%/98% 范围；对手为空时不暂存。
-  const bool outside =
-      order.is_CYB && ((order.side == EventSide::Buy && !asks.empty() &&
-                        order.price * 100 > asks.begin()->first * BID_COEFFICIENT) ||
-                       (order.side == EventSide::Sell && !bids.empty() &&
-                        order.price * 100 < bids.begin()->first * ASK_COEFFICIENT));
-  if (outside) {
-    pending_limit_order_alive[order.order_appl_seq_num] = order;
-    order_info_map[order.order_appl_seq_num] =
-        OrderInfo{order.price, order.side, OrderQueue::iterator(), 0};
-    pending_cyb_group = true;
-    return;
-  }
-  // 合格新单先独立完成自身撮合；由盘口变化解冻的同向旧单不会改变这一份成交量。
-  // 解冻单同样复用本方法；双方撮合结果共用当前快照，真实 F 只补成交笔数。
-  int64_t remaining_quantity = order.quantity;
-  if (order.side == EventSide::Buy) {
-    while (remaining_quantity > 0 && !asks.empty() && asks.begin()->first <= order.price) {
-      const int64_t quantity = std::min(remaining_quantity, asks.begin()->second.total_quantity);
-      execute_order_at_price(asks.begin()->first, quantity, false, true);
-      remaining_quantity -= quantity;
-    }
-  } else {
-    while (remaining_quantity > 0 && !bids.empty() && bids.begin()->first >= order.price) {
-      const int64_t quantity = std::min(remaining_quantity, bids.begin()->second.total_quantity);
-      execute_order_at_price(bids.begin()->first, quantity, true, false);
-      remaining_quantity -= quantity;
-    }
-  }
+  // 每轮处理一张原单：先完成当前单，再检查它是否解冻了其他单。
+  // 用局部副本切换下一张原单，既不改外层生成快照使用的输入事件，也不递归增长调用栈。
+  Order current_order = order;
+  while (true) {
+    // 保留用户 v2 的对手最优价 102%/98% 范围；对手为空时不暂存。
+    const bool outside = current_order.is_CYB &&
+                         ((current_order.side == EventSide::Buy && !asks.empty() &&
+                           current_order.price * 100 > asks.begin()->first * BID_COEFFICIENT) ||
+                          (current_order.side == EventSide::Sell && !bids.empty() &&
+                           current_order.price * 100 < bids.begin()->first * ASK_COEFFICIENT));
+    if (outside) {
+      pending_limit_order_alive[current_order.order_appl_seq_num] = current_order;
+      order_info_map[current_order.order_appl_seq_num] =
+          OrderInfo{current_order.price, current_order.side, OrderQueue::iterator(), 0};
+      pending_cyb_group = true;
+    } else {
+      // 本单必须先完成自身全部撮合及余量入簿，才轮到由它解冻的旧单。
+      // 所有轮次的量额和最新价归同一快照，已提前撮合部分的真实 F 只补笔数。
+      int64_t remaining_quantity = current_order.quantity;
+      if (current_order.side == EventSide::Buy) {
+        while (remaining_quantity > 0 && !asks.empty() &&
+               asks.begin()->first <= current_order.price) {
+          const int64_t quantity =
+              std::min(remaining_quantity, asks.begin()->second.total_quantity);
+          execute_order_at_price(asks.begin()->first, quantity, false, true);
+          remaining_quantity -= quantity;
+        }
+      } else {
+        while (remaining_quantity > 0 && !bids.empty() &&
+               bids.begin()->first >= current_order.price) {
+          const int64_t quantity =
+              std::min(remaining_quantity, bids.begin()->second.total_quantity);
+          execute_order_at_price(bids.begin()->first, quantity, true, false);
+          remaining_quantity -= quantity;
+        }
+      }
 
-  if (remaining_quantity > 0) {
-    Order remaining_order = order;
-    remaining_order.quantity = remaining_quantity;
-    apply_order_in_acution(remaining_order);
-  } else {
-    // 全成来单没有链表节点，相关真实 F 只补笔数，不再查找其 position。
-    order_arrival_rank.erase(order.order_appl_seq_num);
+      if (remaining_quantity > 0) {
+        Order remaining_order = current_order;
+        remaining_order.quantity = remaining_quantity;
+        apply_order_in_acution(remaining_order);
+      } else {
+        // 全成来单没有链表节点，后续真实 F 不再通过其 position 扣量。
+        order_arrival_rank.erase(current_order.order_appl_seq_num);
+      }
+    }
+
+    // 每轮重新读取最新盘口，收集此刻能够解冻的原单；没有合格单即结束。
+    // 这里始终是连续竞价入口，竞价阶段的暂存恢复仍由回放入口只入簿处理。
+    std::vector<int64_t> activated;
+    for (std::map<int64_t, Order>::const_iterator held = pending_limit_order_alive.begin();
+         held != pending_limit_order_alive.end(); ++held) {
+      const Order& frozen_order = held->second;
+      const bool still_frozen =
+          (frozen_order.side == EventSide::Buy && !asks.empty() &&
+           frozen_order.price * 100 > asks.begin()->first * BID_COEFFICIENT) ||
+          (frozen_order.side == EventSide::Sell && !bids.empty() &&
+           frozen_order.price * 100 < bids.begin()->first * ASK_COEFFICIENT);
+      if (!still_frozen) {
+        activated.push_back(held->first);
+      }
+    }
+    if (activated.empty()) {
+      break;
+    }
+    // 沿用原来的方向、价格及同价到达优先级；本轮只取第一张。
+    // 它完成后可能再解冻价格更优的旧单，因此不能一次处理完本轮收集的整批订单。
+    std::sort(activated.begin(), activated.end(), [this](int64_t left_id, int64_t right_id) {
+      const Order& left = pending_limit_order_alive.find(left_id)->second;
+      const Order& right = pending_limit_order_alive.find(right_id)->second;
+      if (left.side != right.side) {
+        return left.side == EventSide::Buy;
+      }
+      if (left.price != right.price) {
+        return left.side == EventSide::Buy ? left.price > right.price : left.price < right.price;
+      }
+      return order_arrival_rank.find(left_id)->second < order_arrival_rank.find(right_id)->second;
+    });
+
+    std::map<int64_t, Order>::iterator held = pending_limit_order_alive.find(activated.front());
+    // 先复制待解冻原单，再删除暂存项及没有节点的占位索引；保留原到达顺序。
+    // 下一轮直接复用上面的撮合逻辑，负责全成清理或为剩余量建立有效 position。
+    current_order = held->second;
+    pending_limit_order_alive.erase(held);
+    order_info_map.erase(current_order.order_appl_seq_num);
   }
 }
 

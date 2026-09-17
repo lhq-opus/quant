@@ -87,10 +87,10 @@ void OrderBook::replay_CYB_trades(std::vector<Trade> trades) {
     }
   }
 
-  // 每轮基于同一盘口收集合格暂存单，再按价优/原到达顺序直接撮合，余量入簿。
-  // 撮合后的最优价可能继续解冻其他订单，因此重复直到没有新增合格订单。
-  // 空缓存也执行这一段；竞价阶段则解除连续竞价笼子，只入簿、不提前撮合。
-  while (!pending_limit_order_alive.empty()) {
+  // 撤单、市价或真实 F 回放改变盘口后，只选首张合格暂存单进入限价方法。
+  // 后续连续解冻由 apply_limit_order 内的循环完成，此处不再重复循环撮合。
+  // 竞价阶段解除连续竞价笼子，一次恢复所有暂存原单，只入簿、不提前撮合。
+  if (!pending_limit_order_alive.empty()) {
     std::vector<int64_t> activated;
     for (std::map<int64_t, Order>::const_iterator held = pending_limit_order_alive.begin();
          held != pending_limit_order_alive.end(); ++held) {
@@ -107,7 +107,7 @@ void OrderBook::replay_CYB_trades(std::vector<Trade> trades) {
       }
     }
     if (activated.empty()) {
-      break;
+      return;
     }
     // 同轮解冻的同侧订单按价格优先，同价沿用原到达次序；不能按 map 中的
     // 订单号先后撮合，否则较低优先级的暂存单会先消耗对手量。
@@ -131,7 +131,7 @@ void OrderBook::replay_CYB_trades(std::vector<Trade> trades) {
       order_info_map.erase(order.order_appl_seq_num);
       if (trading_session == TradingSession::ContinuousTrade) {
         apply_limit_order(order);
-        // 本单完成后可能又解冻价格更优的旧单，重新收集，不能先把原批次撮合完。
+        // 限价方法返回时已处理完整条解冻链；原批次中的其他迭代对象可能已删除。
         break;
       } else {
         apply_order_in_acution(order);
