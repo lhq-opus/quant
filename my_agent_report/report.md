@@ -6,7 +6,7 @@
 
 **Purpose:** I am reviewing my experience with agent adoption at miHoYo, including my work in its data team, to inform AI decisions at our current company. My earlier experience at ByteDance provides comparative context.
 
-**Review period:** The intended scope is a one-year retrospective, with exact boundaries still to be confirmed. The current account starts with my arrival at miHoYo in November 2025, covers Echo's emergence after the OpenClaw surge I recall in January 2026, and extends through the following two to three months. Echo's precise dates and the subsequent period's calendar boundaries remain open. The ByteDance comparison covers late 2023 through the end of 2025.
+**Review period:** The intended scope is a one-year retrospective, with exact boundaries still to be confirmed. The current account starts with my arrival at miHoYo in November 2025, covers Echo's emergence after the OpenClaw surge I recall in January 2026 and the following two to three months, and includes company-level infrastructure development in March–April 2026. Echo's precise dates, the subsequent expansion period's calendar boundaries, and its overlap with the March–April work remain open. The ByteDance comparison covers late 2023 through the end of 2025.
 
 ## Executive Summary
 
@@ -19,6 +19,8 @@ I see Echo as a major adoption turning point. Following OpenClaw's surge in popu
 Over the next two to three months, I saw the company become highly aggressive in its approach to LLMs and agents. At least four or five departmental projects adapted OpenClaw, and employees widely moved discrete tasks into agents connected to workplace IM chatbots. My understanding of the company's position was that existing frameworks made further general-purpose agent development unnecessary: employees should instead write comprehensive skills, ultimately connecting individual tasks into complete workflows spanning everyone's work. The adoption of individual tasks was visible; achievement of that broader workflow objective remains to be established.
 
 The company invested substantial resources. One incident I recall involved an employee's multi-agent experiment using Claude Opus 4.6, which incurred RMB 2 million in token costs in one day. My understanding is that the gateway did not cap this experiment's usage, and the experiment had no limits on agent numbers or inter-agent message-history volume. I participated in the company's review. The company treated the incident as a necessary cost of exploring LLMs while identifying inadequate gateway quota logic, routing problems that resulted in a low KV cache hit rate, and missing infrastructure for multi-agent and agent-to-agent (A2A) collaboration. Supporting records, the accounting basis, experimental results, and subsequent corrective actions remain to be added.
+
+In March–April 2026, I saw rapid development of company-level agent infrastructure, with MCP interfaces designed for nearly all internal systems. I considered the vast majority of these implementations low quality: many quickly wrapped existing service APIs, retaining designs suited to human use but poorly suited to agents. For example, agents reading data had to repeatedly call MCP tools and adjust pagination parameters, consuming substantial context. I also considered the permissions model inadequately designed; which systems personal agents and team agents should be allowed to access remained unresolved throughout the period I observed.
 
 Compared with ByteDance, where I worked earlier, I consider miHoYo's start in LLM and agent adoption substantially later. ByteDance began applying LLMs to customer service and internal engineering productivity in late 2023 and gradually expanded into other areas. By the end of 2025, some tools could complete certain long tasks end to end, with results I regarded as very good. Detailed outcomes and the reasons for the difference still need further examination.
 
@@ -41,6 +43,7 @@ Throughout the report, I distinguish what I participated in, what I observed or 
 | By the end of 2025 | ByteDance | Some AI tools could complete certain long tasks end to end, with results I considered very good. |
 | After the OpenClaw surge I recall in January 2026; Echo dates to be confirmed | miHoYo | Another team independently initiated Echo. I observed broad adoption, especially among non-R&D staff, and regard this as a major turning point. |
 | The following two to three months; exact dates to be confirmed | miHoYo | I saw aggressive expansion, at least four or five departmental OpenClaw adaptations, widespread individual-task adoption through agents and IM chatbots, and substantial spending. The company emphasized existing frameworks and employee-written skills, and treated a one-day RMB 2 million experiment as a necessary exploration cost. |
+| March–April 2026 | miHoYo | I observed rapid infrastructure development and MCP designs for nearly all internal systems. I considered the vast majority of implementations low quality; pagination required repeated calls and consumed substantial context, while access permissions for personal and team agents remained unresolved. |
 | Review of the cost incident; date to be confirmed | miHoYo | I participated in the company review, which identified inadequate gateway quota logic, routing problems causing a low KV cache hit rate, and missing infrastructure for multi-agent and A2A collaboration. Corrective actions and their results remain to be documented. |
 
 November 2025 is the starting point of my miHoYo account, not the date of its first agent project. Dify was already available by December; its initial deployment date and the full observation period still need to be specified.
@@ -72,6 +75,14 @@ As I understood it, the company's position was that sufficiently capable framewo
 The company invested substantial resources in this direction. During this period, the multi-agent experiment described in C05 incurred RMB 2 million in one day; the company ultimately classified it as a necessary cost of exploring LLMs. I participated in the company review, which identified inadequate gateway quota logic, routing problems that resulted in a low KV cache hit rate, and missing infrastructure for multi-agent and A2A collaboration. These are the company's assessment and reflections. The review date, resulting actions, and my personal evaluation of the response remain to be developed in this draft.
 
 The formal source and scope of the framework-and-skills position still need clarification. Its effect on specific projects, including the December proposal and Echo, and the results of workflow integration remain to be established.
+
+### March–April 2026 — Rapid MCP development and unresolved usability and permissions
+
+I observed a period of rapid company-level infrastructure development. Nearly all internal systems had MCP interfaces designed for them, and many quickly exposed MCP capabilities by wrapping existing service APIs.
+
+In my assessment, the vast majority of those implementations were low quality. Existing designs carried over poorly to agent use: pagination required agents to repeatedly call tools and adjust parameters when reading data, consuming substantial context. Permissions design also remained inadequate, leaving unresolved which systems personal agents and team agents should be able to access. C06 develops these observations.
+
+These are my assessments of the implementation, rather than company review findings. The work's overlap with the broader expansion period and its timing relative to the cost-incident review still need detail; its relationship to the review's corrective actions has not been established.
 
 ## Case Studies
 
@@ -121,6 +132,16 @@ These are company findings from the review I attended. The draft does not yet in
 
 **Assessment pending:** The experiment's task, technical outcome, and business value remain unspecified. The review identified infrastructure problems, but those findings alone do not establish the experiment's overall success or failure. Prior budget authorization also remains to be documented. The event, amount, and review findings rest on my recollection. Anthropic's [Opus 4.6 release announcement](https://www.anthropic.com/news/claude-opus-4-6), dated February 5, 2026, provides model timeline context only.
 
+### C06 — Broad MCP development with usability and permissions gaps
+
+**What I observed:** In March–April 2026, company-level agent infrastructure developed rapidly. Nearly all internal systems had MCP interfaces designed for them. Many implementations were wrappers around existing service APIs, created to expose MCP capabilities quickly. The inventory and the extent of production deployment and actual use remain to be documented.
+
+**My assessment of interface quality:** I considered the vast majority of these implementations low quality. In my view, directly wrapping existing APIs carried over designs suited to human use but poorly suited to agents. When reading data through paginated interfaces, agents had to repeatedly call MCP tools and adjust pagination parameters, consuming substantial context. This is the concrete burden behind my pagination example. The specific systems, tasks, data volumes, call counts, and context consumption have not yet been documented; my assessment concerns the implementations I encountered.
+
+**Unresolved permissions:** I considered the permissions model inadequately designed. The question of which internal systems personal agents and team agents should be allowed to access remained unresolved throughout the period I observed. The meaning of each agent category, concrete permissions questions, and the observation's end date remain to be specified.
+
+**Results and reflection:** My account records broad MCP development alongside context overhead and unresolved access design. Task completion rates, business impact, company decisions on quality and permissions, and subsequent improvements remain to be added. These concerns are my observations and judgments, distinct from the company findings in C05.
+
 ByteDance remains comparative background. Its individual customer-service, engineering-productivity, and long-task tools still need to be identified before developing full cases.
 
 ## My Observations and Judgments
@@ -132,6 +153,8 @@ I regarded the December discussion as partly representative of senior leadership
 I consider Echo a major turning point and a company-level adoption success. My explanation centers on how its client UI lowered the barrier to use, particularly for non-R&D employees. This remains my assessment, rather than a documented company evaluation or a measured causal finding.
 
 I describe the following two to three months as a period of highly aggressive adoption and substantial spending. The views that general-purpose agent development was unnecessary and that the cost incident was a necessary exploration expense were company positions as I understood them. I participated in the incident review; the quota, routing, cache, and collaboration-infrastructure findings above record the company's reflections. My own support, reservations, and later reflections on those positions still need to be developed.
+
+My assessment of the March–April MCP work is that broad coverage coexisted with poor interface quality and unresolved permissions design. I linked the usability problems to directly wrapping existing service APIs; repeated pagination calls consumed substantial context during data retrieval. These are my observations and judgments, not a recorded company consensus.
 
 When I joined miHoYo, I regarded Claude Sonnet 4.5 as the strongest model available. [Anthropic's announcement](https://www.anthropic.com/news/claude-sonnet-4-5) confirms its release on September 29, 2025. That supports the timing; the judgment about model quality is mine.
 
@@ -149,6 +172,8 @@ The following hypotheses are draft analysis pending my review and further eviden
 
 **Experimentation and cost:** C05 combines a willingness to absorb a large exploration cost with company reflection on quota logic, routing and cache efficiency, and collaboration infrastructure. This raises a question to test alongside C04: what supporting infrastructure is still needed when reusing general-purpose frameworks and skills? The review findings, the experiment's value, and the effectiveness of subsequent corrective actions need separate assessment. Identifying deficiencies does not establish that they were corrected or what value the experiment delivered.
 
+**MCP coverage and usable access:** C06 suggests assessing integration coverage separately from an agent's ability to complete a task within a reasonable context budget and with clearly defined access permissions. Alongside C04's emphasis on skills, it raises a question about whether the available tools and permissions support complete workflows. The breadth of MCP development alone does not answer that question.
+
 ## Decision Options for Our Current Company
 
 These are provisional options derived from the cases, pending my review and assessment against our company's priorities and constraints. They are not finalized recommendations or a record of measures miHoYo implemented.
@@ -157,7 +182,9 @@ These are provisional options derived from the cases, pending my review and asse
 - **Framework and skill reuse — C04:** If this approach is under consideration, test complete workflows with representative handoffs between employees. Assess completion quality and required human intervention before treating a collection of skills as a complete workflow. The current cases do not establish a basis for stopping all internal general-purpose agent development.
 - **Experimental consumption and infrastructure — C05:** Set experiment budgets and gateway usage limits; cap agent numbers and the message history passed between them; pause or review runs at defined thresholds. Assess routing and KV cache hit rates, and identify infrastructure needs for multi-agent and A2A collaboration. Record spending, intended learning, actual results, and the effects of corrective actions together. Thresholds and infrastructure priorities should reflect our resources and objectives.
 
-The assessment should distinguish infrastructure availability, application breadth, actual use, workflow completion, and cost relative to results. The Echo and departmental cases currently support adoption observations; sustained use and business value still need evidence.
+- **MCP quality and permissions — C06:** Evaluate representative agent tasks, including the calls and context needed to retrieve data through paginated interfaces. Define which systems personal and team agents may access, and check those boundaries in the same task evaluations. Use completion quality, context consumption, and access problems to guide interface and permissions improvements.
+
+The assessment should distinguish infrastructure availability, application breadth, actual use, workflow completion, and cost relative to results. The Echo and departmental cases currently support adoption observations; sustained use and business value still need evidence. C06 adds interface usability, context consumption, and access permissions to that assessment.
 
 ## Information to Complete Before Finalizing
 
@@ -169,6 +196,7 @@ The assessment should distinguish infrastructure availability, application bread
 - Exact dates and project coverage for the subsequent expansion, including whether the count includes Echo; evidence of skill reuse and completed workflows across employees.
 - Who communicated the position on general-purpose agent development, through which channel and with what scope, and which projects or resource decisions changed.
 - The dates of the RMB 2 million incident and its review; the experiment's task, technical outcome, business value, billing records, accounting basis, and cost breakdown; review records, routing and cache measurements, and the specific multi-agent and A2A infrastructure gaps; prior authorization and corrective actions, owners, timing, and effects; my views at the time and in retrospect.
+- The March–April MCP system inventory, design and deployment coverage, actual use, representative tasks and measured pagination overhead, quality criteria, definitions of personal and team agents, specific permissions questions and how long they remained unresolved, responsible teams, company decisions, and subsequent improvements; the timing and relationship to the broader expansion and cost-incident review.
 - The ByteDance tools and teams, long-task completion criteria, human intervention, reliability, task duration, and business impact, together with the basis for my knowledge of their state by the end of 2025.
 - Supporting evidence for the company timelines and comparisons, and the AI decisions and constraints this report should address at our current company.
 
@@ -181,6 +209,7 @@ The assessment should distinguish infrastructure availability, application bread
 | U03 | My observations of Echo and its independent project origin | Recorded September 17, 2026 | Emergence after the OpenClaw surge I place in January 2026; another team's self-initiated exploration; client agent; product analogies; broad use, especially outside R&D. Success and the UI explanation are my judgments. Precise dates, measured results, technical dependencies, and formal Echo-specific decisions remain open. |
 | U04 | My recollections of expansion after Echo and the multi-agent cost incident | Recorded September 17, 2026 | Following two to three months; at least four or five departmental OpenClaw adaptations; individual-task adoption and IM integration; company emphasis on frameworks and skills; substantial investment; RMB 2 million in one day using Opus 4.6, missing limits, and the company's response. The source of the framework-and-skills position, dates, billing evidence, workflow and experiment outcomes, and my personal evaluation of those company positions remain open. U05 adds my participation in the incident review. |
 | U05 | My participation in the company incident review and confirmation of the cost amount | Recorded September 17, 2026 | I participated in the review. Company reflections covered inadequate gateway quota logic, routing problems causing a low KV cache hit rate, and missing infrastructure for multi-agent and A2A collaboration. I confirmed the amount as RMB 2 million. Review records and measurements have not been independently examined here; corrective actions and their effects remain to be documented. |
+| U06 | My observations of March–April infrastructure development, MCP quality, pagination, and permissions | Recorded September 17, 2026 | Rapid development in March–April 2026; MCP designs for nearly all internal systems; many wrappers around existing service APIs; my assessment that the vast majority were low quality; repeated MCP calls and pagination adjustments consuming substantial context during data retrieval; unresolved system access for personal and team agents. Deployment coverage, measured overhead, task outcomes, specific permissions questions, and their duration remain open. These are my recollections and judgments, not independently verified results or company review findings. |
 | S01 | Anthropic, [Introducing Claude Sonnet 4.5](https://www.anthropic.com/news/claude-sonnet-4-5) | Published September 29, 2025; accessed September 17, 2026 | Confirms release before my joining month. It does not verify internal company adoption or establish the strongest model across all tasks in November 2025. |
 | S02 | OpenClaw documentation, [OpenClaw lore](https://docs.openclaw.ai/start/lore) | Publication date not stated; accessed September 17, 2026 | Records adoption of the OpenClaw name on January 30, 2026, after earlier names. Supports naming chronology, not the timing or extent of popularity in China or Echo's dates and implementation. |
 | S03 | Kimi Help Center, [What Is Kimi Agent? Features and Entry Points](https://www.kimi.com/en/help/agent/agent-overview) | Publication date not stated; accessed September 17, 2026 | Places Kimi Claw's public beta in mid-February 2026. My comparison is a product analogy; it establishes neither a January Kimi Claw release nor Echo's precise launch date. |
