@@ -12,7 +12,7 @@ Seven chronological case studies each examine **decisions and actions, possible 
 2. After the January 2026 OpenClaw surge: Echo's broad adoption.
 3. The months after Echo: the February–April individual-productivity priority, framework-and-skills expansion, server-side project halt, and cost-incident review.
 4. March–April: MCP, permissions, disappointing progress, and departmental OpenClaw discontinuation.
-5. April initiative: Project S's harness and data flywheel, architecture and design gaps, and my FDE experience adapting data workflows, including the limits of end-to-end validation. The dates of my roughly two-month involvement remain open.
+5. April initiative: Project S's harness and data flywheel, architecture and rollout gaps, and my FDE work adapting data engineering. Actual changes addressed subagent context loss, skill adherence, and lengthy execution. Agent acceptance at every stage still required business criteria to be adjusted; data-return cycles also constrained iteration. The dates of my roughly two-month involvement remain open.
 6. May–July: harness work and infrastructure rework, with renewed agent project activity and B2B/FDE needs; the OpenCode-based delivery and verification framework and the personal memory system I drove. Specific project restart and staffing dates remain open.
 7. Approximately August–September: Anuttacon recognizes a need for FDE support while promoting its own models to investor-backed companies. Its internal draft principles are compared with the miHoYo cases. Earlier public products, model research, and the AnuNeko shutdown supply context; this is not presented as a pivot into FDE services.
 
