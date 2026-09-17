@@ -4,16 +4,16 @@ I prepared [From Agent Adoption to End-to-End Delivery: Decisions and Lessons fr
 
 [Chinese reading guide](README.zh-CN.md) · [Chinese report](report.zh-CN.md)
 
-The report is a first-person working draft covering November 2025 through July 2026. Its main thread is the shift from aggressive agent adoption and individual-task productivity toward shared infrastructure and attempts to connect end-to-end workflows. Those priorities overlap; workflow integration remains partly an ambition, not an established company-wide outcome.
+The report is a first-person working draft covering November 2025 through July 2026. Its main thread is the shift from aggressive agent adoption and individual-task productivity toward shared infrastructure and attempts to connect end-to-end workflows. Those priorities overlap; workflow integration remains partly an ambition, not an established company-wide outcome. The cases also trace how staffing needs changed with the goals.
 
 Six chronological case studies each examine **decisions and actions, possible reasons, and key results**:
 
-1. November–December 2025: the limited starting point and shared-platform discussion.
+1. November–December 2025: the limited starting point and shared-platform discussion, with context on early recruitment for runtime development.
 2. After the January 2026 OpenClaw surge: Echo's broad adoption.
-3. The months after Echo: the framework-and-skills expansion and cost-incident review.
+3. The months after Echo: the February–April individual-productivity priority, framework-and-skills expansion, server-side project halt, and cost-incident review.
 4. March–April: MCP, permissions, disappointing progress, and departmental OpenClaw discontinuation.
 5. April initiative: Project S's harness and data flywheel, architecture and design gaps, and my FDE experience adapting data workflows, including the limits of end-to-end validation. The dates of my roughly two-month involvement remain open.
-6. May–July: harness work, infrastructure rework, an OpenCode-based delivery and verification framework, and the personal memory system I drove.
+6. May–July: harness work and infrastructure rework, with renewed agent project activity and B2B/FDE needs; the OpenCode-based delivery and verification framework and the personal memory system I drove. Specific project restart and staffing dates remain open.
 
 The report separates company positions, my observations and judgments, and working analysis pending my review. Key results include qualitative outcomes where measurements are unavailable. It ends with provisional decision options, material evidence gaps, and sources.
 

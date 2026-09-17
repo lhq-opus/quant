@@ -6,7 +6,7 @@
 
 ## Executive View
 
-I saw miHoYo move from a small number of agent initiatives into an aggressive “all in” phase. Employees began using agents widely for individual tasks, while the company expected existing frameworks and employee-written skills to connect those tasks into complete workflows. My assessment is that this approach neglected company-level infrastructure designed for agents. Broad adoption and expanding MCP coverage coexisted with usability, permissions, and delivery problems.
+I saw miHoYo move from a small number of agent initiatives into an aggressive “all in” phase. Employees began using agents widely for individual tasks, while the company expected existing frameworks and employee-written skills to connect those tasks into complete workflows. My assessment is that this approach neglected company-level infrastructure designed for agents. Broad adoption and expanding MCP coverage coexisted with usability, permissions, and delivery problems. I also saw the company bring together people with different backgrounds as its goals changed.
 
 By May–July, the company's approach was less aggressive, while employees and departments focused on harness engineering and the infrastructure required for long tasks. MCP interfaces were reworked, and knowledge retrieval, permissions, and memory capabilities were developed. One departmental framework offered development, deployment, and verification; a separate project enabled personal memory portability. Connecting individual gains into workflows involving multiple people or agents remained an objective under exploration.
 
@@ -16,10 +16,10 @@ The central progression is **all-in adoption with insufficient attention to agen
 | --- | --- | --- | --- |
 | 1 | November–December 2025 | Discuss a shared platform from a limited starting point | A platform direction was discussed; implementation remains unconfirmed. |
 | 2 | After the January 2026 OpenClaw surge | Make a general-purpose agent accessible through Echo | Broad uptake, especially outside R&D. |
-| 3 | The two to three months after Echo; exact dates open | Scale existing frameworks and employee-written skills | Widespread individual-task use; a major cost incident exposed infrastructure gaps. |
+| 3 | February–April 2026 productivity priority; wider expansion dates open | Improve individual engineering productivity through clients and skills; halt nearly all server-side agent projects | Rapid single-task gains in my assessment; a major cost incident exposed infrastructure gaps. |
 | 4 | March–April 2026; overlapping the expansion | Expose internal systems through MCP | Poor usability and unresolved permissions; disappointing progress and widespread departmental OpenClaw discontinuation. |
 | 5 | April 2026 initiative | Test a general-purpose harness and team-memory data flywheel through Project S | Useful on individual data tasks; the intended miHoYo rollout did not progress. |
-| 6 | May–July 2026 | Build the context, infrastructure, and verification needed for delivery | Infrastructure rework and popular departmental projects; broader workflow results remain to be demonstrated. |
+| 6 | May–July 2026; project restart dates open | Develop harnesses and delivery infrastructure; seek B2B experience for FDE responsibilities | Infrastructure rework and popular departmental projects; broader workflow results remain to be demonstrated. |
 
 **Basis of the analysis:** I participated in data-team agent work, the December discussion, the cost-incident review, Project S workflow adaptation, and the personal memory initiative. Other developments reflect my observations and recollections, recorded on September 17, 2026. Company positions, my own assessments, and possible explanations are distinguished below. Passages marked **working analysis** and the decision options remain drafts for my review. Internal developments have not been independently corroborated here; public sources support only the external background described in the source table.
 
@@ -28,6 +28,8 @@ The central progression is **all-in adoption with insufficient attention to agen
 ### Decisions and Actions
 
 I joined miHoYo's data team in November 2025 to develop agents. To my knowledge, my project was one of very few across the company. A privately deployed Dify instance was available but attracted little attention throughout the period I observed. By December, I understood the company-level infrastructure to consist of an LLM gateway and Dify, alongside a few projects.
+
+**Early staffing direction:** The company initially recruited people with agent development experience to build its own agent runtime frameworks. The exact recruitment dates and staffing arrangements remain to be documented.
 
 I discussed a general-purpose server-side agent platform, a skill hub, and knowledge bases with the head of the shared team. The aim was to help employees move their business workflows onto the platform or complete end-to-end work more effectively over the following months. I describe this leader's seniority as “founder minus one” and considered the discussion partly representative of senior leadership's thinking. The description does not establish a specific reporting line; “shared team” is a provisional English translation.
 
@@ -45,7 +47,7 @@ For comparison, ByteDance, where I worked earlier, began applying LLMs to custom
 - Dify's availability did not translate into much attention in my observation. Usage and business value are not yet measured here.
 - My data-team project provides an early example of agent work, but its goal, delivery milestones, and outcomes still need to be developed.
 
-*Evidence: U01, U02, S01.*
+*Evidence: U01, U02, U10, S01.*
 
 ## Case Study 2 — After the January 2026 OpenClaw Surge: Echo Makes Agents Accessible
 
@@ -71,11 +73,13 @@ Its form reminded me of Kimi Claw and, retrospectively, the ChatGPT client avail
 
 ## Case Study 3 — The Months After Echo: “All In” on Frameworks and Skills
 
-*This case covers the two to three months after Echo's turning point. Its exact boundaries and the incident-review date remain open; it overlaps the March–April case that follows.*
+*I place the individual engineering-productivity priority in February–April 2026. My earlier account dates the wider expansion to the two to three months after Echo's turning point; its exact boundaries and the incident-review date remain open. This case overlaps the March–April case that follows.*
 
 ### Decisions and Actions
 
 I saw the company become highly aggressive about LLMs and agents and invest substantial resources. As I understood the direction, existing frameworks were already good enough, so further general-purpose agent development was unnecessary. Everyone could create agents by writing sufficiently complete skills; the eventual ambition was to connect employees' work into end-to-end workflows.
+
+During February–April, the immediate priority was improving individual employees' engineering productivity. In my observation, colleagues familiar with the business did this better using agent clients. The company also halted **nearly all server-side agent projects**. The overlap with the departmental OpenClaw deployments in Case Study 4 remains to be established.
 
 Departments adapted OpenClaw, while employees moved scattered tasks into agents connected to workplace IM chatbots. In its response to the cost incident below, the company treated the expense as a necessary cost of exploring LLMs. I participated in that review.
 
@@ -87,12 +91,13 @@ Departments adapted OpenClaw, while employees moved scattered tasks into agents 
 
 ### Key Results
 
+- My assessment is that employees' single-task productivity problems were resolved rapidly, within **two to three months**. The task coverage, criteria for considering them resolved, and measured gains remain to be documented.
 - At least four or five departmental OpenClaw adaptations appeared. Individual-task use and IM integration became widespread; company-wide workflow completion was not established.
 - One employee's multi-agent experiment using Opus 4.6 incurred **RMB 2 million in token costs in one day**. The gateway did not cap this experiment's usage, and the experiment had no limits on agent numbers or inter-agent message-history volume. I associate the consumption with those missing limits; billing records and a cost breakdown remain unavailable in this report.
 - The company review I attended identified inadequate gateway quota logic, routing problems causing a low **KV cache hit rate**, and missing infrastructure for **multi-agent and agent-to-agent (A2A) collaboration**.
 - The expense was accepted as exploration cost, but the experiment's technical and business value, corrective actions, and their effects remain unspecified. Acceptance of the expense does not establish a successful experiment.
 
-*Evidence: U04, U05. S04 supplies the Opus 4.6 release date, not verification of the incident.*
+*Evidence: U04, U05, U10. S04 supplies the Opus 4.6 release date, not verification of the incident.*
 
 ## Case Study 4 — March–April 2026: Broad Integration Without Adequate Agent Infrastructure
 
@@ -214,6 +219,8 @@ As I understand it, the founder first promoted the project at Anuttacon, his oth
 
 At the company level, I observed a less aggressive approach. Employees and departments nevertheless commonly pursued harness engineering: when using Codex, Claude Code, or pi agent, they explored what context would better constrain agents to complete long tasks. They also examined what infrastructure was needed for end-to-end delivery involving multiple people or agents.
 
+Agent project activity also resumed, with the focus shifting from developing agent runtimes to **harness engineering on mature existing frameworks**. The company now wanted agent developers with **B2B experience** to take on responsibilities similar to those of a forward-deployed engineer (FDE).
+
 During these three months, nearly all MCP interfaces previously rushed into use were refactored. Knowledge-base retrieval, an agent permissions system, and agent memory capabilities were added or developed. The infrastructure effort now addressed how agents would use knowledge, access systems, and retain context.
 
 Two departmental projects gave this work concrete forms:
@@ -224,7 +231,9 @@ Two departmental projects gave this work concrete forms:
 
 ### Possible Reasons
 
-**Working analysis:** The earlier cases expose a gap between creating an agent and giving it the conditions to finish work. The May–July focus could reflect greater attention to those conditions: relevant knowledge, usable tools, permitted access, persistent context, and a way to verify outputs. Together, these capabilities could make it more practical to connect individual tasks.
+**My interpretation of the change:** I connect the return to agent projects with the rapid resolution of the individual productivity problems described in Case Study 3.
+
+**Working analysis:** The earlier cases expose a gap between creating an agent and giving it the conditions to finish work. The May–July focus could reflect greater attention to those conditions: relevant knowledge, usable tools, permitted access, persistent context, and a way to verify outputs. Together, these capabilities could make it more practical to connect individual tasks. B2B experience may also help with the workflow adaptation and acceptance discussions illustrated by my FDE work in Case Study 5.
 
 The OpenCode case also suggests that verification can matter to R&D acceptance alongside generation and deployment. A runnable application and a way for agents to check it may have made generated work easier for engineers to evaluate. These are possible explanations for the priorities and reception; the reasons for the company attitude change, any formal policy or resource changes, and links to earlier corrective actions remain to be established.
 
@@ -235,7 +244,7 @@ The OpenCode case also suggests that verification can matter to R&D acceptance a
 - I regarded the memory project I drove as another popular departmental initiative. It provided **memory portability across endpoints and agents**; adoption figures and business impact remain unmeasured here.
 - These projects provided capabilities relevant to linking work, but the broader goal of dependable workflows across multiple people and agents remained under exploration. This account does not yet demonstrate company-wide completion of that transition.
 
-*Evidence: U09. The initiatives share the May–July period; their precise internal sequence and delivery dates remain open.*
+*Evidence: U09, U10. The infrastructure and departmental initiatives share the May–July period; their precise internal sequence and delivery dates remain open. The calendar dates of the broader return to agent projects and staffing changes also need confirmation.*
 
 ## Decision Implications for Our Company
 
@@ -248,6 +257,7 @@ The cases suggest that individual adoption, agent infrastructure, and workflow i
 | Experimental cost and operations | Case 3 | Set budgets, gateway limits, agent-count and message-history caps, and review thresholds. Assess routing, KV cache efficiency, and multi-agent/A2A needs; record spending, learning, and results together. |
 | Team workflow integration | Cases 5, 6 | Start with a bounded team and workflow. Define handoffs, agent roles and permissions, source-data access, and memory isolation and visibility separately. Test whether accumulated memory improves subsequent tasks, alongside the value and disruption of moving work into IM, before requiring broad migration. |
 | Delivery and verification | Cases 5, 6 | Test a data or development-to-deployment workflow. Define the expected output and acceptance method at each step; distinguish automated checks from business judgment and assign a reviewer where needed. Support repeated agent revision and verification, and check alignment with the original requirement at handoffs. Evaluate completed work, goal drift, human intervention, cost, and acceptance by the intended user groups. |
+| People and delivery responsibilities | Cases 1, 3, 5, 6 | Define whether the immediate task is runtime development, individual productivity, or workflow adaptation. Test staffing that fits that task: runtime developers, colleagues with business context using agent clients, or agent developers with B2B experience carrying FDE responsibilities. Keep business owners involved in acceptance and evaluate completed work. |
 | Personal memory continuity | Case 6 | Continue a real task on another endpoint or agent. Check what memory transfers, access boundaries, and the effort needed to restate context. Treat team-wide sharing as a separate requirement. |
 
 ## Evidence Needed to Strengthen the Conclusions
@@ -257,6 +267,7 @@ The cases suggest that individual adoption, agent infrastructure, and workflow i
 - **March–April outcomes:** Which deployments stopped, who decided, why, whether Echo was included, and what had been delivered; the teams and expectations behind disappointing progress; MCP inventory, deployment and use, pagination overhead, quality criteria, and the definitions and unresolved permissions of personal and team agents.
 - **Project S:** The dates of my roughly two months of FDE work, workflows adapted and their completion status, and how I learned about Anuttacon; pilot scope, component deployment, and dates in both companies; final status and any formal company review. A representative full workflow run, the stages with ambiguous acceptance criteria, any actual goal drift, human intervention, revision and verification records, and measured results. Specific agent permissions gaps, required memory isolation boundaries, missing harness capabilities, permissions conflicts, and memory visibility and IM requirements in practice. Similarity thresholds, memory-processing quality, retrieval and reuse by agents, and effects on subsequent task outcomes.
 - **May–July:** Specific policy or resource changes and their reasons; harness tasks and multi-person/multi-agent results; refactoring changes, retrieval and permissions coverage, and before-and-after outcomes. For the delivery framework, a representative verification run, acceptance criteria, and adoption by user group. For my memory project, my responsibilities, supported endpoints and agents, memory content, transfer mechanism, access boundaries, usage, and task outcomes. Project names, departments, dates, links to earlier initiatives, and my further reflections remain to be added.
+- **Staffing and project decisions:** Early recruitment dates, roles, and staffing arrangements; the projects halted in February–April, decision-makers and scope, and their relationship to departmental OpenClaw deployments and Project S. The task coverage, acceptance criteria, and measured gains behind my assessment that individual productivity problems were resolved in two to three months. Dates of renewed project activity, whether it involved existing or new projects, and actual B2B/FDE staffing and delivery outcomes.
 - **Comparisons and applicability:** ByteDance's specific tools, task scope, reliability, human involvement, and business impact, plus how I learned about their state by the end of 2025; supporting records for company decisions; the AI decisions and constraints at our current company.
 
 ## Sources and Evidence Notes
@@ -272,6 +283,7 @@ The cases suggest that individual adoption, agent infrastructure, and workflow i
 | U07 | My Project S workflow adaptation work and my account of its architecture, rollout, and constraints | Recorded September 17, 2026 | A founder's April 2026 involvement; a general-purpose Claude Code harness and team-memory data flywheel; IM integration and the goal of migrating team workflows, with shared memory from conversations, meetings, and documents and intended access to all members' data. My architecture account covers per-user pods, CC coordinator/worker/researcher roles, session and IM record collection, similarity-based memory processing, and scheduled vault maintenance. I recall smoother initial progress at Anuttacon and failure to advance the intended miHoYo rollout. Simpler startup permissions, miHoYo's complexity, aggressive IM and visibility requirements, absent agent permissions design, unisolated memory, and a weak generic harness are my explanations. The absence of a universally applicable harness is my technical judgment at the time of this retrospective. I spent roughly two months on FDE responsibilities in the data team, adapting colleagues' workflows. I found individual requests such as warehouse table design worked well. The workflow I worked to support covered requirements understanding and context collection, instrumentation design, data return, warehouse table design, and processing and validation. Repeated revision and self-verification placed high demands on the harness and agent infrastructure; unclear acceptance criteria could cause goal drift. These are my observations and risk assessment. Exact dates, how I learned about Anuttacon, component deployment, concrete workflow records and measured results, final status, and company evaluation remain to be documented; the architecture and outcomes have not been independently verified. |
 | U08 | My account of disappointing progress and confirmation that departmental OpenClaw deployments stopped being used | Recorded September 17, 2026 | The company's belief that anyone could create agents; my assessment that it neglected company-level AI-native infrastructure and that this contributed to disappointing progress; my recollection of widespread concern about AI project progress in March–April 2026; nearly all departmental OpenClaw deployments taken offline and no longer used. Specific deployments, dates, reasons, decision-makers, whether Echo was included, and measured results remain open. These are my recollections and judgments, not independently verified findings or a formal company review. |
 | U09 | My account of May–July harness work, infrastructure improvements, and two departmental projects, with clarification of verification | Recorded September 17, 2026 | A less aggressive company-level approach; employee and departmental context work using Codex, Claude Code, and pi agent; exploration of delivery involving multiple people or agents; refactoring of nearly all previously rushed MCP interfaces; retrieval, agent permissions, and memory capabilities. An OpenCode-based development-to-release framework was popular with non-R&D staff and later gained some R&D acceptance as end-to-end verification was added. Its front-end and back-end deployment let engineers ask agents to verify the output using browser use or Playwright. I drove a popular personal memory project enabling transfer across endpoints and agents. These are my recollections, participation, and assessments; formal policy, detailed implementation, measured outcomes, and links to earlier initiatives remain unverified or incomplete. |
+| U10 | My account of changing goals, staffing needs, and agent project decisions | Recorded September 17, 2026 | Initial recruitment of people with agent development experience for in-house runtime frameworks; the February–April 2026 focus on individual engineering productivity and a halt to nearly all server-side agent projects. My qualitative assessments cover the better results achieved with agent clients by colleagues familiar with the business, and the resolution of single-task productivity problems within two to three months. I associate that progress with renewed agent project activity focused on harness engineering on mature frameworks, and demand for agent developers with B2B experience to perform FDE responsibilities. Recruitment and restart dates, actual staffing, task coverage and measured gains, halted/new/resumed project identities, and the relationship to OpenClaw deployments and Project S remain open. These are my recollections and interpretations, not independently verified results or a formal company review. |
 | S01 | Anthropic, [Introducing Claude Sonnet 4.5](https://www.anthropic.com/news/claude-sonnet-4-5) | Published September 29, 2025; accessed September 17, 2026 | Confirms release before my joining month. It does not verify internal company adoption or establish the strongest model across all tasks in November 2025. |
 | S02 | OpenClaw documentation, [OpenClaw lore](https://docs.openclaw.ai/start/lore) | Publication date not stated; accessed September 17, 2026 | Records adoption of the OpenClaw name on January 30, 2026, after earlier names. Supports naming chronology, not the timing or extent of popularity in China or Echo's dates and implementation. |
 | S03 | Kimi Help Center, [What Is Kimi Agent? Features and Entry Points](https://www.kimi.com/en/help/agent/agent-overview) | Publication date not stated; accessed September 17, 2026 | Places Kimi Claw's public beta in mid-February 2026. My comparison is a product analogy; it establishes neither a January Kimi Claw release nor Echo's precise launch date. |
