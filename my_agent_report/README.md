@@ -12,7 +12,7 @@ Six chronological case studies each examine **decisions and actions, possible re
 2. After the January 2026 OpenClaw surge: Echo's broad adoption.
 3. The months after Echo: the framework-and-skills expansion and cost-incident review.
 4. March–April: MCP, permissions, disappointing progress, and departmental OpenClaw discontinuation.
-5. April: Project S's attempt to connect team workflows.
+5. April: Project S's general-purpose harness and team-memory data flywheel, with an architecture sketch and my assessment of three design gaps.
 6. May–July: harness work, infrastructure rework, an OpenCode-based delivery and verification framework, and the personal memory system I drove.
 
 The report separates company positions, my observations and judgments, and working analysis pending my review. Key results include qualitative outcomes where measurements are unavailable. It ends with provisional decision options, material evidence gaps, and sources.

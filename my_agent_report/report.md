@@ -18,7 +18,7 @@ The central progression is **all-in adoption with insufficient attention to agen
 | 2 | After the January 2026 OpenClaw surge | Make a general-purpose agent accessible through Echo | Broad uptake, especially outside R&D. |
 | 3 | The two to three months after Echo; exact dates open | Scale existing frameworks and employee-written skills | Widespread individual-task use; a major cost incident exposed infrastructure gaps. |
 | 4 | March–April 2026; overlapping the expansion | Expose internal systems through MCP | Poor usability and unresolved permissions; disappointing progress and widespread departmental OpenClaw discontinuation. |
-| 5 | April 2026 initiative | Connect a team's work through Project S | Smoother initial progress at Anuttacon; the intended miHoYo rollout did not progress. |
+| 5 | April 2026 initiative | Test a general-purpose harness and team-memory data flywheel through Project S | Smoother initial progress at Anuttacon; the intended miHoYo rollout did not progress. |
 | 6 | May–July 2026 | Build the context, infrastructure, and verification needed for delivery | Infrastructure rework and popular departmental projects; broader workflow results remain to be demonstrated. |
 
 **Basis of the analysis:** I participated in data-team agent work, the December discussion, the cost-incident review, and the personal memory initiative. Other developments reflect my observations and recollections, recorded on September 17, 2026. Company positions, my own assessments, and possible explanations are distinguished below. Passages marked **working analysis** and the decision options remain drafts for my review. Internal developments have not been independently corroborated here; public sources support only the external background described in the source table.
@@ -117,11 +117,11 @@ The wider approach still emphasized everyone being able to create agents. My ass
 
 *Evidence: U06, U08. The May–July rework is the follow-up in Case Study 6.*
 
-## Case Study 5 — April 2026: Project S Attempts to Connect a Team's Work
+## Case Study 5 — April 2026: Project S Tests a General-Purpose Harness and Data Flywheel
 
 ### Decisions and Actions
 
-A miHoYo founder personally promoted Project S while the company's approach was still highly aggressive. Built around Claude Code using what I describe as harness engineering, it integrated workplace IM and aimed to move every person's workflows within a team or department into the system.
+A miHoYo founder personally promoted Project S while the company's approach was still highly aggressive. I understand it as an attempt to combine a **general-purpose harness framework with a team-memory data flywheel**. Built around Claude Code, it integrated workplace IM and aimed to move every person's workflows within a team or department into the system.
 
 The intended design combined:
 
@@ -129,21 +129,68 @@ The intended design combined:
 - Memory visible to every team member and an agent with all members' data permissions.
 - All work entry points concentrated in IM so the agent could capture complete workflow context.
 
+**Architecture as I recall it.** A pod pool provided one pod per user. Each pod contained one Claude Code coordinator that distributed user requests to other Claude Code agents with roles such as worker and researcher. The following is a logical sketch; the deployment scope of each component in the two companies remains to be documented. CC stands for Claude Code.
+
+```text
+Pod pool: one pod per user
+|
++-- User 1 -> Pod 1
+|              |
+|              +-- User requests -> Coordinator (one CC)
+|                                      |
+|                                      +--> Worker (CC)
+|                                      +--> Researcher (CC)
+|                                      +--> Other roles (CC)
+|
++-- User 2 -> Pod 2 (same internal layout)
++-- ...    -> ...   (same internal layout)
+
+Session records ------------+
+                            +--> Collector
+Agent IM group chat logs ---+        |
+                                     | synchronize
+                                     v
+                               Vault Manager
+                                     |
+                       Similarity from vector retrieval
+                                     |
+        +----------------------------+------------------------+
+        | High                       | Medium                 | Low
+        v                            v                        v
+Discard incoming record    Merge with existing node    New node + links
+                                     |                        |
+                                     +------------+-----------+
+                                                  v
+                                         Vault (team memory)
+                                                  ^
+                                                  |
+                                         Scheduled inspection
+                                         Merge / update / delete
+```
+
+Collectors gathered session records and records from IM groups in which agents participated, then synchronized them to the Vault Manager. It used vector-retrieval similarity to decide how to handle incoming material: **high similarity meant discarding it; medium similarity meant merging it with an existing node; low similarity meant creating a new node and links between nodes**. The vault also had scheduled inspections to merge, update, and delete memory data.
+
+The flywheel ambition was to turn ongoing work records into reusable team context. The retrieval path back to agents, ingestion of meetings and documents, and evidence of better subsequent task outcomes remain to be documented.
+
 As I understand it, the founder first promoted the project at Anuttacon, his other LLM company. I describe Anuttacon as a startup with a relatively simple permissions system, where initial progress was smoother.
 
 ### Possible Reasons
 
-**The design rationale in my account:** Bring work and its context into a common entry point so an agent could support a team's complete workflows.
+**The design rationale in my account:** Reuse a common harness across projects and accumulate context from team work, with IM as the common entry point.
 
-**My assessment:** Simpler permissions helped at Anuttacon. At miHoYo, complex permissions were the largest obstacle. I considered the ambition highly idealistic, and the requirements for team-wide memory visibility and moving every work entry point into IM too aggressive for that setting.
+**My assessment:** Simpler permissions helped at Anuttacon. At miHoYo, complex permissions were the largest obstacle. I considered the ambition highly idealistic, and the requirements for team-wide memory visibility and moving every work entry point into IM too aggressive for that setting. In particular, I attribute the unsuccessful rollout to three design gaps:
 
-**Working analysis:** Progress in the startup may have made the model appear transferable. The comparison suggests that access rights and existing work practices can limit that transfer. It does not isolate each factor's contribution or show that team memory is inherently unworkable.
+1. **Agents were treated as team employees without a corresponding permissions system.** The employee-like role and intended access were not supported by an agent permissions design.
+2. **Team memory lacked isolation.** The team memory system did not establish the isolation needed for that setting. The specific boundaries requiring isolation still need to be documented.
+3. **The general-purpose harness layer was too weak.** At the time of recording this retrospective, my view is that no existing harness framework fits every project. This is my technical judgment; a systematic comparison of frameworks is outside the evidence assembled here.
+
+**Working analysis:** Progress in the startup may have made the model appear transferable. The comparison points to the need to evaluate agent authority, memory boundaries, and workflow-specific harness capabilities before extending a design across organizations. Per-user pods and unisolated team memory coexist in my account, so the execution layout should not be taken as evidence of memory isolation. The available evidence does not isolate each gap's contribution or show that team memory itself is unworkable.
 
 ### Key Results
 
 - I recall smoother initial progress at Anuttacon; complete migration or measured business value there has not been established.
 - The intended miHoYo rollout did not progress. Its final status, pilot scope, and whether any parts remained in use are still unclear.
-- Project S made an early attempt at the desired move from individual assistance to team workflows. Its difficulty illustrates the permissions and work-practice constraints in my account, not a formal company postmortem.
+- Project S was an early attempt to connect individual assistance into team workflows through a reusable harness and accumulated memory. This account does not yet provide evidence that the memory pipeline improved subsequent tasks or produced a working data flywheel. The failure explanations above are my assessment, not a formal company postmortem.
 
 *Evidence: U07. S05 supports Anuttacon's name and stated research focus only.*
 
@@ -183,9 +230,9 @@ The cases suggest that individual adoption, agent infrastructure, and workflow i
 | Decision area | Basis | Option to test |
 | --- | --- | --- |
 | Adoption | Case 2 | Use an accessible interface for representative non-R&D tasks; measure the effort to complete a first useful task, repeat use, and output quality. |
-| Framework reuse and shared infrastructure | Cases 3, 4, 6 | Evaluate a complete workflow alongside the skills it requires. Assign owners for tool usability, knowledge retrieval, permissions, and memory. Measure calls, context consumption, completion quality, and sustained use. Existing frameworks alone do not settle what internal development is still needed. |
+| Framework reuse and shared infrastructure | Cases 3, 4, 5, 6 | Evaluate a complete workflow alongside its skills, separating reusable harness functions from workflow-specific requirements. Assign owners for tool usability, knowledge retrieval, permissions, and memory. Measure calls, context consumption, completion quality, and sustained use. Existing frameworks alone do not settle what internal development is still needed. |
 | Experimental cost and operations | Case 3 | Set budgets, gateway limits, agent-count and message-history caps, and review thresholds. Assess routing, KV cache efficiency, and multi-agent/A2A needs; record spending, learning, and results together. |
-| Team workflow integration | Cases 5, 6 | Start with a bounded team and workflow. Define handoffs, source-data permissions, and memory visibility separately. Test the value and disruption of moving work into IM before requiring broad migration. |
+| Team workflow integration | Cases 5, 6 | Start with a bounded team and workflow. Define handoffs, agent roles and permissions, source-data access, and memory isolation and visibility separately. Test whether accumulated memory improves subsequent tasks, alongside the value and disruption of moving work into IM, before requiring broad migration. |
 | Delivery and verification | Case 6 | Test a development-to-deployment task with explicit acceptance criteria and agent verification. Evaluate completed work, human intervention, cost, and acceptance by the intended user groups. |
 | Personal memory continuity | Case 6 | Continue a real task on another endpoint or agent. Check what memory transfers, access boundaries, and the effort needed to restate context. Treat team-wide sharing as a separate requirement. |
 
@@ -194,7 +241,7 @@ The cases suggest that individual adoption, agent infrastructure, and workflow i
 - **Baseline and early adoption:** My formal title, employment dates, and full review period; the data-team project's purpose and results; December action items, owners, resources, and delivery; Dify's observation period and usage; Echo's dates, team, tasks, retention, business results, and relationship to the platform proposal.
 - **Expansion and the incident:** The source and scope of the framework-and-skills direction; project names, departments, dates, skill reuse, handoffs, and completed workflows; incident and review dates, billing basis, authorization, cost breakdown, routing/cache measurements, experiment value, and corrective actions.
 - **March–April outcomes:** Which deployments stopped, who decided, why, whether Echo was included, and what had been delivered; the teams and expectations behind disappointing progress; MCP inventory, deployment and use, pagination overhead, quality criteria, and the definitions and unresolved permissions of personal and team agents.
-- **Project S:** My role or source of knowledge; pilot scope and dates in both companies, actual workflow migration, permissions conflicts, memory visibility and IM requirements in practice, final status, and any formal company review.
+- **Project S:** My role or source of knowledge; pilot scope, component deployment, and dates in both companies; actual workflow migration, final status, and any formal company review. Specific agent permissions gaps, required memory isolation boundaries, missing harness capabilities, permissions conflicts, and memory visibility and IM requirements in practice. Similarity thresholds, memory-processing quality, retrieval and reuse by agents, and effects on subsequent task outcomes.
 - **May–July:** Specific policy or resource changes and their reasons; harness tasks and multi-person/multi-agent results; refactoring changes, retrieval and permissions coverage, and before-and-after outcomes. For the delivery framework, a representative verification run, acceptance criteria, and adoption by user group. For my memory project, my responsibilities, supported endpoints and agents, memory content, transfer mechanism, access boundaries, usage, and task outcomes. Project names, departments, dates, links to earlier initiatives, and my further reflections remain to be added.
 - **Comparisons and applicability:** ByteDance's specific tools, task scope, reliability, human involvement, and business impact, plus how I learned about their state by the end of 2025; supporting records for company decisions; the AI decisions and constraints at our current company.
 
@@ -208,7 +255,7 @@ The cases suggest that individual adoption, agent infrastructure, and workflow i
 | U04 | My recollections of expansion after Echo and the multi-agent cost incident | Recorded September 17, 2026 | Following two to three months; at least four or five departmental OpenClaw adaptations; individual-task adoption and IM integration; company emphasis on frameworks and skills; substantial investment; RMB 2 million in one day using Opus 4.6, missing limits, and the company's response. The source of the framework-and-skills position, dates, billing evidence, workflow and experiment outcomes, and my personal evaluation of those company positions remain open. U05 adds my participation in the incident review. |
 | U05 | My participation in the company incident review and confirmation of the cost amount | Recorded September 17, 2026 | I participated in the review. Company reflections covered inadequate gateway quota logic, routing problems causing a low KV cache hit rate, and missing infrastructure for multi-agent and A2A collaboration. I confirmed the amount as RMB 2 million. Review records and measurements have not been independently examined here; corrective actions and their effects remain to be documented. |
 | U06 | My observations of March–April infrastructure development, MCP quality, pagination, and permissions | Recorded September 17, 2026 | Rapid development in March–April 2026; MCP designs for nearly all internal systems; many wrappers around existing service APIs; my assessment that the vast majority were low quality; repeated MCP calls and pagination adjustments consuming substantial context during data retrieval; unresolved system access for personal and team agents. Deployment coverage, measured overhead, task outcomes, specific permissions questions, and their duration remain open. These are my recollections and judgments, not independently verified results or company review findings. |
-| U07 | My account of Project S and its differing rollout experiences | Recorded September 17, 2026 | A founder's April 2026 involvement; Claude Code harness work and IM integration; the goal of migrating a team's or department's workflows, shared memory built from conversations, meetings and documents, and access combining all members' data permissions; smoother initial progress at Anuttacon and failure to advance the intended rollout at miHoYo. Startup permissions, miHoYo's complexity, and the assessment that the design was too aggressive are my explanations. My involvement, detailed rollout evidence, final status, and company evaluation remain to be documented. |
+| U07 | My account of Project S, its architecture, rollout differences, and design gaps | Recorded September 17, 2026 | A founder's April 2026 involvement; a general-purpose Claude Code harness and team-memory data flywheel; IM integration and the goal of migrating team workflows, with shared memory from conversations, meetings, and documents and intended access to all members' data. My architecture account covers per-user pods, CC coordinator/worker/researcher roles, session and IM record collection, similarity-based memory processing, and scheduled vault maintenance. I recall smoother initial progress at Anuttacon and failure to advance the intended miHoYo rollout. Simpler startup permissions, miHoYo's complexity, aggressive IM and visibility requirements, absent agent permissions design, unisolated memory, and a weak generic harness are my explanations. The absence of a universally applicable harness is my technical judgment at the time of this retrospective. My involvement, component deployment, detailed results, final status, and company evaluation remain to be documented; the architecture and outcomes have not been independently verified. |
 | U08 | My account of disappointing progress and confirmation that departmental OpenClaw deployments stopped being used | Recorded September 17, 2026 | The company's belief that anyone could create agents; my assessment that it neglected company-level AI-native infrastructure and that this contributed to disappointing progress; my recollection of widespread concern about AI project progress in March–April 2026; nearly all departmental OpenClaw deployments taken offline and no longer used. Specific deployments, dates, reasons, decision-makers, whether Echo was included, and measured results remain open. These are my recollections and judgments, not independently verified findings or a formal company review. |
 | U09 | My account of May–July harness work, infrastructure improvements, and two departmental projects, with clarification of verification | Recorded September 17, 2026 | A less aggressive company-level approach; employee and departmental context work using Codex, Claude Code, and pi agent; exploration of delivery involving multiple people or agents; refactoring of nearly all previously rushed MCP interfaces; retrieval, agent permissions, and memory capabilities. An OpenCode-based development-to-release framework was popular with non-R&D staff and later gained some R&D acceptance as end-to-end verification was added. Its front-end and back-end deployment let engineers ask agents to verify the output using browser use or Playwright. I drove a popular personal memory project enabling transfer across endpoints and agents. These are my recollections, participation, and assessments; formal policy, detailed implementation, measured outcomes, and links to earlier initiatives remain unverified or incomplete. |
 | S01 | Anthropic, [Introducing Claude Sonnet 4.5](https://www.anthropic.com/news/claude-sonnet-4-5) | Published September 29, 2025; accessed September 17, 2026 | Confirms release before my joining month. It does not verify internal company adoption or establish the strongest model across all tasks in November 2025. |
